@@ -1,0 +1,11 @@
+fastf1
+pandas>=1.5
+numpy<2.0
+xgboost
+scikit-learn
+shap
+streamlit
+plotly
+joblib
+matplotlib
+requests

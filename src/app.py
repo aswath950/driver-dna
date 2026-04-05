@@ -1,0 +1,621 @@
+"""
+app.py — Streamlit dashboard for Driver DNA Fingerprinter.
+
+Run with:
+    streamlit run src/app.py
+
+Expected columns from dataset.parquet:
+  driver, lap_time_seconds, mean_speed, max_speed, min_speed,
+  throttle_mean, throttle_std, brake_mean, brake_events,
+  gear_changes, steer_std, speed_trace, throttle_trace, brake_trace
+"""
+
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from model import load_model, FEATURE_COLS, DATA_DIR, MODELS_DIR
+from openf1 import OpenF1Client
+from race_engine import RaceAnalyser
+
+DATASET_PATH = DATA_DIR / "dataset.parquet"
+ACCURACY_PATH = MODELS_DIR / "accuracy.txt"
+N_POINTS = 200
+TRACE_COLS = {"Speed": "speed_trace", "Throttle": "throttle_trace", "Brake": "brake_trace"}
+RADAR_FEATURES = ["mean_speed", "throttle_mean", "throttle_std", "brake_events", "steer_std", "gear_changes"]
+
+# --- Session state defaults for non-widget keys only ---------------
+# Widget keys (ta_a, ta_b, radar_drivers, mystery_lap, rp_mode, etc.)
+# must NOT be pre-set here — Streamlit manages widget state internally
+# and raises a conflict error if a widget key already exists in
+# session_state when the widget renders with its own default value.
+STATE_DEFAULTS: dict = {
+    # Tab 4 — non-widget state
+    "rp_last_refresh": None,
+    "rp_live_client": None,
+    # Tab 4 historical — persists loaded race data across reruns
+    "rp_hist_analyser": None,
+    "rp_hist_laps_remaining": 10,
+    "rp_hist_driver_map": {},
+    # Tab 4 live — driver map for current session
+    "rp_live_driver_map": {},
+}
+
+st.set_page_config(page_title="Driver DNA Fingerprinter", layout="wide")
+
+for _key, _val in STATE_DEFAULTS.items():
+    if _key not in st.session_state:
+        st.session_state[_key] = _val
+
+# --- Sidebar ---
+with st.sidebar:
+    st.title("🧬 Driver DNA + 🏁 Race Pace")
+
+    # -- Driver DNA section --
+    st.subheader("Driver DNA")
+    st.markdown("Identify F1 drivers from telemetry alone using XGBoost.")
+    if ACCURACY_PATH.exists():
+        acc = float(ACCURACY_PATH.read_text().strip())
+        st.metric("Model CV Accuracy", f"{acc:.1%}")
+    else:
+        st.caption("Run `model.py` to generate accuracy.txt")
+    st.info("**Mystery Driver** — pick any lap and see if the ML model can identify the driver from driving style alone.")
+
+    st.divider()
+
+    # -- Race Pace Dashboard section --
+    st.subheader("Race Pace Dashboard")
+    rp_mode_val = st.session_state.get("rp_mode", "")
+    if rp_mode_val.startswith("📡"):
+        st.markdown("**Mode:** 📡 Live")
+        last_ts = st.session_state.get("rp_last_refresh")
+        if last_ts:
+            st.caption(f"Last refreshed: {last_ts}")
+        else:
+            st.caption("Waiting for first refresh...")
+    elif rp_mode_val.startswith("🗂️"):
+        st.markdown("**Mode:** 🗂️ Historical")
+        loaded_gp = st.session_state.get("rp_gp", "—")
+        loaded_year = st.session_state.get("rp_year", "—")
+        st.caption(f"{loaded_year} {loaded_gp}")
+    else:
+        st.caption("Select a mode in the Race Pace tab to get started.")
+    st.info("**Race Pace** — live or historical race analysis with rolling pace, gap charts, undercut detection, and projected finishing order.")
+
+    # -- Health Check expander --
+    st.divider()
+    with st.expander("🩺 Health Check"):
+        _ok = "✅"
+        _fail = "❌"
+
+        # Dataset
+        st.markdown(f"{_ok if DATASET_PATH.exists() else _fail} `dataset.parquet` exists")
+
+        # Model
+        _model_exists = (MODELS_DIR / "driver_dna_clf.joblib").exists()
+        st.markdown(f"{_ok if _model_exists else _fail} `driver_dna_clf.joblib` exists")
+
+        # OpenF1 API reachable (cached for 60s so it doesn't block every rerun)
+        @st.cache_data(ttl=60, show_spinner=False)
+        def _check_openf1() -> bool:
+            try:
+                import requests as _req
+                _resp = _req.get(
+                    "https://api.openf1.org/v1/sessions", timeout=5, params={"limit": 1}
+                )
+                return _resp.status_code == 200
+            except Exception:
+                return False
+
+        _api_ok = _check_openf1()
+        st.markdown(f"{_ok if _api_ok else _fail} OpenF1 API reachable")
+
+        # Required libraries
+        _libs = ["fastf1", "pandas", "numpy", "xgboost", "sklearn", "shap",
+                 "streamlit", "plotly", "joblib", "matplotlib", "requests"]
+        _missing_libs = []
+        for _lib in _libs:
+            try:
+                __import__(_lib)
+            except ImportError:
+                _missing_libs.append(_lib)
+        if _missing_libs:
+            st.markdown(f"{_fail} Missing libraries: {', '.join(_missing_libs)}")
+        else:
+            st.markdown(f"{_ok} All required libraries importable")
+
+# --- Load resources ---
+@st.cache_resource
+def get_model():
+    return load_model()
+
+
+@st.cache_data
+def get_data() -> pd.DataFrame:
+    return pd.read_parquet(DATASET_PATH)
+
+
+if not DATASET_PATH.exists():
+    st.error("Run `python src/pipeline.py` first to fetch telemetry and build the dataset.")
+    st.stop()
+
+model_path = MODELS_DIR / "driver_dna_clf.joblib"
+if not model_path.exists():
+    st.error("Run `python src/model.py` first to train the model.")
+    st.stop()
+
+try:
+    clf, le = get_model()
+    df = get_data()
+except Exception as e:
+    st.error(f"Failed to load resources: {e}")
+    st.stop()
+
+drivers = sorted(df["driver"].unique())
+palette = px.colors.qualitative.Plotly
+color_map = {d: palette[i % len(palette)] for i, d in enumerate(drivers)}
+
+tab1, tab2, tab3, tab4 = st.tabs(["Telemetry Overlay", "Driver Radar", "Mystery Driver", "Race Pace Dashboard"])
+
+# ================================================================
+# TAB 1 — Telemetry Overlay
+# ================================================================
+with tab1:
+    st.subheader("Average Telemetry Trace Comparison")
+
+    c1, c2, c3 = st.columns(3)
+    driver_a = c1.selectbox("Driver A", drivers, index=0, key="ta_a")
+    driver_b = c2.selectbox("Driver B", drivers, index=min(1, len(drivers) - 1), key="ta_b")
+    channel = c3.selectbox("Channel", list(TRACE_COLS.keys()), key="ta_ch")
+
+    trace_col = TRACE_COLS[channel]
+
+    if trace_col not in df.columns:
+        st.info("Telemetry trace columns not found. Re-run `python src/pipeline.py` to regenerate the dataset.")
+    else:
+        x = np.arange(N_POINTS)
+        fig = go.Figure()
+        for drv in (driver_a, driver_b):
+            rows = df[df["driver"] == drv][trace_col]
+            if rows.empty:
+                continue
+            traces = np.vstack([row for row in rows])
+            avg = traces.mean(axis=0)
+            fig.add_trace(go.Scatter(
+                x=x, y=avg,
+                mode="lines",
+                name=drv,
+                line=dict(color=color_map[drv], width=2.5),
+            ))
+        fig.update_layout(
+            title=f"Average {channel} — {driver_a} vs {driver_b}",
+            xaxis_title="Normalised Distance (0–200 points)",
+            yaxis_title=channel,
+            legend_title="Driver",
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig, width="stretch", key="tab1_telemetry_overlay")
+
+# ================================================================
+# TAB 2 — Driver Radar
+# ================================================================
+with tab2:
+    st.subheader("Driver Style Fingerprint")
+
+    selected = st.multiselect(
+        "Select 2–4 drivers",
+        options=drivers,
+        default=drivers[:min(3, len(drivers))],
+        key="radar_drivers",
+    )
+
+    if len(selected) < 2:
+        st.warning("Select at least 2 drivers.")
+    elif len(selected) > 4:
+        st.warning("Select at most 4 drivers.")
+    else:
+        feat_df = df[RADAR_FEATURES].copy()
+        feat_min = feat_df.min()
+        feat_max = feat_df.max()
+        norm_df = (feat_df - feat_min) / (feat_max - feat_min).replace(0, 1)
+        norm_df["driver"] = df["driver"].values
+
+        driver_means = norm_df.groupby("driver")[RADAR_FEATURES].mean()
+
+        categories = RADAR_FEATURES + [RADAR_FEATURES[0]]
+        fig = go.Figure()
+        for drv in selected:
+            vals = driver_means.loc[drv].tolist()
+            vals += [vals[0]]
+            fig.add_trace(go.Scatterpolar(
+                r=vals,
+                theta=categories,
+                fill="toself",
+                name=drv,
+                line=dict(color=color_map[drv]),
+                opacity=0.7,
+            ))
+        fig.update_layout(
+            polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+            title="Driver Style Radar (normalised 0–1)",
+            legend_title="Driver",
+        )
+        st.plotly_chart(fig, width="stretch", key="tab2_driver_radar")
+
+# ================================================================
+# TAB 3 — Mystery Driver
+# ================================================================
+with tab3:
+    st.subheader("Can the model identify the driver?")
+
+    lap_idx = st.selectbox(
+        "Pick a lap",
+        range(len(df)),
+        format_func=lambda i: f"Lap {i + 1}",
+        key="mystery_lap",
+    )
+
+    if st.button("Identify Driver", key="identify_btn"):
+        lap_row = df.iloc[lap_idx]
+        actual_driver = lap_row["driver"]
+
+        X_input = lap_row[FEATURE_COLS].to_numpy().reshape(1, -1)
+        proba = clf.predict_proba(X_input)[0]
+        pred_driver = le.classes_[proba.argmax()]
+
+        prob_df = pd.DataFrame({
+            "Driver": le.classes_,
+            "Probability": proba,
+        }).sort_values("Probability", ascending=True)
+
+        fig = go.Figure(go.Bar(
+            x=prob_df["Probability"],
+            y=prob_df["Driver"],
+            orientation="h",
+            marker_color=[color_map.get(d, "#888") for d in prob_df["Driver"]],
+        ))
+        fig.update_layout(
+            title="Model Prediction Probabilities",
+            xaxis_title="Probability",
+            yaxis_title="Driver",
+            xaxis=dict(range=[0, 1]),
+        )
+        st.plotly_chart(fig, width="stretch", key="tab3_mystery_proba")
+
+        correct = pred_driver == actual_driver
+        icon = "✅" if correct else "❌"
+        st.markdown(f"### Actual driver: **{actual_driver}** {icon}")
+        if correct:
+            st.success(f"Correct! The model identified **{pred_driver}** with {proba.max():.1%} confidence.")
+        else:
+            st.error(f"Wrong! The model predicted **{pred_driver}** but the actual driver was **{actual_driver}**.")
+
+# ================================================================
+# TAB 4 — Race Pace Dashboard
+# ================================================================
+
+# ---- helpers shared by both modes --------------------------------
+
+RACE_PALETTE = px.colors.qualitative.Dark24
+
+
+def _driver_color_map(driver_numbers: list) -> dict:
+    """Assign a distinct colour to each driver number."""
+    return {d: RACE_PALETTE[i % len(RACE_PALETTE)] for i, d in enumerate(sorted(driver_numbers))}
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_analysis(laps_hash: str, _analyser: RaceAnalyser, laps_remaining: int) -> dict:
+    """Cache the 4 analysis results so reruns don't recompute.
+
+    *laps_hash* is a hashable key derived from the lap data so the cache
+    invalidates when new laps arrive.  *_analyser* is prefixed with ``_``
+    so Streamlit skips hashing it (it's not picklable).
+    """
+    return {
+        "rolling_pace": _analyser.rolling_pace(window=5),
+        "gap_to_leader": _analyser.gap_to_leader(),
+        "undercuts": _analyser.detect_undercuts(),
+        "projections": _analyser.project_finishing_order(laps_remaining),
+        "driver_numbers": sorted(_analyser._clean["driver_number"].unique()),
+    }
+
+
+def _render_charts(
+    analyser: RaceAnalyser,
+    laps_remaining: int,
+    container,
+    driver_map: dict | None = None,
+) -> None:
+    """Render all 4 Race-Pace charts inside *container*.
+
+    Parameters
+    ----------
+    driver_map : dict, optional
+        Mapping of ``{driver_number: acronym}`` e.g. ``{44: 'HAM'}``.
+        Falls back to the raw driver number string when not provided or
+        when a number has no entry in the map.
+    """
+    if driver_map is None:
+        driver_map = {}
+
+    def _label(num) -> str:
+        """Return acronym if known, otherwise the number as a string."""
+        return driver_map.get(int(num), str(num)) if driver_map else str(num)
+
+    # Build a hash key from the laps data so the cache invalidates on new data
+    laps_hash = str(hash(tuple(analyser._laps["lap_number"].tolist()[:50])))
+    results = _cached_analysis(laps_hash, analyser, laps_remaining)
+
+    drv_nums = results["driver_numbers"]
+    cmap = _driver_color_map(drv_nums)
+
+    # ---- Chart 1: Rolling Race Pace --------------------------------
+    container.markdown("### Rolling Race Pace")
+    rp = results["rolling_pace"]
+    fig1 = go.Figure()
+    for drv in rp.columns:
+        fig1.add_trace(go.Scatter(
+            x=rp.index, y=rp[drv],
+            mode="lines", name=_label(drv),
+            line=dict(color=cmap.get(drv, "#888"), width=2),
+        ))
+    # Session median pace (dashed reference)
+    all_vals = rp.values[~np.isnan(rp.values)]
+    if len(all_vals):
+        median_pace = float(np.median(all_vals))
+        fig1.add_hline(
+            y=median_pace, line_dash="dash", line_color="white",
+            opacity=0.5,
+            annotation_text=f"Median {median_pace:.2f}s",
+            annotation_position="top left",
+        )
+    fig1.update_layout(
+        xaxis_title="Lap Number", yaxis_title="Rolling Avg Lap Time (s)",
+        hovermode="x unified", legend_title="Driver",
+    )
+    container.plotly_chart(fig1, width="stretch", key="tab4_rolling_pace")
+
+    # ---- Chart 2 & 3: Gap to Leader + Undercut markers -------------
+    container.markdown("### Gap to Leader")
+    gap = results["gap_to_leader"]
+    undercuts = results["undercuts"]
+
+    fig2 = go.Figure()
+    for drv in gap.columns:
+        fig2.add_trace(go.Scatter(
+            x=gap.index, y=gap[drv],
+            mode="lines", name=_label(drv),
+            line=dict(color=cmap.get(drv, "#888"), width=2),
+            fill="tozeroy", opacity=0.3,
+        ))
+    # Overlay undercut/overcut markers
+    for evt in undercuts:
+        lap = evt["lap"]
+        atk = evt["attacking_driver"]
+        kind = evt["type"]
+        marker_symbol = "triangle-up" if kind == "undercut" else "triangle-down"
+        try:
+            y_val = gap.loc[lap, atk].item()  # type: ignore[union-attr]
+        except (KeyError, AttributeError):
+            y_val = 0.0
+        label = f"Lap {lap}: {_label(atk)} {kind} {_label(evt['defending_driver'])}"
+        fig2.add_trace(go.Scatter(
+            x=[lap], y=[y_val],
+            mode="markers+text",
+            marker=dict(
+                symbol=marker_symbol, size=14,
+                color="lime" if kind == "undercut" else "orange",
+                line=dict(width=1, color="white"),
+            ),
+            text=[f"{'▲' if kind == 'undercut' else '▽'}"],
+            textposition="top center",
+            hovertext=[label],
+            hoverinfo="text",
+            showlegend=False,
+        ))
+    fig2.update_layout(
+        xaxis_title="Lap Number", yaxis_title="Gap to Leader (s)",
+        hovermode="x unified", legend_title="Driver",
+    )
+    container.plotly_chart(fig2, width="stretch", key="tab4_gap_to_leader")
+
+    # ---- Chart 4: Projected Finishing Order -------------------------
+    container.markdown("### Projected Finishing Order")
+    projections = results["projections"]
+    if projections:
+        # Winner time comes from the first active (non-DNF) driver
+        active = [p for p in projections if p.get("status") != "DNF"]
+        winner_time = active[0]["projected_total_time"] if active else 0
+        proj_data = []
+        for p in projections:
+            is_dnf = p.get("status") == "DNF"
+            gap_to_win = 0.0 if is_dnf else p["projected_total_time"] - winner_time
+            change = p.get("position_change")
+            if is_dnf:
+                bar_color = "#555555"
+            elif change is not None and change > 0:
+                bar_color = "#2ecc71"
+            elif change is not None and change < 0:
+                bar_color = "#e74c3c"
+            else:
+                bar_color = "#95a5a6"
+            cur = p.get("current_position", "?")
+            proj_pos = p["projected_position"]
+            label = "DNF" if is_dnf else f"P{cur} → P{proj_pos}"
+            proj_data.append({
+                "driver": _label(p["driver"]),
+                "gap": round(gap_to_win, 2),
+                "color": bar_color,
+                "label": label,
+            })
+        # Reverse so P1 is at the top of the horizontal bar chart
+        proj_data = proj_data[::-1]
+        fig4 = go.Figure(go.Bar(
+            x=[d["gap"] for d in proj_data],
+            y=[d["driver"] for d in proj_data],
+            orientation="h",
+            marker_color=[d["color"] for d in proj_data],
+            text=[d["label"] for d in proj_data],
+            textposition="outside",
+            hovertemplate="Driver %{y}<br>Gap: +%{x:.2f}s<extra></extra>",
+        ))
+        fig4.update_layout(
+            xaxis_title="Projected Gap to Winner (s)",
+            yaxis_title="Driver",
+            showlegend=False,
+        )
+        container.plotly_chart(fig4, width="stretch", key="tab4_projected_order")
+    else:
+        container.info("Not enough data to project finishing order.")
+
+
+# ---- Tab 4 content -----------------------------------------------
+
+with tab4:
+    st.subheader("Race Pace Dashboard")
+
+    mode = st.radio(
+        "Mode",
+        ["🗂️ Historical (select a race)", "📡 Live (current race weekend)"],
+        horizontal=True,
+        key="rp_mode",
+    )
+
+    if mode.startswith("🗂️"):
+        # ---- HISTORICAL MODE ----
+        h1, h2 = st.columns(2)
+        hist_year = h1.selectbox("Year", [2024, 2023, 2022], key="rp_year")
+        hist_gp = h2.text_input("Grand Prix", value="Italian Grand Prix", key="rp_gp")
+        hist_laps_remaining = st.number_input(
+            "Laps remaining (for projection)", min_value=0, value=10, key="rp_laps_rem",
+        )
+
+        if st.button("Load Race Data", key="rp_load"):
+            with st.spinner("Fetching data from OpenF1..."):
+                client = OpenF1Client(mode="historical")
+                sessions = client.get_sessions(hist_year, hist_gp)
+
+                if sessions.empty:
+                    st.error(
+                        "No sessions found. Either the year/Grand Prix name is wrong, "
+                        "or the OpenF1 API is unreachable (check your internet connection)."
+                    )
+                    st.stop()
+
+                # Pick the Race session; fall back to whatever is available
+                race_sessions = sessions[sessions["session_name"].str.contains("Race", case=False, na=False)]
+                if race_sessions.empty:
+                    race_sessions = sessions
+                session_key = int(race_sessions.iloc[0]["session_key"])
+
+                st.caption(f"Session key: `{session_key}`")
+
+                laps = client.get_laps(session_key)
+                stints = client.get_stints(session_key)
+                position = client.get_position(session_key)
+                drivers_df = client.get_drivers(session_key)
+
+            if laps.empty:
+                st.error("No lap data returned for this session.")
+            else:
+                # Build driver number → acronym map
+                driver_map: dict = {}
+                if not drivers_df.empty and "driver_number" in drivers_df.columns and "name_acronym" in drivers_df.columns:
+                    driver_map = {
+                        int(row["driver_number"]): str(row["name_acronym"])
+                        for _, row in drivers_df.iterrows()
+                        if pd.notna(row["driver_number"]) and pd.notna(row["name_acronym"])
+                    }
+                # Persist analyser and driver map in session state so charts survive reruns
+                st.session_state["rp_hist_analyser"] = RaceAnalyser(laps, stints, position)
+                st.session_state["rp_hist_laps_remaining"] = hist_laps_remaining
+                st.session_state["rp_hist_driver_map"] = driver_map
+
+        # Render charts from session state if data has been loaded
+        if st.session_state["rp_hist_analyser"] is not None:
+            _render_charts(
+                st.session_state["rp_hist_analyser"],
+                st.session_state["rp_hist_laps_remaining"],
+                st,
+                driver_map=st.session_state["rp_hist_driver_map"],
+            )
+
+    else:
+        # ---- LIVE MODE ----
+        st.markdown(
+            """
+            <style>
+            @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+            .live-badge {
+                display: inline-block;
+                font-size: 1.4rem;
+                font-weight: 700;
+                color: #ff4444;
+                animation: pulse 1.5s ease-in-out infinite;
+            }
+            </style>
+            <span class="live-badge">🔴 LIVE</span>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        refresh_interval = st.selectbox(
+            "Auto-refresh interval",
+            options=[10, 30, 60],
+            format_func=lambda s: f"{s}s",
+            key="rp_refresh",
+        )
+        live_laps_remaining = st.number_input(
+            "Estimated laps remaining", min_value=0, value=20, key="rp_live_laps",
+        )
+
+        chart_container = st.empty()
+
+        try:
+            # Persist live client across reruns so watermarks survive
+            if st.session_state["rp_live_client"] is None:
+                st.session_state["rp_live_client"] = OpenF1Client(mode="live")
+            client = st.session_state["rp_live_client"]
+
+            with st.spinner("Fetching live data from OpenF1..."):
+                laps = client.get_live_laps()
+                stints = client.get_live_stints()
+                position = client.get_live_position()
+                live_drivers_df = client.get_live_drivers()
+                st.session_state["rp_last_refresh"] = datetime.now().strftime("%H:%M:%S")
+
+            # Build / refresh driver map
+            if not live_drivers_df.empty and "driver_number" in live_drivers_df.columns and "name_acronym" in live_drivers_df.columns:
+                st.session_state["rp_live_driver_map"] = {
+                    int(row["driver_number"]): str(row["name_acronym"])
+                    for _, row in live_drivers_df.iterrows()
+                    if pd.notna(row["driver_number"]) and pd.notna(row["name_acronym"])
+                }
+
+            if laps.empty:
+                st.warning("No active session found. Try during a race weekend.")
+            else:
+                analyser = RaceAnalyser(laps, stints, position)
+                with chart_container.container():
+                    _render_charts(
+                        analyser,
+                        live_laps_remaining,
+                        st,
+                        driver_map=st.session_state["rp_live_driver_map"],
+                    )
+        except Exception as exc:
+            st.warning(f"Live refresh failed: {exc}")
+
+        # Only auto-rerun if still on live mode — prevents resetting other tabs
+        if st.session_state.get("rp_mode", "").startswith("📡"):
+            time.sleep(refresh_interval)
+            st.rerun()
