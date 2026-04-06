@@ -43,8 +43,10 @@ STATE_DEFAULTS: dict = {
     "rp_live_client": None,
     # Tab 4 historical — persists loaded race data across reruns
     "rp_hist_analyser": None,
-    "rp_hist_laps_remaining": 10,
     "rp_hist_driver_map": {},
+    # Tab 4 historical — available sessions fetched from OpenF1
+    "rp_available_sessions": None,   # pd.DataFrame or None
+    "rp_fetched_for": None,          # (year, gp) tuple — invalidates cache on change
     # Tab 4 live — driver map for current session
     "rp_live_driver_map": {},
 }
@@ -326,6 +328,8 @@ def _cached_analysis(laps_hash: str, _analyser: RaceAnalyser, laps_remaining: in
         "undercuts": _analyser.detect_undercuts(),
         "projections": _analyser.project_finishing_order(laps_remaining),
         "driver_numbers": sorted(_analyser._clean["driver_number"].unique()),
+        "tyre_deg": _analyser.tyre_degradation(),
+        "pace_summary": _analyser.pace_summary(),
     }
 
 
@@ -334,8 +338,9 @@ def _render_charts(
     laps_remaining: int,
     container,
     driver_map: dict | None = None,
+    selected_drivers: list | None = None,
 ) -> None:
-    """Render all 4 Race-Pace charts inside *container*.
+    """Render all Race-Pace charts inside *container*.
 
     Parameters
     ----------
@@ -343,6 +348,8 @@ def _render_charts(
         Mapping of ``{driver_number: acronym}`` e.g. ``{44: 'HAM'}``.
         Falls back to the raw driver number string when not provided or
         when a number has no entry in the map.
+    selected_drivers : list, optional
+        Subset of driver numbers to display. Defaults to all drivers.
     """
     if driver_map is None:
         driver_map = {}
@@ -355,14 +362,15 @@ def _render_charts(
     laps_hash = str(hash(tuple(analyser._laps["lap_number"].tolist()[:50])))
     results = _cached_analysis(laps_hash, analyser, laps_remaining)
 
-    drv_nums = results["driver_numbers"]
-    cmap = _driver_color_map(drv_nums)
+    # Resolve the active driver set (filter or all)
+    active_drivers = set(selected_drivers) if selected_drivers else set(results["driver_numbers"])
+    cmap = _driver_color_map(list(active_drivers))
 
     # ---- Chart 1: Rolling Race Pace --------------------------------
     container.markdown("### Rolling Race Pace")
     rp = results["rolling_pace"]
     fig1 = go.Figure()
-    for drv in rp.columns:
+    for drv in [d for d in rp.columns if d in active_drivers]:
         fig1.add_trace(go.Scatter(
             x=rp.index, y=rp[drv],
             mode="lines", name=_label(drv),
@@ -390,15 +398,19 @@ def _render_charts(
     undercuts = results["undercuts"]
 
     fig2 = go.Figure()
-    for drv in gap.columns:
+    for drv in [d for d in gap.columns if d in active_drivers]:
         fig2.add_trace(go.Scatter(
             x=gap.index, y=gap[drv],
             mode="lines", name=_label(drv),
             line=dict(color=cmap.get(drv, "#888"), width=2),
             fill="tozeroy", opacity=0.3,
         ))
-    # Overlay undercut/overcut markers
-    for evt in undercuts:
+    # Overlay undercut/overcut markers (only when both drivers are selected)
+    visible_undercuts = [
+        e for e in undercuts
+        if e["attacking_driver"] in active_drivers and e["defending_driver"] in active_drivers
+    ]
+    for evt in visible_undercuts:
         lap = evt["lap"]
         atk = evt["attacking_driver"]
         kind = evt["type"]
@@ -430,7 +442,7 @@ def _render_charts(
 
     # ---- Chart 4: Projected Finishing Order -------------------------
     container.markdown("### Projected Finishing Order")
-    projections = results["projections"]
+    projections = [p for p in results["projections"] if p["driver"] in active_drivers]
     if projections:
         # Winner time comes from the first active (non-DNF) driver
         active = [p for p in projections if p.get("status") != "DNF"]
@@ -477,6 +489,115 @@ def _render_charts(
     else:
         container.info("Not enough data to project finishing order.")
 
+    # ---- Chart 5: Average Race Pace --------------------------------
+    container.markdown("### Average Race Pace")
+    pace_sum = results["pace_summary"]
+    if pace_sum.empty:
+        container.info("Not enough clean lap data for pace summary.")
+    else:
+        pace_sum = pace_sum.reset_index()
+        pace_sum = pace_sum[pace_sum["driver_number"].isin(active_drivers)]
+        pace_sum["label"] = pace_sum["driver_number"].apply(_label)
+        pace_sum = pace_sum.sort_values("median_pace", ascending=False)  # fastest at top
+        fig5 = go.Figure(go.Bar(
+            x=pace_sum["median_pace"],
+            y=pace_sum["label"],
+            orientation="h",
+            marker=dict(
+                color=pace_sum["std_pace"],
+                colorscale="Viridis",
+                showscale=True,
+                colorbar=dict(title="Pace Std Dev (s)"),
+            ),
+            customdata=pace_sum[["mean_pace", "std_pace", "fastest_lap", "lap_count"]].values,
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Median: %{x:.3f}s<br>"
+                "Mean: %{customdata[0]:.3f}s<br>"
+                "Std Dev: %{customdata[1]:.3f}s<br>"
+                "Fastest lap: %{customdata[2]:.3f}s<br>"
+                "Laps counted: %{customdata[3]}<extra></extra>"
+            ),
+        ))
+        fig5.update_layout(
+            xaxis_title="Median Lap Time (s)",
+            yaxis_title="Driver",
+            showlegend=False,
+        )
+        container.plotly_chart(fig5, width="stretch", key="tab4_avg_pace")
+
+    # ---- Chart 6: Race Pace Ranking --------------------------------
+    container.markdown("### Race Pace Ranking")
+    if pace_sum.empty:
+        container.info("Not enough clean lap data for pace ranking.")
+    else:
+        ranked = pace_sum.sort_values("mean_pace")
+        bar_colors = [cmap.get(int(row["driver_number"]), "#888") for _, row in ranked.iterrows()]
+        fig6 = go.Figure(go.Bar(
+            x=ranked["label"],
+            y=ranked["mean_pace"],
+            error_y=dict(type="data", array=ranked["std_pace"].tolist(), visible=True),
+            marker_color=bar_colors,
+            text=ranked["fastest_lap"].round(3).astype(str) + "s",
+            textposition="outside",
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "Mean pace: %{y:.3f}s<br>"
+                "Fastest lap: %{text}<extra></extra>"
+            ),
+        ))
+        fig6.update_layout(
+            xaxis_title="Driver",
+            yaxis_title="Mean Lap Time (s)",
+            showlegend=False,
+        )
+        container.plotly_chart(fig6, width="stretch", key="tab4_pace_ranking")
+
+    # ---- Chart 7: Tyre Degradation by Compound ---------------------
+    container.markdown("### Tyre Degradation by Compound")
+    tyre_deg = results["tyre_deg"]
+    tyre_deg = tyre_deg[tyre_deg["driver_number"].isin(active_drivers)]
+    if tyre_deg.empty:
+        container.info("Stint data unavailable — tyre degradation chart requires stint information.")
+    else:
+        COMPOUND_COLORS = {
+            "SOFT": "#e8002d",
+            "MEDIUM": "#ffd700",
+            "HARD": "#cccccc",
+            "INTERMEDIATE": "#39b54a",
+            "WET": "#0067ff",
+        }
+        fig7 = go.Figure()
+        for compound, grp in tyre_deg.groupby("compound"):
+            color = COMPOUND_COLORS.get(str(compound).upper(), "#888888")
+            fig7.add_trace(go.Scatter(
+                x=grp["mean_pace"],
+                y=grp["deg_per_lap"],
+                mode="markers",
+                name=str(compound),
+                marker=dict(color=color, size=10, line=dict(width=1, color="white")),
+                customdata=grp[["driver_number", "laps_in_stint"]].assign(
+                    label=grp["driver_number"].apply(_label)
+                )[["label", "laps_in_stint"]].values,
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b> — " + str(compound) + "<br>"
+                    "Mean pace: %{x:.3f}s<br>"
+                    "Degradation: %{y:+.4f}s/lap<br>"
+                    "Laps in stint: %{customdata[1]}<extra></extra>"
+                ),
+            ))
+        fig7.add_hline(
+            y=0, line_dash="dash", line_color="white",
+            opacity=0.4, annotation_text="No degradation",
+            annotation_position="top left",
+        )
+        fig7.update_layout(
+            xaxis_title="Mean Stint Pace (s)",
+            yaxis_title="Degradation (s / lap)",
+            legend_title="Compound",
+        )
+        container.plotly_chart(fig7, width="stretch", key="tab4_tyre_deg")
+
 
 # ---- Tab 4 content -----------------------------------------------
 
@@ -493,60 +614,117 @@ with tab4:
     if mode.startswith("🗂️"):
         # ---- HISTORICAL MODE ----
         h1, h2 = st.columns(2)
-        hist_year = h1.selectbox("Year", [2024, 2023, 2022], key="rp_year")
-        hist_gp = h2.text_input("Grand Prix", value="Italian Grand Prix", key="rp_gp")
-        hist_laps_remaining = st.number_input(
-            "Laps remaining (for projection)", min_value=0, value=10, key="rp_laps_rem",
+        hist_year = h1.selectbox("Year", [2026, 2025, 2024, 2023, 2022], key="rp_year")
+        _gp_options = [
+            "Australian Grand Prix",
+            "Bahrain Grand Prix",
+            "Saudi Arabian Grand Prix",
+            "Japanese Grand Prix",
+            "Chinese Grand Prix",
+            "Miami Grand Prix",
+            "Emilia Romagna Grand Prix",
+            "Monaco Grand Prix",
+            "Canadian Grand Prix",
+            "Spanish Grand Prix",
+            "Austrian Grand Prix",
+            "British Grand Prix",
+            "Hungarian Grand Prix",
+            "Belgian Grand Prix",
+            "Dutch Grand Prix",
+            "Italian Grand Prix",
+            "Azerbaijan Grand Prix",
+            "Singapore Grand Prix",
+            "United States Grand Prix",
+            "Mexico City Grand Prix",
+            "São Paulo Grand Prix",
+            "Las Vegas Grand Prix",
+            "Qatar Grand Prix",
+            "Abu Dhabi Grand Prix",
+        ]
+        hist_gp = h2.selectbox(
+            "Grand Prix",
+            options=_gp_options,
+            index=_gp_options.index("Italian Grand Prix"),
+            key="rp_gp",
         )
+        # Invalidate cached sessions when year or GP changes
+        if st.session_state["rp_fetched_for"] != (hist_year, hist_gp):
+            st.session_state["rp_available_sessions"] = None
+            st.session_state["rp_hist_analyser"] = None
 
-        if st.button("Load Race Data", key="rp_load"):
-            with st.spinner("Fetching data from OpenF1..."):
-                client = OpenF1Client(mode="historical")
-                sessions = client.get_sessions(hist_year, hist_gp)
-
-                if sessions.empty:
-                    st.error(
-                        "No sessions found. Either the year/Grand Prix name is wrong, "
-                        "or the OpenF1 API is unreachable (check your internet connection)."
-                    )
-                    st.stop()
-
-                # Pick the Race session; fall back to whatever is available
-                race_sessions = sessions[sessions["session_name"].str.contains("Race", case=False, na=False)]
-                if race_sessions.empty:
-                    race_sessions = sessions
-                session_key = int(race_sessions.iloc[0]["session_key"])
-
-                st.caption(f"Session key: `{session_key}`")
-
-                laps = client.get_laps(session_key)
-                stints = client.get_stints(session_key)
-                position = client.get_position(session_key)
-                drivers_df = client.get_drivers(session_key)
-
-            if laps.empty:
-                st.error("No lap data returned for this session.")
+        # Step 1 — Fetch available sessions for the selected GP
+        if st.button("Fetch Sessions", key="rp_fetch_sessions"):
+            with st.spinner("Fetching sessions from OpenF1..."):
+                _client = OpenF1Client(mode="historical")
+                _sessions = _client.get_sessions(hist_year, hist_gp)
+            if _sessions.empty:
+                st.error(
+                    "No sessions found. Either the year/Grand Prix name is wrong, "
+                    "or the OpenF1 API is unreachable (check your internet connection)."
+                )
             else:
-                # Build driver number → acronym map
-                driver_map: dict = {}
-                if not drivers_df.empty and "driver_number" in drivers_df.columns and "name_acronym" in drivers_df.columns:
-                    driver_map = {
-                        int(row["driver_number"]): str(row["name_acronym"])
-                        for _, row in drivers_df.iterrows()
-                        if pd.notna(row["driver_number"]) and pd.notna(row["name_acronym"])
-                    }
-                # Persist analyser and driver map in session state so charts survive reruns
-                st.session_state["rp_hist_analyser"] = RaceAnalyser(laps, stints, position)
-                st.session_state["rp_hist_laps_remaining"] = hist_laps_remaining
-                st.session_state["rp_hist_driver_map"] = driver_map
+                st.session_state["rp_available_sessions"] = _sessions
+                st.session_state["rp_fetched_for"] = (hist_year, hist_gp)
+
+        # Step 2 — Session selector + Load button (shown once sessions are fetched)
+        if st.session_state["rp_available_sessions"] is not None:
+            _sessions_df = st.session_state["rp_available_sessions"]
+            _session_names = _sessions_df["session_name"].tolist() if "session_name" in _sessions_df.columns else []
+            # Default to Race if available
+            _default_idx = next(
+                (i for i, n in enumerate(_session_names) if "race" in str(n).lower() and "sprint" not in str(n).lower()),
+                0,
+            )
+            hist_session_name = st.selectbox(
+                "Session",
+                options=_session_names,
+                index=_default_idx,
+                key="rp_session_name",
+            )
+
+            if st.button("Load Session Data", key="rp_load"):
+                _row = _sessions_df[_sessions_df["session_name"] == hist_session_name].iloc[0]
+                session_key = int(_row["session_key"])
+                with st.spinner(f"Loading {hist_session_name} data from OpenF1..."):
+                    client = OpenF1Client(mode="historical")
+                    laps = client.get_laps(session_key)
+                    stints = client.get_stints(session_key)
+                    position = client.get_position(session_key)
+                    drivers_df = client.get_drivers(session_key)
+
+                if laps.empty:
+                    st.error("No lap data returned for this session.")
+                else:
+                    driver_map: dict = {}
+                    if not drivers_df.empty and "driver_number" in drivers_df.columns and "name_acronym" in drivers_df.columns:
+                        driver_map = {
+                            int(row["driver_number"]): str(row["name_acronym"])
+                            for _, row in drivers_df.iterrows()
+                            if pd.notna(row["driver_number"]) and pd.notna(row["name_acronym"])
+                        }
+                    st.session_state["rp_hist_analyser"] = RaceAnalyser(laps, stints, position)
+                    st.session_state["rp_hist_driver_map"] = driver_map
+        else:
+            st.info("Select a year and Grand Prix, then click **Fetch Sessions** to see available sessions.")
 
         # Render charts from session state if data has been loaded
         if st.session_state["rp_hist_analyser"] is not None:
+            _analyser = st.session_state["rp_hist_analyser"]
+            _dmap = st.session_state["rp_hist_driver_map"]
+            _all_drvs = sorted(_analyser._clean["driver_number"].dropna().unique().tolist())
+            _selected = st.multiselect(
+                "Drivers",
+                options=_all_drvs,
+                default=_all_drvs,
+                format_func=lambda n: _dmap.get(int(n), str(n)),
+                key="rp_driver_filter",
+            )
             _render_charts(
-                st.session_state["rp_hist_analyser"],
-                st.session_state["rp_hist_laps_remaining"],
+                _analyser,
+                0,
                 st,
-                driver_map=st.session_state["rp_hist_driver_map"],
+                driver_map=_dmap,
+                selected_drivers=_selected or _all_drvs,
             )
 
     else:
@@ -605,12 +783,22 @@ with tab4:
                 st.warning("No active session found. Try during a race weekend.")
             else:
                 analyser = RaceAnalyser(laps, stints, position)
+                _live_dmap = st.session_state["rp_live_driver_map"]
+                _all_drvs = sorted(analyser._clean["driver_number"].dropna().unique().tolist())
+                _selected = st.multiselect(
+                    "Drivers",
+                    options=_all_drvs,
+                    default=_all_drvs,
+                    format_func=lambda n: _live_dmap.get(int(n), str(n)),
+                    key="rp_driver_filter",
+                )
                 with chart_container.container():
                     _render_charts(
                         analyser,
                         live_laps_remaining,
                         st,
-                        driver_map=st.session_state["rp_live_driver_map"],
+                        driver_map=_live_dmap,
+                        selected_drivers=_selected or _all_drvs,
                     )
         except Exception as exc:
             st.warning(f"Live refresh failed: {exc}")

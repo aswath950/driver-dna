@@ -393,6 +393,41 @@ class RaceAnalyser:
 
         return active_projections + dnf_projections
 
+    # ------------------------------------------------------------------
+    # 5. Tyre degradation
+    # ------------------------------------------------------------------
+
+    def tyre_degradation(self) -> pd.DataFrame:
+        """
+        Degradation rate (seconds per lap) per driver/stint via linear regression.
+
+        Wraps the standalone ``stint_degradation()`` utility using clean laps.
+
+        Returns
+        -------
+        DataFrame with columns: ``driver_number``, ``stint_number``,
+        ``compound``, ``laps_in_stint``, ``deg_per_lap``, ``mean_pace``.
+        """
+        return stint_degradation(self._clean, self._stints)
+
+    # ------------------------------------------------------------------
+    # 6. Pace summary
+    # ------------------------------------------------------------------
+
+    def pace_summary(self) -> pd.DataFrame:
+        """
+        Per-driver aggregate pace from clean (pit-out/SC filtered) laps.
+
+        Wraps the standalone ``compute_pace_summary()`` utility.
+
+        Returns
+        -------
+        DataFrame indexed by ``driver_number`` with columns:
+        ``mean_pace``, ``median_pace``, ``std_pace``, ``fastest_lap``,
+        ``lap_count``.
+        """
+        return compute_pace_summary(self._clean)
+
 
 # ------------------------------------------------------------------
 # Standalone utility functions (kept for backward compatibility)
