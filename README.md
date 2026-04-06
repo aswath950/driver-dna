@@ -24,7 +24,7 @@ Real-time and historical race analysis powered by the OpenF1 API (no API key req
 
 **Historical mode** — analyse any race from 2022 onwards. Select a year and Grand Prix, and all charts load from the OpenF1 archive.
 
-**4 analysis charts:**
+**7 analysis charts:**
 
 | Chart | What it shows |
 |---|---|
@@ -32,6 +32,11 @@ Real-time and historical race analysis powered by the OpenF1 API (no API key req
 | **Gap to Leader** | Cumulative time gap to the race leader at each lap. Each driver's area is shaded at low opacity so gaps are easy to read at a glance. |
 | **Undercut / Overcut Alerts** | Triangle markers overlaid on the gap chart at the exact lap where a position swap was caused by a pit strategy move. Hover for details. |
 | **Projected Finishing Order** | Horizontal bars showing projected gap to the winner. Accounts for current pace, tyre degradation (+0.07s/lap beyond 20 laps on a compound), and flags DNF drivers. Bars are green (gaining), red (losing), or grey (holding). |
+| **Average Race Pace** | Horizontal bars per driver sorted fastest to slowest, coloured by pace consistency (Viridis scale — yellow = consistent, dark = variable). Hover shows mean, median, std dev, fastest lap, and lap count. |
+| **Race Pace Ranking** | Vertical bars sorted fastest to slowest with ± std dev error bars. Each driver has a distinct colour. Fastest lap time is annotated above each bar. |
+| **Tyre Degradation by Compound** | Scatter plot of mean stint pace vs. degradation rate (s/lap) from linear regression. Coloured by compound: SOFT (red), MEDIUM (yellow), HARD (grey), INTERMEDIATE (green), WET (blue). A zero-line marks the no-degradation baseline. |
+
+All driver labels display 3-letter acronyms (e.g. HAM, VER) rather than raw driver numbers.
 
 ---
 
@@ -167,7 +172,7 @@ driver-dna/
 │   ├── pipeline.py     # Data extraction & feature engineering
 │   ├── model.py        # Train, evaluate, save classifier
 │   ├── openf1.py       # OpenF1 API client (live + historical)
-│   ├── race_engine.py  # Pace analysis, undercut detection, projections
+│   ├── race_engine.py  # Pace analysis, tyre degradation, undercut detection, projections
 │   └── app.py          # Streamlit dashboard (4 tabs)
 ├── .streamlit/
 │   └── config.toml     # Dark theme with F1 red (#E8002D)
