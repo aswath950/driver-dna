@@ -120,6 +120,7 @@ def extract_session_telemetry(
 
             row = {
                 "driver": driver,
+                "lap_number": int(lap["LapNumber"]),
                 "lap_time_seconds": lap["LapTime"].total_seconds(),
                 "mean_speed": float(np.nanmean(spd)),
                 "max_speed": float(np.nanmax(spd)),

@@ -1,4 +1,4 @@
-# Driver DNA + Race Pace
+# Driver DNA + Race Dashboard
 
 **Can a machine learning model tell two F1 drivers apart from their telemetry alone — without ever seeing their name?**
 
@@ -12,13 +12,14 @@ Driver DNA Fingerprinter extracts lap telemetry from FastF1, engineers driving-s
 
 Extracts telemetry from qualifying/race sessions, engineers 10 scalar driving-style features per lap, and trains an XGBoost classifier to identify drivers. The Streamlit dashboard includes:
 
-- **Telemetry Overlay** — compare two drivers' average Speed, Throttle, or Brake trace across all their laps
 - **Driver Radar** — spider chart of normalised style features for 2–4 drivers
 - **Mystery Driver** — pick any lap, let the model guess the driver, then reveal whether it was right
 
-### 🏁 Race Pace Dashboard
+### 🏁 Race Dashboard
 
 Real-time and historical race analysis powered by the OpenF1 API (no API key required).
+
+**Fastest Lap Telemetry** — compare the single fastest recorded lap telemetry (Speed, Throttle, or Brake) between two drivers side by side. Legend shows each driver's fastest lap time.
 
 **Live mode** — connects to the OpenF1 live feed during an active F1 session. Auto-refreshes at a configurable interval (10s / 30s / 60s) with a pulsing LIVE badge. Only works during active F1 race weekends.
 
@@ -70,7 +71,13 @@ Each lap is compressed into **10 scalar features** that capture driving style:
 A gradient-boosted tree classifier is trained with **5-fold stratified cross-validation**. Each driver is one class. The model learns the combination of scalar features that makes each driver's style distinct. SHAP values reveal which features matter most.
 
 ### 4. Streamlit dashboard (`src/app.py`)
-Four interactive tabs covering both the Driver DNA analysis and the Race Pace Dashboard described in the Features section above.
+Three interactive tabs covering both the Driver DNA analysis and the Race Dashboard described in the Features section above:
+
+| Tab | Contents |
+|---|---|
+| **Driver Radar** | Normalised driving-style spider chart for 2–4 drivers |
+| **Mystery Driver** | ML model prediction with probability breakdown |
+| **Race Dashboard** | Fastest lap telemetry comparison + full race analysis (7 charts) |
 
 ---
 
@@ -114,7 +121,7 @@ python src/model.py
 streamlit run src/app.py
 ```
 
-> **Note:** The Race Pace Dashboard's live mode only works during active F1 race weekends (practice, qualifying, or race sessions). Historical mode works any time for races from 2022 onwards.
+> **Note:** The Race Dashboard's live mode only works during active F1 race weekends (practice, qualifying, or race sessions). Historical mode works any time for races from 2022 onwards.
 
 ---
 
@@ -173,7 +180,7 @@ driver-dna/
 │   ├── model.py        # Train, evaluate, save classifier
 │   ├── openf1.py       # OpenF1 API client (live + historical)
 │   ├── race_engine.py  # Pace analysis, tyre degradation, undercut detection, projections
-│   └── app.py          # Streamlit dashboard (4 tabs)
+│   └── app.py          # Streamlit dashboard (3 tabs)
 ├── .streamlit/
 │   └── config.toml     # Dark theme with F1 red (#E8002D)
 ├── streamlit_app.py    # Streamlit Community Cloud entry point

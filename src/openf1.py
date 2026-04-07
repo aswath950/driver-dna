@@ -36,6 +36,10 @@ _STINT_COLS = [
 _POSITION_COLS = [
     "driver_number", "position", "date", "session_key",
 ]
+_CAR_DATA_COLS = [
+    "driver_number", "date", "speed", "throttle", "brake",
+    "n_gear", "rpm", "session_key",
+]
 
 
 def validate_dataframe(df: pd.DataFrame, required_cols: list[str], context: str = "") -> pd.DataFrame:
@@ -237,6 +241,38 @@ class OpenF1Client:
         df = self._clean(df, _STINT_COLS)
         return validate_dataframe(df, _STINT_COLS, "get_stints")
 
+    def get_car_data(
+        self,
+        session_key: int,
+        driver_number: int | None = None,
+        date_gte: str | None = None,
+        date_lte: str | None = None,
+    ) -> pd.DataFrame:
+        """
+        Return high-frequency car telemetry for a specific driver and time window.
+
+        The ``/v1/car_data`` endpoint does not support ``lap_number`` filtering.
+        Always provide ``driver_number`` plus a ``date_gte``/``date_lte`` window
+        (ISO-8601 strings) to keep the response small and avoid 422 errors.
+
+        Returns
+        -------
+        DataFrame with at least: ``driver_number``, ``date``, ``speed``,
+        ``throttle``, ``brake``, ``n_gear``, ``rpm``, ``session_key``.
+        """
+        params: dict = {"session_key": session_key}
+        if driver_number is not None:
+            params["driver_number"] = driver_number
+        if date_gte is not None:
+            params["date>"] = date_gte
+        if date_lte is not None:
+            params["date<"] = date_lte
+        df = self._get("car_data", params)
+        df = self._clean(df, _CAR_DATA_COLS)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        return validate_dataframe(df, _CAR_DATA_COLS, "get_car_data")
+
     def get_position(self, session_key: int) -> pd.DataFrame:
         """
         Return position data per driver per lap for a given session.
@@ -299,6 +335,15 @@ class OpenF1Client:
         if "date" in df.columns and not df["date"].isna().all():
             self._last_stint_ts = str(df["date"].max())
         return validate_dataframe(df, _STINT_COLS, "get_live_stints")
+
+    def get_live_car_data(self) -> pd.DataFrame:
+        """Poll ``/v1/car_data?session_key=latest`` for the current session."""
+        self._require_live()
+        df = self._get("car_data", {"session_key": "latest"})
+        df = self._clean(df, _CAR_DATA_COLS)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        return validate_dataframe(df, _CAR_DATA_COLS, "get_live_car_data")
 
     def get_live_position(self) -> pd.DataFrame:
         """
