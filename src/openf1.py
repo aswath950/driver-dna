@@ -198,7 +198,7 @@ class OpenF1Client:
         df = self._get("drivers", {"session_key": session_key})
         if df.empty:
             return df
-        for col in ["driver_number", "name_acronym", "full_name", "team_name"]:
+        for col in ["driver_number", "name_acronym", "full_name", "team_name", "team_colour"]:
             if col not in df.columns:
                 df[col] = pd.NA
         return df
@@ -209,7 +209,7 @@ class OpenF1Client:
         df = self._get("drivers", {"session_key": "latest"})
         if df.empty:
             return df
-        for col in ["driver_number", "name_acronym", "full_name", "team_name"]:
+        for col in ["driver_number", "name_acronym", "full_name", "team_name", "team_colour"]:
             if col not in df.columns:
                 df[col] = pd.NA
         return df
