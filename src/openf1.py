@@ -243,7 +243,7 @@ class OpenF1Client:
 
     def get_car_data(
         self,
-        session_key: int,
+        session_key: int | str,
         driver_number: int | None = None,
         date_gte: str | None = None,
         date_lte: str | None = None,

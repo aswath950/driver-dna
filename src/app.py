@@ -10,6 +10,7 @@ Expected columns from dataset.parquet:
   gear_changes, steer_std, speed_trace, throttle_trace, brake_trace
 """
 
+import json
 import sys
 import time
 from datetime import datetime
@@ -27,6 +28,7 @@ from openf1 import OpenF1Client
 from race_engine import RaceAnalyser
 
 DATASET_PATH = DATA_DIR / "dataset.parquet"
+CIRCUITS_PATH = DATA_DIR / "circuits.json"
 ACCURACY_PATH = MODELS_DIR / "accuracy.txt"
 N_POINTS = 200
 TRACE_COLS = {"Speed": "speed_trace", "Throttle": "throttle_trace", "Brake": "brake_trace"}
@@ -49,12 +51,14 @@ STATE_DEFAULTS: dict = {
     "rp_hist_analyser": None,
     "rp_hist_driver_map": {},
     "rp_hist_team_colour_map": {},   # {int(driver_number): "#RRGGBB"}
+    "rp_hist_session_key": None,     # int session_key of the currently loaded session
     # Tab 4 historical — available sessions fetched from OpenF1
     "rp_available_sessions": None,   # pd.DataFrame or None
     "rp_fetched_for": None,          # (year, gp) tuple — invalidates cache on change
     # Tab 4 live — driver map for current session
     "rp_live_driver_map": {},
     "rp_live_team_colour_map": {},   # {int(driver_number): "#RRGGBB"}
+    "rp_live_meeting_name": "",      # GP name for live Track Map circuit lookup
 }
 
 st.set_page_config(page_title="Driver DNA Fingerprinter", layout="wide")
@@ -151,6 +155,15 @@ def get_data() -> pd.DataFrame:
     return pd.read_parquet(DATASET_PATH)
 
 
+@st.cache_data
+def get_circuits() -> dict:
+    """Load pre-generated circuit XY outlines keyed by Grand Prix name."""
+    if not CIRCUITS_PATH.exists():
+        return {}
+    with open(CIRCUITS_PATH) as f:
+        return json.load(f)
+
+
 if not DATASET_PATH.exists():
     st.error("Run `python src/pipeline.py` first to fetch telemetry and build the dataset.")
     st.stop()
@@ -166,6 +179,8 @@ try:
 except Exception as e:
     st.error(f"Failed to load resources: {e}")
     st.stop()
+
+circuits = get_circuits()
 
 drivers = sorted(df["driver"].unique())
 palette = px.colors.qualitative.Plotly
@@ -299,6 +314,11 @@ def _fastest_lap_trace(
     or (None, None, None) if the driver or channel is not found.
     lap_number is the driver's own lap number (e.g. lap 32 of their race), or None
     if the dataset pre-dates the lap_number column.
+
+    Note: this function is now used only by the Driver Radar and Mystery Driver tabs,
+    which still read from the static dataset.parquet. The Race Dashboard telemetry
+    section uses _fetch_fastest_lap_openf1() and _fetch_fastest_lap_all_openf1()
+    instead, which pull live data from the OpenF1 API for the user-selected session.
     """
     trace_col = TRACE_COLS.get(channel)
     if trace_col is None or trace_col not in telemetry_df.columns:
@@ -326,6 +346,10 @@ def _get_fastest_lap_all(
 
     Keys: 'speed', 'x', 'y', 'lap_time', 'lap_number'.
     'x' and 'y' are None if the dataset pre-dates the x_trace/y_trace columns.
+
+    Note: this function is now used only to supply X/Y circuit coordinates to Track Map
+    from dataset.parquet (the only available source for XY). All other telemetry in the
+    Race Dashboard is fetched live via _fetch_fastest_lap_all_openf1().
     """
     drv_df = telemetry_df[telemetry_df["driver"] == driver_acronym].dropna(
         subset=["lap_time_seconds"]
@@ -339,6 +363,175 @@ def _get_fastest_lap_all(
         "y": np.asarray(row["y_trace"], dtype=float) if "y_trace" in row.index else None,
         "lap_time": float(row["lap_time_seconds"]),
         "lap_number": int(row["lap_number"]) if "lap_number" in row.index else None,
+    }
+
+
+def _fetch_fastest_lap_openf1(
+    session_key: int | str,
+    driver_number: int,
+    laps_df: pd.DataFrame,
+    channel: str,
+) -> tuple[np.ndarray | None, float | None, int | None]:
+    """
+    Fetch the fastest-lap telemetry trace for a driver from the OpenF1 car_data API.
+
+    Parameters
+    ----------
+    session_key : int | str
+        The OpenF1 session key for the currently loaded session, or ``"latest"``
+        for the live session.
+    driver_number : int
+        The OpenF1 driver number (e.g. 44 for Hamilton).
+    laps_df : pd.DataFrame
+        The laps DataFrame already fetched from OpenF1 for this session.
+        Used to identify the fastest lap and its time window — avoids a second API call.
+    channel : str
+        One of ``"Speed"``, ``"Throttle"``, ``"Brake"``.
+
+    Returns
+    -------
+    (trace, lap_time, lap_number) where trace is a float64 ndarray of length N_POINTS,
+    or (None, None, None) on any failure.
+
+    How it works
+    ------------
+    1. Filter laps to this driver, drop pit-out laps, find the row with the
+       minimum ``lap_duration``.
+    2. Use ``date_start`` and ``date_start + lap_duration`` as the car_data
+       time window (ISO-8601 strings passed to ``date>`` / ``date<``).
+    3. Fetch car_data from OpenF1 for that window.
+    4. Sort by date, compute a cumulative-distance proxy from speed × dt, then
+       resample the requested channel to N_POINTS evenly spaced distance points
+       using np.interp — matching the normalisation pipeline.py applies.
+    """
+    OPENF1_CHANNEL_COL = {"Speed": "speed", "Throttle": "throttle", "Brake": "brake"}
+    col = OPENF1_CHANNEL_COL.get(channel)
+    if col is None:
+        return None, None, None
+
+    # --- 1. Find the fastest lap for this driver ---
+    drv_laps = laps_df[laps_df["driver_number"] == driver_number].copy()
+    if "is_pit_out_lap" in drv_laps.columns:
+        drv_laps = drv_laps[drv_laps["is_pit_out_lap"] != True]  # noqa: E712
+    drv_laps = drv_laps.dropna(subset=["lap_duration"])
+    if drv_laps.empty:
+        return None, None, None
+
+    fastest = drv_laps.sort_values("lap_duration").iloc[0]
+    lap_time = float(fastest["lap_duration"])
+    lap_number: int | None = int(fastest["lap_number"]) if pd.notna(fastest.get("lap_number")) else None
+
+    # --- 2. Build the time window ---
+    date_start = fastest.get("date_start")
+    if date_start is None or pd.isna(date_start):
+        return None, None, None
+    ts_start = pd.Timestamp(date_start)
+    ts_end = ts_start + pd.Timedelta(seconds=lap_time)
+    # Add a small buffer so we don't clip the final sample
+    date_gte = ts_start.isoformat()
+    date_lte = (ts_end + pd.Timedelta(seconds=0.5)).isoformat()
+
+    # --- 3. Fetch car_data ---
+    client = OpenF1Client(mode="historical")
+    car = client.get_car_data(
+        session_key=session_key,
+        driver_number=driver_number,
+        date_gte=date_gte,
+        date_lte=date_lte,
+    )
+    if car.empty or col not in car.columns or "date" not in car.columns:
+        return None, None, None
+
+    car = car.sort_values("date").reset_index(drop=True)
+    values = car[col].to_numpy(dtype=float)
+    if len(values) < 2:
+        return None, None, None
+
+    # --- 4. Resample to N_POINTS evenly spaced distance points ---
+    # Compute cumulative distance proxy: distance ≈ speed × dt (speed in km/h → m/s)
+    dt = car["date"].diff().dt.total_seconds().fillna(0.0).to_numpy(dtype=float)[1:]
+    speeds_ms = car["speed"].to_numpy(dtype=float)[:-1] / 3.6            # km/h → m/s
+    dist_increments = np.where(np.isfinite(speeds_ms) & np.isfinite(dt), speeds_ms * dt, 0.0)
+    dist = np.concatenate([[0.0], np.cumsum(dist_increments)])
+
+    dist_grid = np.linspace(dist[0], dist[-1], N_POINTS)
+    trace = np.interp(dist_grid, dist, values)
+    return trace, lap_time, lap_number
+
+
+def _fetch_fastest_lap_all_openf1(
+    session_key: int | str,
+    driver_number: int,
+    laps_df: pd.DataFrame,
+) -> dict | None:
+    """
+    Fetch all telemetry channels for a driver's fastest lap from the OpenF1 API.
+
+    Returns a dict with keys: ``'speed'``, ``'throttle'``, ``'brake'``,
+    ``'lap_time'``, ``'lap_number'``, ``'x'``, ``'y'``.
+
+    ``'x'`` and ``'y'`` are always ``None`` — OpenF1 car_data does not include
+    circuit XY coordinates. Track Map falls back to dataset.parquet for these.
+    """
+    drv_laps = laps_df[laps_df["driver_number"] == driver_number].copy()
+    if "is_pit_out_lap" in drv_laps.columns:
+        drv_laps = drv_laps[drv_laps["is_pit_out_lap"] != True]  # noqa: E712
+    drv_laps = drv_laps.dropna(subset=["lap_duration"])
+    if drv_laps.empty:
+        return None
+
+    fastest = drv_laps.sort_values("lap_duration").iloc[0]
+    lap_time = float(fastest["lap_duration"])
+    lap_number: int | None = int(fastest["lap_number"]) if pd.notna(fastest.get("lap_number")) else None
+
+    date_start = fastest.get("date_start")
+    if date_start is None or pd.isna(date_start):
+        return None
+    ts_start = pd.Timestamp(date_start)
+    ts_end = ts_start + pd.Timedelta(seconds=lap_time)
+    date_gte = ts_start.isoformat()
+    date_lte = (ts_end + pd.Timedelta(seconds=0.5)).isoformat()
+
+    client = OpenF1Client(mode="historical")
+    car = client.get_car_data(
+        session_key=session_key,
+        driver_number=driver_number,
+        date_gte=date_gte,
+        date_lte=date_lte,
+    )
+    if car.empty or "date" not in car.columns or "speed" not in car.columns:
+        return None
+
+    car = car.sort_values("date").reset_index(drop=True)
+    speeds = car["speed"].to_numpy(dtype=float)
+    if len(speeds) < 2:
+        return None
+
+    # Cumulative elapsed time from real timestamps — immune to missing samples.
+    # (date[i] - date[0]) gives the true wall-clock time at each data point;
+    # no speed-based reconstruction needed so there are no integration artifacts.
+    cumtime_raw = (car["date"] - car["date"].iloc[0]).dt.total_seconds().to_numpy(dtype=float)
+
+    dt = car["date"].diff().dt.total_seconds().fillna(0.0).to_numpy(dtype=float)[1:]
+    speeds_ms = speeds[:-1] / 3.6
+    dist_increments = np.where(np.isfinite(speeds_ms) & np.isfinite(dt), speeds_ms * dt, 0.0)
+    dist = np.concatenate([[0.0], np.cumsum(dist_increments)])
+    dist_grid = np.linspace(dist[0], dist[-1], N_POINTS)
+
+    def _resample(col: str) -> np.ndarray:
+        if col not in car.columns:
+            return np.full(N_POINTS, np.nan)
+        return np.interp(dist_grid, dist, car[col].to_numpy(dtype=float))
+
+    return {
+        "speed": _resample("speed"),
+        "throttle": _resample("throttle"),
+        "brake": _resample("brake"),
+        "cumtime": np.interp(dist_grid, dist, cumtime_raw),  # elapsed seconds at each distance point
+        "x": None,   # not available from OpenF1 car_data; Track Map uses dataset.parquet
+        "y": None,
+        "lap_time": lap_time,
+        "lap_number": lap_number,
     }
 
 
@@ -360,15 +553,20 @@ def _build_track_map_fig(
     if x_a is None or y_a is None:
         return None
 
-    # Upsample from 200 stored points → 1000 display points for a smoother
-    # circuit outline and finer microsector boundaries (999 segments vs 199).
+    # Upsample to 1000 display points for a smoother circuit outline and finer
+    # microsector boundaries. XY (from circuits.json, 500 pts) and speed traces
+    # (from OpenF1, N_POINTS=200) may have different source lengths, so each is
+    # interpolated on its own unit-interval grid before being mapped to t_fine.
     N_DISPLAY = 1000
-    t = np.linspace(0.0, 1.0, len(x_a))
     t_fine = np.linspace(0.0, 1.0, N_DISPLAY)
-    x_fine = np.interp(t_fine, t, x_a)
-    y_fine = np.interp(t_fine, t, y_a)
-    spd_a_fine = np.interp(t_fine, t, spd_a)
-    spd_b_fine = np.interp(t_fine, t, spd_b)
+
+    t_xy = np.linspace(0.0, 1.0, len(x_a))
+    x_fine = np.interp(t_fine, t_xy, x_a)
+    y_fine = np.interp(t_fine, t_xy, y_a)
+
+    t_spd = np.linspace(0.0, 1.0, len(spd_a))
+    spd_a_fine = np.interp(t_fine, t_spd, spd_a)
+    spd_b_fine = np.interp(t_fine, t_spd, spd_b)
 
     # winner[i] = "a" or "b" for the microsector between point i and i+1
     winner = np.where(spd_a_fine[:-1] >= spd_b_fine[:-1], "a", "b")
@@ -410,7 +608,7 @@ def _build_track_map_fig(
         i = j
 
     fig.update_layout(
-        title=f"Track Map — {acronym_a} vs {acronym_b} (faster driver per microsector)",
+        title=f"Track Map — {acronym_a} vs {acronym_b} (faster driver by microsector)",
         xaxis=dict(visible=False, scaleanchor="y", scaleratio=1),
         yaxis=dict(visible=False),
         legend_title="Faster driver",
@@ -427,96 +625,185 @@ def _build_time_delta_fig(
     data_b: dict, acronym_b: str, color_b: str,
 ) -> go.Figure:
     """
-    2D time-delta chart.
+    Redesigned time-delta chart.
 
-    X axis: Δ time = cumulative time of Driver B minus Driver A at each distance point.
-      Positive → A is ahead (B spent more time reaching that point).
-      Negative → B is ahead.
-    Y axis: elapsed time through the lap for Driver A (0 → lap_time_A seconds).
+    X axis: Lap Distance (0–100%) — symmetric, matches F1 broadcast convention.
+    Y axis: cumulative gap in seconds (positive = A ahead, negative = B ahead).
 
-    Elapsed time is reconstructed from the speed trace:
-      dt ∝ 1/speed  (uniform distance spacing → time ∝ inverse speed)
-    scaled so the total equals the known lap time.
+    Delta is computed from speed traces reconstructed to cumulative time, then
+    differenced. The line is coloured by whichever driver is ahead at each point.
+    Crossover markers, peak advantage markers, and a final-gap annotation are added
+    so the chart is readable at a glance.
     """
-    def _cumtime(speed: np.ndarray, lap_time: float) -> np.ndarray:
-        dt_raw = np.where(speed > 0, 1.0 / speed, np.nan)
-        mean_dt = float(np.nanmean(dt_raw))
-        dt_raw = np.where(np.isnan(dt_raw), mean_dt, dt_raw)
-        cum = np.cumsum(dt_raw)
-        return cum * lap_time / cum[-1]
-
-    cumtime_a = _cumtime(data_a["speed"], data_a["lap_time"])
-    cumtime_b = _cumtime(data_b["speed"], data_b["lap_time"])
-    delta = cumtime_b - cumtime_a   # positive = A gaining
-
-    def _to_rgba(color: str, alpha: float = 0.18) -> str:
+    def _to_rgba(color: str, alpha: float = 0.30) -> str:
         """Convert any hex or rgb() colour to an rgba() string Plotly accepts."""
         if color.startswith("rgba("):
             return color
         if color.startswith("rgb("):
             return color.replace("rgb(", "rgba(").replace(")", f",{alpha})")
-        # Hex: #RGB, #RRGGBB
         h = color.lstrip("#")
         if len(h) == 3:
             h = "".join(c * 2 for c in h)
         r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
         return f"rgba({r},{g},{b},{alpha})"
 
+    # Use real timestamp-derived cumulative time — avoids speed-reconstruction artifacts
+    # that cause mid-lap delta spikes when car_data samples are unevenly distributed.
+    cumtime_a = data_a["cumtime"]
+    cumtime_b = data_b["cumtime"]
+    delta = cumtime_b - cumtime_a   # positive = A gaining
+
+    n = len(delta)
+    x_pct = np.linspace(0.0, 100.0, n)
+
+    # Per-point plain-language hover text
+    hover_text = [
+        f"{acronym_a} +{abs(d):.3f}s ahead" if d >= 0 else f"{acronym_b} +{abs(d):.3f}s ahead"
+        for d in delta
+    ]
+
     fig = go.Figure()
 
-    # Zero reference (horizontal line after 90° CW rotation — elapsed time on X, delta on Y)
-    fig.add_hline(y=0, line=dict(color="rgba(255,255,255,0.4)", dash="dash", width=1))
-
-    # Shade: split delta into A-gaining (>0) and B-gaining (<0) regions
-    # fill="tozero y" fills vertically to y=0
+    # --- Shaded fill regions (opacity 0.30) ---
     pos = np.where(delta >= 0, delta, 0.0)
     neg = np.where(delta < 0, delta, 0.0)
 
     fig.add_trace(go.Scatter(
-        x=np.concatenate([[cumtime_a[0]], cumtime_a, [cumtime_a[-1]]]),
+        x=np.concatenate([[x_pct[0]], x_pct, [x_pct[-1]]]),
         y=np.concatenate([[0], pos, [0]]),
         mode="lines",
         fill="tozeroy",
-        fillcolor=_to_rgba(color_a),
+        fillcolor=_to_rgba(color_a, 0.30),
         line=dict(width=0),
-        name=f"{acronym_a} gaining",
-        showlegend=True,
+        name=f"{acronym_a} faster",
+        showlegend=False,
         hoverinfo="skip",
     ))
     fig.add_trace(go.Scatter(
-        x=np.concatenate([[cumtime_a[0]], cumtime_a, [cumtime_a[-1]]]),
+        x=np.concatenate([[x_pct[0]], x_pct, [x_pct[-1]]]),
         y=np.concatenate([[0], neg, [0]]),
         mode="lines",
         fill="tozeroy",
-        fillcolor=_to_rgba(color_b),
+        fillcolor=_to_rgba(color_b, 0.30),
         line=dict(width=0),
-        name=f"{acronym_b} gaining",
-        showlegend=True,
+        name=f"{acronym_b} faster",
+        showlegend=False,
         hoverinfo="skip",
     ))
 
-    # Main delta line
+    # --- Coloured delta line: A's colour above zero, B's colour below ---
+    delta_a = np.where(delta >= 0, delta, np.nan)
+    delta_b = np.where(delta < 0,  delta, np.nan)
+
     fig.add_trace(go.Scatter(
-        x=cumtime_a,
-        y=delta,
+        x=x_pct, y=delta_a,
         mode="lines",
-        line=dict(color="white", width=2),
-        name="Δ gap",
-        hovertemplate="t=%{x:.3f}s  Δ %{y:+.3f}s<extra></extra>",
+        connectgaps=False,
+        line=dict(color=color_a, width=2.5),
+        name=f"{acronym_a} faster",
+        customdata=hover_text,
+        hovertemplate="%{x:.0f}%  —  %{customdata}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_pct, y=delta_b,
+        mode="lines",
+        connectgaps=False,
+        line=dict(color=color_b, width=2.5),
+        name=f"{acronym_b} faster",
+        customdata=hover_text,
+        hovertemplate="%{x:.0f}%  —  %{customdata}<extra></extra>",
     ))
 
-    lap_a_label = f"Lap {data_a['lap_number']}, {data_a['lap_time']:.3f}s" if data_a["lap_number"] else f"{data_a['lap_time']:.3f}s"
-    lap_b_label = f"Lap {data_b['lap_number']}, {data_b['lap_time']:.3f}s" if data_b["lap_number"] else f"{data_b['lap_time']:.3f}s"
+    # --- Lead-change markers ---
+    crossings = np.where(np.diff(np.sign(delta)) != 0)[0]
+    if len(crossings) > 0:
+        cx = x_pct[crossings]
+        fig.add_trace(go.Scatter(
+            x=cx, y=np.zeros(len(cx)),
+            mode="markers",
+            marker=dict(color="white", size=8, symbol="circle",
+                        line=dict(color="rgba(0,0,0,0.6)", width=1)),
+            name="Lead change",
+            hovertemplate="Lead change at %{x:.0f}%<extra></extra>",
+        ))
+
+    # --- Peak advantage markers (only if meaningful gap > 0.05s) ---
+    max_delta = float(np.nanmax(delta))
+    min_delta = float(np.nanmin(delta))
+
+    if max_delta > 0.05:
+        idx_max = int(np.argmax(delta))
+        fig.add_trace(go.Scatter(
+            x=[x_pct[idx_max]], y=[max_delta],
+            mode="markers",
+            marker=dict(color=color_a, size=10, symbol="triangle-up",
+                        line=dict(color="white", width=1)),
+            name=f"Peak {acronym_a}",
+            hovertemplate=f"Max {acronym_a} +{max_delta:.3f}s at %{{x:.0f}}%<extra></extra>",
+        ))
+
+    if min_delta < -0.05:
+        idx_min = int(np.argmin(delta))
+        fig.add_trace(go.Scatter(
+            x=[x_pct[idx_min]], y=[min_delta],
+            mode="markers",
+            marker=dict(color=color_b, size=10, symbol="triangle-down",
+                        line=dict(color="white", width=1)),
+            name=f"Peak {acronym_b}",
+            hovertemplate=f"Max {acronym_b} +{abs(min_delta):.3f}s at %{{x:.0f}}%<extra></extra>",
+        ))
+
+    # --- Final gap annotation at right edge ---
+    final_gap = float(delta[-1])
+    if abs(final_gap) < 0.001:
+        gap_text = "Dead heat"
+        gap_color = "white"
+    elif final_gap > 0:
+        gap_text = f"+{final_gap:.3f}s\n{acronym_a}"
+        gap_color = color_a
+    else:
+        gap_text = f"{final_gap:.3f}s\n{acronym_b}"
+        gap_color = color_b
+
+    fig.add_annotation(
+        x=x_pct[-1], y=final_gap,
+        text=gap_text,
+        showarrow=True,
+        arrowhead=2,
+        arrowcolor=gap_color,
+        arrowwidth=1.5,
+        ax=40, ay=0,
+        font=dict(color=gap_color, size=12),
+        xanchor="left",
+    )
+
+    # --- Title with subtitle ---
+    lap_a_num = data_a.get("lap_number")
+    lap_b_num = data_b.get("lap_number")
+    lap_a_str = f"Lap {lap_a_num}, {data_a['lap_time']:.3f}s" if lap_a_num else f"{data_a['lap_time']:.3f}s"
+    lap_b_str = f"Lap {lap_b_num}, {data_b['lap_time']:.3f}s" if lap_b_num else f"{data_b['lap_time']:.3f}s"
+    title_text = (
+        f"Lap Time Delta — {acronym_a} vs {acronym_b}"
+        f"<br><sup>{acronym_a}: {lap_a_str}  |  {acronym_b}: {lap_b_str}</sup>"
+    )
 
     fig.update_layout(
-        title=(
-            f"Time Delta — {acronym_b} ({lap_b_label}) minus {acronym_a} ({lap_a_label})"
+        title=dict(text=title_text, font=dict(size=14)),
+        xaxis=dict(
+            title="Lap Distance (%)",
+            range=[0, 100],
+            zeroline=False,
         ),
-        xaxis_title=f"Elapsed time in lap — {acronym_a} (s)",
-        yaxis_title=f"Δ time (s)     ↑ {acronym_a} ahead  |  {acronym_b} ahead ↓",
-        legend_title="",
+        yaxis=dict(
+            title=f"Gap (s)   ↑ {acronym_a} faster   ·   {acronym_b} faster ↓",
+            zeroline=True,
+            zerolinecolor="rgba(255,255,255,0.6)",
+            zerolinewidth=1.5,
+        ),
         hovermode="x unified",
-        height=440,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=460,
+        margin=dict(t=80, b=50, l=60, r=120),
     )
     return fig
 
@@ -985,6 +1272,7 @@ with tab3:
                     st.session_state["rp_hist_analyser"] = RaceAnalyser(laps, stints, position)
                     st.session_state["rp_hist_driver_map"] = driver_map
                     st.session_state["rp_hist_team_colour_map"] = team_colour_map
+                    st.session_state["rp_hist_session_key"] = session_key
         else:
             st.info("Select a year and Grand Prix, then click **Fetch Sessions** to see available sessions.")
 
@@ -1011,7 +1299,7 @@ with tab3:
             )
             _tel_channel = _tc3.selectbox(
                 "Channel",
-                options=list(TRACE_COLS.keys()) + SPECIAL_CHANNELS,
+                options=SPECIAL_CHANNELS + list(TRACE_COLS.keys()),
                 key="rp_tel_channel",
             )
 
@@ -1031,22 +1319,36 @@ with tab3:
                     team_colour_map=st.session_state.get("rp_hist_team_colour_map"),
                 )
 
-                if _tel_channel in SPECIAL_CHANNELS:
-                    _data_a = _get_fastest_lap_all(df, _dlabel(_drv_a_int))
-                    _data_b = _get_fastest_lap_all(df, _dlabel(_drv_b_int))
+                _hist_sk: int | str | None = st.session_state.get("rp_hist_session_key")
+                _hist_laps = _analyser._laps
+
+                if _hist_sk is None:
+                    st.info("Session not loaded yet. Load a race first.")
+                elif _tel_channel in SPECIAL_CHANNELS:
+                    with st.spinner("Fetching fastest-lap telemetry from OpenF1..."):
+                        _data_a = _fetch_fastest_lap_all_openf1(_hist_sk, _drv_a_int, _hist_laps)
+                        _data_b = _fetch_fastest_lap_all_openf1(_hist_sk, _drv_b_int, _hist_laps)
                     if _data_a is None:
-                        st.caption(f"No FastF1 telemetry for {_dlabel(_drv_a_int)} — run `pipeline.py` to include this driver.")
+                        st.caption(f"Could not fetch telemetry for {_dlabel(_drv_a_int)} from OpenF1.")
                     elif _data_b is None:
-                        st.caption(f"No FastF1 telemetry for {_dlabel(_drv_b_int)} — run `pipeline.py` to include this driver.")
+                        st.caption(f"Could not fetch telemetry for {_dlabel(_drv_b_int)} from OpenF1.")
                     elif _tel_channel == "Track Map":
-                        _special_fig = _build_track_map_fig(
-                            _data_a, _dlabel(_drv_a_int), _col_a,
-                            _data_b, _dlabel(_drv_b_int), _col_b,
-                        )
-                        if _special_fig is None:
-                            st.info("Track Map requires X/Y coordinates. Re-run `python src/pipeline.py` to regenerate the dataset.")
+                        _gp_name = st.session_state.get("rp_gp", "")
+                        _circuit = circuits.get(_gp_name)
+                        if _circuit is None:
+                            st.info(f"No circuit data for '{_gp_name}'. Run `python src/generate_circuits.py` to generate it.")
                         else:
-                            st.plotly_chart(_special_fig, width="stretch", key="tab3_track_map_hist")
+                            _cx = np.asarray(_circuit["x"], dtype=float)
+                            _cy = np.asarray(_circuit["y"], dtype=float)
+                            _acronym_a, _acronym_b = _dlabel(_drv_a_int), _dlabel(_drv_b_int)
+                            _map_a = {"x": _cx, "y": _cy, "speed": _data_a["speed"]}
+                            _map_b = {"x": _cx, "y": _cy, "speed": _data_b["speed"]}
+                            _special_fig = _build_track_map_fig(
+                                _map_a, _acronym_a, _col_a,
+                                _map_b, _acronym_b, _col_b,
+                            )
+                            if _special_fig is not None:
+                                st.plotly_chart(_special_fig, width="stretch", key="tab3_track_map_hist")
                     elif _tel_channel == "Time Delta":
                         _special_fig = _build_time_delta_fig(
                             _data_a, _dlabel(_drv_a_int), _col_a,
@@ -1057,17 +1359,19 @@ with tab3:
                     _tel_fig = go.Figure()
                     _any_trace = False
                     for _drv_int in (_drv_a_int, _drv_b_int):
-                        _acronym = _dlabel(_drv_int)
-                        _trace, _lap_t, _lap_num = _fastest_lap_trace(df, _acronym, _tel_channel)
+                        with st.spinner(f"Fetching {_tel_channel} telemetry for {_dlabel(_drv_int)}..."):
+                            _trace, _lap_t, _lap_num = _fetch_fastest_lap_openf1(
+                                _hist_sk, _drv_int, _hist_laps, _tel_channel
+                            )
                         if _trace is None:
-                            st.caption(f"No FastF1 telemetry for {_acronym} — run `pipeline.py` to include this driver.")
+                            st.caption(f"Could not fetch {_tel_channel} telemetry for {_dlabel(_drv_int)} from OpenF1.")
                             continue
                         _any_trace = True
                         _lap_label = f"Lap {_lap_num}, {_lap_t:.3f}s" if _lap_num is not None else f"{_lap_t:.3f}s"
                         _tel_fig.add_trace(go.Scatter(
                             x=np.arange(N_POINTS), y=_trace,
                             mode="lines",
-                            name=f"{_acronym} ({_lap_label})",
+                            name=f"{_dlabel(_drv_int)} ({_lap_label})",
                             line=dict(color=_tel_cmap.get(_drv_int, "#888"), width=2.5),
                         ))
                     if _any_trace:
@@ -1184,7 +1488,7 @@ with tab3:
                 )
                 _ltel_channel = _lc3.selectbox(
                     "Channel",
-                    options=list(TRACE_COLS.keys()) + SPECIAL_CHANNELS,
+                    options=SPECIAL_CHANNELS + list(TRACE_COLS.keys()),
                     key="rp_live_tel_channel",
                 )
 
@@ -1204,22 +1508,34 @@ with tab3:
                         team_colour_map=st.session_state.get("rp_live_team_colour_map"),
                     )
 
+                    # Live mode: use "latest" as the session key for car_data calls
+                    _live_laps = analyser._laps
+
                     if _ltel_channel in SPECIAL_CHANNELS:
-                        _ldata_a = _get_fastest_lap_all(df, _live_dlabel(_ldrv_a_int))
-                        _ldata_b = _get_fastest_lap_all(df, _live_dlabel(_ldrv_b_int))
+                        with st.spinner("Fetching fastest-lap telemetry from OpenF1..."):
+                            _ldata_a = _fetch_fastest_lap_all_openf1("latest", _ldrv_a_int, _live_laps)
+                            _ldata_b = _fetch_fastest_lap_all_openf1("latest", _ldrv_b_int, _live_laps)
                         if _ldata_a is None:
-                            st.caption(f"No FastF1 telemetry for {_live_dlabel(_ldrv_a_int)} — run `pipeline.py` to include this driver.")
+                            st.caption(f"Could not fetch telemetry for {_live_dlabel(_ldrv_a_int)} from OpenF1.")
                         elif _ldata_b is None:
-                            st.caption(f"No FastF1 telemetry for {_live_dlabel(_ldrv_b_int)} — run `pipeline.py` to include this driver.")
+                            st.caption(f"Could not fetch telemetry for {_live_dlabel(_ldrv_b_int)} from OpenF1.")
                         elif _ltel_channel == "Track Map":
-                            _lspecial_fig = _build_track_map_fig(
-                                _ldata_a, _live_dlabel(_ldrv_a_int), _lcol_a,
-                                _ldata_b, _live_dlabel(_ldrv_b_int), _lcol_b,
-                            )
-                            if _lspecial_fig is None:
-                                st.info("Track Map requires X/Y coordinates. Re-run `python src/pipeline.py` to regenerate the dataset.")
+                            _live_gp = st.session_state.get("rp_live_meeting_name", "")
+                            _lcircuit = circuits.get(_live_gp) if _live_gp else None
+                            if _lcircuit is None:
+                                st.info("Circuit outline unavailable for the current live session.")
                             else:
-                                st.plotly_chart(_lspecial_fig, width="stretch", key="tab3_track_map_live")
+                                _lcx = np.asarray(_lcircuit["x"], dtype=float)
+                                _lcy = np.asarray(_lcircuit["y"], dtype=float)
+                                _lacronym_a, _lacronym_b = _live_dlabel(_ldrv_a_int), _live_dlabel(_ldrv_b_int)
+                                _lmap_a = {"x": _lcx, "y": _lcy, "speed": _ldata_a["speed"]}
+                                _lmap_b = {"x": _lcx, "y": _lcy, "speed": _ldata_b["speed"]}
+                                _lspecial_fig = _build_track_map_fig(
+                                    _lmap_a, _lacronym_a, _lcol_a,
+                                    _lmap_b, _lacronym_b, _lcol_b,
+                                )
+                                if _lspecial_fig is not None:
+                                    st.plotly_chart(_lspecial_fig, width="stretch", key="tab3_track_map_live")
                         elif _ltel_channel == "Time Delta":
                             _lspecial_fig = _build_time_delta_fig(
                                 _ldata_a, _live_dlabel(_ldrv_a_int), _lcol_a,
@@ -1230,17 +1546,19 @@ with tab3:
                         _ltel_fig = go.Figure()
                         _lany_trace = False
                         for _ldrv_int in (_ldrv_a_int, _ldrv_b_int):
-                            _lacronym = _live_dlabel(_ldrv_int)
-                            _ltrace, _llap_t, _llap_num = _fastest_lap_trace(df, _lacronym, _ltel_channel)
+                            with st.spinner(f"Fetching {_ltel_channel} telemetry for {_live_dlabel(_ldrv_int)}..."):
+                                _ltrace, _llap_t, _llap_num = _fetch_fastest_lap_openf1(
+                                    "latest", _ldrv_int, _live_laps, _ltel_channel
+                                )
                             if _ltrace is None:
-                                st.caption(f"No FastF1 telemetry for {_lacronym} — run `pipeline.py` to include this driver.")
+                                st.caption(f"Could not fetch {_ltel_channel} telemetry for {_live_dlabel(_ldrv_int)} from OpenF1.")
                                 continue
                             _lany_trace = True
                             _llap_label = f"Lap {_llap_num}, {_llap_t:.3f}s" if _llap_num is not None else f"{_llap_t:.3f}s"
                             _ltel_fig.add_trace(go.Scatter(
                                 x=np.arange(N_POINTS), y=_ltrace,
                                 mode="lines",
-                                name=f"{_lacronym} ({_llap_label})",
+                                name=f"{_live_dlabel(_ldrv_int)} ({_llap_label})",
                                 line=dict(color=_ltel_cmap.get(_ldrv_int, "#888"), width=2.5),
                             ))
                         if _lany_trace:
