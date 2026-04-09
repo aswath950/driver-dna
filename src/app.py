@@ -37,6 +37,16 @@ OPENF1_TRACE_COLS = {"Speed": "speed", "Throttle": "throttle", "Brake": "brake"}
 # Channels that require special rendering (not a simple 1D line overlay)
 SPECIAL_CHANNELS = ["Track Map", "Time Delta"]
 RADAR_FEATURES = ["mean_speed", "throttle_mean", "throttle_std", "brake_events", "steer_std", "gear_changes"]
+# Sidebar visibility toggle keys — order determines display order in the expander
+CHART_KEYS = {
+    "Fastest Lap Telemetry": "show_telemetry",
+    "Rolling Race Pace":     "show_rolling_pace",
+    "Gap to Leader":         "show_gap_to_leader",
+    "Projected Finish":      "show_projected_order",
+    "Average Race Pace":     "show_avg_pace",
+    "Race Pace Ranking":     "show_pace_ranking",
+    "Tyre Degradation":      "show_tyre_deg",
+}
 
 # --- Session state defaults for non-widget keys only ---------------
 # Widget keys (ta_a, ta_b, radar_drivers, mystery_lap, rp_mode, etc.)
@@ -101,6 +111,13 @@ with st.sidebar:
     else:
         st.caption("Select a mode in the Race Dashboard tab to get started.")
     st.info("**Race Dashboard** — fastest lap telemetry comparison, plus live or historical race analysis with rolling pace, gap charts, undercut detection, and projected finishing order.")
+
+    # -- Visible Charts expander --
+    st.divider()
+    with st.expander("Visible Charts", expanded=False):
+        st.caption("Toggle sections on or off in the Race Dashboard.")
+        for _chart_label, _chart_key in CHART_KEYS.items():
+            st.checkbox(_chart_label, value=True, key=_chart_key)
 
     # -- Health Check expander --
     st.divider()
@@ -508,8 +525,6 @@ def _fetch_fastest_lap_all_openf1(
         return None
 
     # Cumulative elapsed time from real timestamps — immune to missing samples.
-    # (date[i] - date[0]) gives the true wall-clock time at each data point;
-    # no speed-based reconstruction needed so there are no integration artifacts.
     cumtime_raw = (car["date"] - car["date"].iloc[0]).dt.total_seconds().to_numpy(dtype=float)
 
     dt = car["date"].diff().dt.total_seconds().fillna(0.0).to_numpy(dtype=float)[1:]
@@ -523,11 +538,18 @@ def _fetch_fastest_lap_all_openf1(
             return np.full(N_POINTS, np.nan)
         return np.interp(dist_grid, dist, car[col].to_numpy(dtype=float))
 
+    # Resample cumtime using raw sample index as the independent variable, not dist.
+    # dist can be flat (non-increasing) in slow/stopped sections which makes it an
+    # invalid xp for np.interp and produces incorrect interpolated cumtime values.
+    # The sample index is always strictly increasing, so interpolation is well-defined.
+    raw_idx = np.linspace(0.0, 1.0, len(cumtime_raw))
+    grid_idx = np.linspace(0.0, 1.0, N_POINTS)
+
     return {
         "speed": _resample("speed"),
         "throttle": _resample("throttle"),
         "brake": _resample("brake"),
-        "cumtime": np.interp(dist_grid, dist, cumtime_raw),  # elapsed seconds at each distance point
+        "cumtime": np.interp(grid_idx, raw_idx, cumtime_raw),  # elapsed seconds at each distance point
         "x": None,   # not available from OpenF1 car_data; Track Map uses dataset.parquet
         "y": None,
         "lap_time": lap_time,
@@ -926,236 +948,246 @@ def _render_charts(
     cmap = _driver_color_map(list(active_drivers), team_colour_map=team_colour_map)
 
     # ---- Chart 1: Rolling Race Pace --------------------------------
-    container.markdown("### Rolling Race Pace")
-    rp = results["rolling_pace"]
-    fig1 = go.Figure()
-    for drv in [d for d in rp.columns if d in active_drivers]:
-        fig1.add_trace(go.Scatter(
-            x=rp.index, y=rp[drv],
-            mode="lines", name=_label(drv),
-            line=dict(color=cmap.get(drv, "#888"), width=2),
-        ))
-    # Session median pace (dashed reference)
-    all_vals = rp.values[~np.isnan(rp.values)]
-    if len(all_vals):
-        median_pace = float(np.median(all_vals))
-        fig1.add_hline(
-            y=median_pace, line_dash="dash", line_color="white",
-            opacity=0.5,
-            annotation_text=f"Median {median_pace:.2f}s",
-            annotation_position="top left",
+    if st.session_state.get("show_rolling_pace", True):
+        container.markdown("### Rolling Race Pace")
+        rp = results["rolling_pace"]
+        fig1 = go.Figure()
+        for drv in [d for d in rp.columns if d in active_drivers]:
+            fig1.add_trace(go.Scatter(
+                x=rp.index, y=rp[drv],
+                mode="lines", name=_label(drv),
+                line=dict(color=cmap.get(drv, "#888"), width=2),
+            ))
+        # Session median pace (dashed reference)
+        all_vals = rp.values[~np.isnan(rp.values)]
+        if len(all_vals):
+            median_pace = float(np.median(all_vals))
+            fig1.add_hline(
+                y=median_pace, line_dash="dash", line_color="white",
+                opacity=0.5,
+                annotation_text=f"Median {median_pace:.2f}s",
+                annotation_position="top left",
+            )
+        fig1.update_layout(
+            xaxis_title="Lap Number", yaxis_title="Rolling Avg Lap Time (s)",
+            hovermode="x unified", legend_title="Driver",
         )
-    fig1.update_layout(
-        xaxis_title="Lap Number", yaxis_title="Rolling Avg Lap Time (s)",
-        hovermode="x unified", legend_title="Driver",
-    )
-    container.plotly_chart(fig1, width="stretch", key="tab4_rolling_pace")
+        container.plotly_chart(fig1, width="stretch", key="tab4_rolling_pace")
 
     # ---- Chart 2 & 3: Gap to Leader + Undercut markers -------------
-    container.markdown("### Gap to Leader")
-    gap = results["gap_to_leader"]
-    undercuts = results["undercuts"]
+    if st.session_state.get("show_gap_to_leader", True):
+        container.markdown("### Gap to Leader")
+        gap = results["gap_to_leader"]
+        undercuts = results["undercuts"]
 
-    fig2 = go.Figure()
-    for drv in [d for d in gap.columns if d in active_drivers]:
-        fig2.add_trace(go.Scatter(
-            x=gap.index, y=gap[drv],
-            mode="lines", name=_label(drv),
-            line=dict(color=cmap.get(drv, "#888"), width=2),
-            fill="tozeroy", opacity=0.3,
-        ))
-    # Overlay undercut/overcut markers (only when both drivers are selected)
-    visible_undercuts = [
-        e for e in undercuts
-        if e["attacking_driver"] in active_drivers and e["defending_driver"] in active_drivers
-    ]
-    for evt in visible_undercuts:
-        lap = evt["lap"]
-        atk = evt["attacking_driver"]
-        kind = evt["type"]
-        marker_symbol = "triangle-up" if kind == "undercut" else "triangle-down"
-        try:
-            y_val = gap.loc[lap, atk].item()  # type: ignore[union-attr]
-        except (KeyError, AttributeError):
-            y_val = 0.0
-        label = f"Lap {lap}: {_label(atk)} {kind} {_label(evt['defending_driver'])}"
-        fig2.add_trace(go.Scatter(
-            x=[lap], y=[y_val],
-            mode="markers+text",
-            marker=dict(
-                symbol=marker_symbol, size=14,
-                color="lime" if kind == "undercut" else "orange",
-                line=dict(width=1, color="white"),
-            ),
-            text=[f"{'▲' if kind == 'undercut' else '▽'}"],
-            textposition="top center",
-            hovertext=[label],
-            hoverinfo="text",
-            showlegend=False,
-        ))
-    fig2.update_layout(
-        xaxis_title="Lap Number", yaxis_title="Gap to Leader (s)",
-        hovermode="x unified", legend_title="Driver",
-    )
-    container.plotly_chart(fig2, width="stretch", key="tab4_gap_to_leader")
+        fig2 = go.Figure()
+        for drv in [d for d in gap.columns if d in active_drivers]:
+            fig2.add_trace(go.Scatter(
+                x=gap.index, y=gap[drv],
+                mode="lines", name=_label(drv),
+                line=dict(color=cmap.get(drv, "#888"), width=2),
+                fill="tozeroy", opacity=0.3,
+            ))
+        # Overlay undercut/overcut markers (only when both drivers are selected)
+        visible_undercuts = [
+            e for e in undercuts
+            if e["attacking_driver"] in active_drivers and e["defending_driver"] in active_drivers
+        ]
+        for evt in visible_undercuts:
+            lap = evt["lap"]
+            atk = evt["attacking_driver"]
+            kind = evt["type"]
+            marker_symbol = "triangle-up" if kind == "undercut" else "triangle-down"
+            try:
+                y_val = gap.loc[lap, atk].item()  # type: ignore[union-attr]
+            except (KeyError, AttributeError):
+                y_val = 0.0
+            label = f"Lap {lap}: {_label(atk)} {kind} {_label(evt['defending_driver'])}"
+            fig2.add_trace(go.Scatter(
+                x=[lap], y=[y_val],
+                mode="markers+text",
+                marker=dict(
+                    symbol=marker_symbol, size=14,
+                    color="lime" if kind == "undercut" else "orange",
+                    line=dict(width=1, color="white"),
+                ),
+                text=[f"{'▲' if kind == 'undercut' else '▽'}"],
+                textposition="top center",
+                hovertext=[label],
+                hoverinfo="text",
+                showlegend=False,
+            ))
+        fig2.update_layout(
+            xaxis_title="Lap Number", yaxis_title="Gap to Leader (s)",
+            hovermode="x unified", legend_title="Driver",
+        )
+        container.plotly_chart(fig2, width="stretch", key="tab4_gap_to_leader")
 
     # ---- Chart 4: Projected Finishing Order -------------------------
-    container.markdown("### Projected Finishing Order")
-    projections = [p for p in results["projections"] if p["driver"] in active_drivers]
-    if projections:
-        # Winner time comes from the first active (non-DNF) driver
-        active = [p for p in projections if p.get("status") != "DNF"]
-        winner_time = active[0]["projected_total_time"] if active else 0
-        proj_data = []
-        for p in projections:
-            is_dnf = p.get("status") == "DNF"
-            gap_to_win = 0.0 if is_dnf else p["projected_total_time"] - winner_time
-            change = p.get("position_change")
-            if is_dnf:
-                bar_color = "#555555"
-            elif change is not None and change > 0:
-                bar_color = "#2ecc71"
-            elif change is not None and change < 0:
-                bar_color = "#e74c3c"
-            else:
-                bar_color = "#95a5a6"
-            cur = p.get("current_position", "?")
-            proj_pos = p["projected_position"]
-            label = "DNF" if is_dnf else f"P{cur} → P{proj_pos}"
-            proj_data.append({
-                "driver": _label(p["driver"]),
-                "gap": round(gap_to_win, 2),
-                "color": bar_color,
-                "label": label,
-            })
-        # Reverse so P1 is at the top of the horizontal bar chart
-        proj_data = proj_data[::-1]
-        fig4 = go.Figure(go.Bar(
-            x=[d["gap"] for d in proj_data],
-            y=[d["driver"] for d in proj_data],
-            orientation="h",
-            marker_color=[d["color"] for d in proj_data],
-            text=[d["label"] for d in proj_data],
-            textposition="outside",
-            hovertemplate="Driver %{y}<br>Gap: +%{x:.2f}s<extra></extra>",
-        ))
-        fig4.update_layout(
-            xaxis_title="Projected Gap to Winner (s)",
-            yaxis_title="Driver",
-            showlegend=False,
-        )
-        container.plotly_chart(fig4, width="stretch", key="tab4_projected_order")
-    else:
-        container.info("Not enough data to project finishing order.")
+    if st.session_state.get("show_projected_order", True):
+        container.markdown("### Projected Finishing Order")
+        projections = [p for p in results["projections"] if p["driver"] in active_drivers]
+        if projections:
+            # Winner time comes from the first active (non-DNF) driver
+            active = [p for p in projections if p.get("status") != "DNF"]
+            winner_time = active[0]["projected_total_time"] if active else 0
+            proj_data = []
+            for p in projections:
+                is_dnf = p.get("status") == "DNF"
+                gap_to_win = 0.0 if is_dnf else p["projected_total_time"] - winner_time
+                change = p.get("position_change")
+                if is_dnf:
+                    bar_color = "#555555"
+                elif change is not None and change > 0:
+                    bar_color = "#2ecc71"
+                elif change is not None and change < 0:
+                    bar_color = "#e74c3c"
+                else:
+                    bar_color = "#95a5a6"
+                cur = p.get("current_position", "?")
+                proj_pos = p["projected_position"]
+                label = "DNF" if is_dnf else f"P{cur} → P{proj_pos}"
+                proj_data.append({
+                    "driver": _label(p["driver"]),
+                    "gap": round(gap_to_win, 2),
+                    "color": bar_color,
+                    "label": label,
+                })
+            # Reverse so P1 is at the top of the horizontal bar chart
+            proj_data = proj_data[::-1]
+            fig4 = go.Figure(go.Bar(
+                x=[d["gap"] for d in proj_data],
+                y=[d["driver"] for d in proj_data],
+                orientation="h",
+                marker_color=[d["color"] for d in proj_data],
+                text=[d["label"] for d in proj_data],
+                textposition="outside",
+                hovertemplate="Driver %{y}<br>Gap: +%{x:.2f}s<extra></extra>",
+            ))
+            fig4.update_layout(
+                xaxis_title="Projected Gap to Winner (s)",
+                yaxis_title="Driver",
+                showlegend=False,
+            )
+            container.plotly_chart(fig4, width="stretch", key="tab4_projected_order")
+        else:
+            container.info("Not enough data to project finishing order.")
 
     # ---- Chart 5: Average Race Pace --------------------------------
-    container.markdown("### Average Race Pace")
-    pace_sum = results["pace_summary"]
-    if pace_sum.empty:
-        container.info("Not enough clean lap data for pace summary.")
-    else:
-        pace_sum = pace_sum.reset_index()
-        pace_sum = pace_sum[pace_sum["driver_number"].isin(active_drivers)]
-        pace_sum["label"] = pace_sum["driver_number"].apply(_label)
-        pace_sum = pace_sum.sort_values("median_pace", ascending=False)  # fastest at top
-        fig5 = go.Figure(go.Bar(
-            x=pace_sum["median_pace"],
-            y=pace_sum["label"],
-            orientation="h",
-            marker=dict(
-                color=pace_sum["std_pace"],
-                colorscale="Viridis",
-                showscale=True,
-                colorbar=dict(title="Pace Std Dev (s)"),
-            ),
-            customdata=pace_sum[["mean_pace", "std_pace", "fastest_lap", "lap_count"]].values,
-            hovertemplate=(
-                "<b>%{y}</b><br>"
-                "Median: %{x:.3f}s<br>"
-                "Mean: %{customdata[0]:.3f}s<br>"
-                "Std Dev: %{customdata[1]:.3f}s<br>"
-                "Fastest lap: %{customdata[2]:.3f}s<br>"
-                "Laps counted: %{customdata[3]}<extra></extra>"
-            ),
-        ))
-        fig5.update_layout(
-            xaxis_title="Median Lap Time (s)",
-            yaxis_title="Driver",
-            showlegend=False,
-        )
-        container.plotly_chart(fig5, width="stretch", key="tab4_avg_pace")
-
-    # ---- Chart 6: Race Pace Ranking --------------------------------
-    container.markdown("### Race Pace Ranking")
-    if pace_sum.empty:
-        container.info("Not enough clean lap data for pace ranking.")
-    else:
-        ranked = pace_sum.sort_values("mean_pace")
-        bar_colors = [cmap.get(int(row["driver_number"]), "#888") for _, row in ranked.iterrows()]
-        fig6 = go.Figure(go.Bar(
-            x=ranked["label"],
-            y=ranked["mean_pace"],
-            error_y=dict(type="data", array=ranked["std_pace"].tolist(), visible=True),
-            marker_color=bar_colors,
-            text=ranked["fastest_lap"].round(3).astype(str) + "s",
-            textposition="outside",
-            hovertemplate=(
-                "<b>%{x}</b><br>"
-                "Mean pace: %{y:.3f}s<br>"
-                "Fastest lap: %{text}<extra></extra>"
-            ),
-        ))
-        fig6.update_layout(
-            xaxis_title="Driver",
-            yaxis_title="Mean Lap Time (s)",
-            showlegend=False,
-        )
-        container.plotly_chart(fig6, width="stretch", key="tab4_pace_ranking")
-
-    # ---- Chart 7: Tyre Degradation by Compound ---------------------
-    container.markdown("### Tyre Degradation by Compound")
-    tyre_deg = results["tyre_deg"]
-    tyre_deg = tyre_deg[tyre_deg["driver_number"].isin(active_drivers)]
-    if tyre_deg.empty:
-        container.info("Stint data unavailable — tyre degradation chart requires stint information.")
-    else:
-        COMPOUND_COLORS = {
-            "SOFT": "#e8002d",
-            "MEDIUM": "#ffd700",
-            "HARD": "#cccccc",
-            "INTERMEDIATE": "#39b54a",
-            "WET": "#0067ff",
-        }
-        fig7 = go.Figure()
-        for compound, grp in tyre_deg.groupby("compound"):
-            color = COMPOUND_COLORS.get(str(compound).upper(), "#888888")
-            fig7.add_trace(go.Scatter(
-                x=grp["mean_pace"],
-                y=grp["deg_per_lap"],
-                mode="markers",
-                name=str(compound),
-                marker=dict(color=color, size=10, line=dict(width=1, color="white")),
-                customdata=grp[["driver_number", "laps_in_stint"]].assign(
-                    label=grp["driver_number"].apply(_label)
-                )[["label", "laps_in_stint"]].values,
+    if st.session_state.get("show_avg_pace", True):
+        container.markdown("### Average Race Pace")
+        pace_sum = results["pace_summary"]
+        if pace_sum.empty:
+            container.info("Not enough clean lap data for pace summary.")
+        else:
+            pace_sum = pace_sum.reset_index()
+            pace_sum = pace_sum[pace_sum["driver_number"].isin(active_drivers)]
+            pace_sum["label"] = pace_sum["driver_number"].apply(_label)
+            pace_sum = pace_sum.sort_values("median_pace", ascending=False)  # fastest at top
+            fig5 = go.Figure(go.Bar(
+                x=pace_sum["median_pace"],
+                y=pace_sum["label"],
+                orientation="h",
+                marker=dict(
+                    color=pace_sum["std_pace"],
+                    colorscale="Viridis",
+                    showscale=True,
+                    colorbar=dict(title="Pace Std Dev (s)"),
+                ),
+                customdata=pace_sum[["mean_pace", "std_pace", "fastest_lap", "lap_count"]].values,
                 hovertemplate=(
-                    "<b>%{customdata[0]}</b> — " + str(compound) + "<br>"
-                    "Mean pace: %{x:.3f}s<br>"
-                    "Degradation: %{y:+.4f}s/lap<br>"
-                    "Laps in stint: %{customdata[1]}<extra></extra>"
+                    "<b>%{y}</b><br>"
+                    "Median: %{x:.3f}s<br>"
+                    "Mean: %{customdata[0]:.3f}s<br>"
+                    "Std Dev: %{customdata[1]:.3f}s<br>"
+                    "Fastest lap: %{customdata[2]:.3f}s<br>"
+                    "Laps counted: %{customdata[3]}<extra></extra>"
                 ),
             ))
-        fig7.add_hline(
-            y=0, line_dash="dash", line_color="white",
-            opacity=0.4, annotation_text="No degradation",
-            annotation_position="top left",
-        )
-        fig7.update_layout(
-            xaxis_title="Mean Stint Pace (s)",
-            yaxis_title="Degradation (s / lap)",
-            legend_title="Compound",
-        )
-        container.plotly_chart(fig7, width="stretch", key="tab4_tyre_deg")
+            fig5.update_layout(
+                xaxis_title="Median Lap Time (s)",
+                yaxis_title="Driver",
+                showlegend=False,
+            )
+            container.plotly_chart(fig5, width="stretch", key="tab4_avg_pace")
+
+    # ---- Chart 6: Race Pace Ranking --------------------------------
+    if st.session_state.get("show_pace_ranking", True):
+        container.markdown("### Race Pace Ranking")
+        pace_sum = results["pace_summary"]
+        if pace_sum.empty:
+            container.info("Not enough clean lap data for pace ranking.")
+        else:
+            pace_sum = pace_sum.reset_index()
+            pace_sum = pace_sum[pace_sum["driver_number"].isin(active_drivers)]
+            pace_sum["label"] = pace_sum["driver_number"].apply(_label)
+            ranked = pace_sum.sort_values("mean_pace")
+            bar_colors = [cmap.get(int(row["driver_number"]), "#888") for _, row in ranked.iterrows()]
+            fig6 = go.Figure(go.Bar(
+                x=ranked["label"],
+                y=ranked["mean_pace"],
+                error_y=dict(type="data", array=ranked["std_pace"].tolist(), visible=True),
+                marker_color=bar_colors,
+                text=ranked["fastest_lap"].round(3).astype(str) + "s",
+                textposition="outside",
+                hovertemplate=(
+                    "<b>%{x}</b><br>"
+                    "Mean pace: %{y:.3f}s<br>"
+                    "Fastest lap: %{text}<extra></extra>"
+                ),
+            ))
+            fig6.update_layout(
+                xaxis_title="Driver",
+                yaxis_title="Mean Lap Time (s)",
+                showlegend=False,
+            )
+            container.plotly_chart(fig6, width="stretch", key="tab4_pace_ranking")
+
+    # ---- Chart 7: Tyre Degradation by Compound ---------------------
+    if st.session_state.get("show_tyre_deg", True):
+        container.markdown("### Tyre Degradation by Compound")
+        tyre_deg = results["tyre_deg"]
+        tyre_deg = tyre_deg[tyre_deg["driver_number"].isin(active_drivers)]
+        if tyre_deg.empty:
+            container.info("Stint data unavailable — tyre degradation chart requires stint information.")
+        else:
+            COMPOUND_COLORS = {
+                "SOFT": "#e8002d",
+                "MEDIUM": "#ffd700",
+                "HARD": "#cccccc",
+                "INTERMEDIATE": "#39b54a",
+                "WET": "#0067ff",
+            }
+            fig7 = go.Figure()
+            for compound, grp in tyre_deg.groupby("compound"):
+                color = COMPOUND_COLORS.get(str(compound).upper(), "#888888")
+                fig7.add_trace(go.Scatter(
+                    x=grp["mean_pace"],
+                    y=grp["deg_per_lap"],
+                    mode="markers",
+                    name=str(compound),
+                    marker=dict(color=color, size=10, line=dict(width=1, color="white")),
+                    customdata=grp[["driver_number", "laps_in_stint"]].assign(
+                        label=grp["driver_number"].apply(_label)
+                    )[["label", "laps_in_stint"]].values,
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b> — " + str(compound) + "<br>"
+                        "Mean pace: %{x:.3f}s<br>"
+                        "Degradation: %{y:+.4f}s/lap<br>"
+                        "Laps in stint: %{customdata[1]}<extra></extra>"
+                    ),
+                ))
+            fig7.add_hline(
+                y=0, line_dash="dash", line_color="white",
+                opacity=0.4, annotation_text="No degradation",
+                annotation_position="top left",
+            )
+            fig7.update_layout(
+                xaxis_title="Mean Stint Pace (s)",
+                yaxis_title="Degradation (s / lap)",
+                legend_title="Compound",
+            )
+            container.plotly_chart(fig7, width="stretch", key="tab4_tyre_deg")
 
 
 # ---- Tab 3 content -----------------------------------------------
@@ -1282,7 +1314,8 @@ with tab3:
             _dmap = st.session_state["rp_hist_driver_map"]
             _all_drvs = sorted(_analyser._clean["driver_number"].dropna().unique().tolist())
             # ---- Fastest Lap Telemetry Comparison ------------------
-            st.markdown("### Fastest Lap Telemetry Comparison")
+            if st.session_state.get("show_telemetry", True):
+                st.markdown("### Fastest Lap Telemetry Comparison")
             _tc1, _tc2, _tc3 = st.columns(3)
             _tel_drv_a = _tc1.selectbox(
                 "Driver A",
@@ -1306,7 +1339,9 @@ with tab3:
             def _dlabel(n: int) -> str:
                 return _dmap.get(n, str(n))
 
-            if _tel_drv_a is None or _tel_drv_b is None:
+            if not st.session_state.get("show_telemetry", True):
+                pass  # section hidden by user
+            elif _tel_drv_a is None or _tel_drv_b is None:
                 st.info("Select two drivers to compare telemetry.")
             else:
                 _drv_a_int, _drv_b_int = int(_tel_drv_a), int(_tel_drv_b)
@@ -1471,7 +1506,8 @@ with tab3:
                 _all_drvs = sorted(analyser._clean["driver_number"].dropna().unique().tolist())
 
                 # ---- Fastest Lap Telemetry Comparison (live) -------
-                st.markdown("### Fastest Lap Telemetry Comparison")
+                if st.session_state.get("show_telemetry", True):
+                    st.markdown("### Fastest Lap Telemetry Comparison")
                 _lc1, _lc2, _lc3 = st.columns(3)
                 _ltel_drv_a = _lc1.selectbox(
                     "Driver A",
@@ -1495,7 +1531,9 @@ with tab3:
                 def _live_dlabel(n: int) -> str:
                     return _live_dmap.get(n, str(n))
 
-                if _ltel_drv_a is None or _ltel_drv_b is None:
+                if not st.session_state.get("show_telemetry", True):
+                    pass  # section hidden by user
+                elif _ltel_drv_a is None or _ltel_drv_b is None:
                     st.info("Select two drivers to compare telemetry.")
                 else:
                     _ldrv_a_int, _ldrv_b_int = int(_ltel_drv_a), int(_ltel_drv_b)

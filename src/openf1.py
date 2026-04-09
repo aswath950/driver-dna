@@ -27,7 +27,7 @@ BASE_URL = "https://api.openf1.org/v1"
 # Any extra columns returned by the API are kept but not type-cast.
 _LAP_COLS = [
     "driver_number", "lap_number", "lap_duration",
-    "is_pit_out_lap", "st_speed", "session_key",
+    "is_pit_out_lap", "st_speed", "session_key", "date_start",
 ]
 _STINT_COLS = [
     "driver_number", "stint_number", "compound",
