@@ -10,6 +10,7 @@ Expected columns from dataset.parquet:
   gear_changes, steer_std, speed_trace, throttle_trace, brake_trace
 """
 
+import json
 import sys
 import time
 from datetime import datetime
@@ -27,10 +28,25 @@ from openf1 import OpenF1Client
 from race_engine import RaceAnalyser
 
 DATASET_PATH = DATA_DIR / "dataset.parquet"
+CIRCUITS_PATH = DATA_DIR / "circuits.json"
 ACCURACY_PATH = MODELS_DIR / "accuracy.txt"
 N_POINTS = 200
 TRACE_COLS = {"Speed": "speed_trace", "Throttle": "throttle_trace", "Brake": "brake_trace"}
+# OpenF1 car_data column names for the same channels
+OPENF1_TRACE_COLS = {"Speed": "speed", "Throttle": "throttle", "Brake": "brake"}
+# Channels that require special rendering (not a simple 1D line overlay)
+SPECIAL_CHANNELS = ["Track Map", "Time Delta"]
 RADAR_FEATURES = ["mean_speed", "throttle_mean", "throttle_std", "brake_events", "steer_std", "gear_changes"]
+# Sidebar visibility toggle keys — order determines display order in the expander
+CHART_KEYS = {
+    "Fastest Lap Telemetry": "show_telemetry",
+    "Rolling Race Pace":     "show_rolling_pace",
+    "Gap to Leader":         "show_gap_to_leader",
+    "Projected Finish":      "show_projected_order",
+    "Average Race Pace":     "show_avg_pace",
+    "Race Pace Ranking":     "show_pace_ranking",
+    "Tyre Degradation":      "show_tyre_deg",
+}
 
 # --- Session state defaults for non-widget keys only ---------------
 # Widget keys (ta_a, ta_b, radar_drivers, mystery_lap, rp_mode, etc.)
@@ -44,11 +60,15 @@ STATE_DEFAULTS: dict = {
     # Tab 4 historical — persists loaded race data across reruns
     "rp_hist_analyser": None,
     "rp_hist_driver_map": {},
+    "rp_hist_team_colour_map": {},   # {int(driver_number): "#RRGGBB"}
+    "rp_hist_session_key": None,     # int session_key of the currently loaded session
     # Tab 4 historical — available sessions fetched from OpenF1
     "rp_available_sessions": None,   # pd.DataFrame or None
     "rp_fetched_for": None,          # (year, gp) tuple — invalidates cache on change
     # Tab 4 live — driver map for current session
     "rp_live_driver_map": {},
+    "rp_live_team_colour_map": {},   # {int(driver_number): "#RRGGBB"}
+    "rp_live_meeting_name": "",      # GP name for live Track Map circuit lookup
 }
 
 st.set_page_config(page_title="Driver DNA Fingerprinter", layout="wide")
@@ -73,8 +93,8 @@ with st.sidebar:
 
     st.divider()
 
-    # -- Race Pace Dashboard section --
-    st.subheader("Race Pace Dashboard")
+    # -- Race Dashboard section --
+    st.subheader("Race Dashboard")
     rp_mode_val = st.session_state.get("rp_mode", "")
     if rp_mode_val.startswith("📡"):
         st.markdown("**Mode:** 📡 Live")
@@ -89,8 +109,15 @@ with st.sidebar:
         loaded_year = st.session_state.get("rp_year", "—")
         st.caption(f"{loaded_year} {loaded_gp}")
     else:
-        st.caption("Select a mode in the Race Pace tab to get started.")
-    st.info("**Race Pace** — live or historical race analysis with rolling pace, gap charts, undercut detection, and projected finishing order.")
+        st.caption("Select a mode in the Race Dashboard tab to get started.")
+    st.info("**Race Dashboard** — fastest lap telemetry comparison, plus live or historical race analysis with rolling pace, gap charts, undercut detection, and projected finishing order.")
+
+    # -- Visible Charts expander --
+    st.divider()
+    with st.expander("Visible Charts", expanded=False):
+        st.caption("Toggle sections on or off in the Race Dashboard.")
+        for _chart_label, _chart_key in CHART_KEYS.items():
+            st.checkbox(_chart_label, value=True, key=_chart_key)
 
     # -- Health Check expander --
     st.divider()
@@ -145,6 +172,15 @@ def get_data() -> pd.DataFrame:
     return pd.read_parquet(DATASET_PATH)
 
 
+@st.cache_data
+def get_circuits() -> dict:
+    """Load pre-generated circuit XY outlines keyed by Grand Prix name."""
+    if not CIRCUITS_PATH.exists():
+        return {}
+    with open(CIRCUITS_PATH) as f:
+        return json.load(f)
+
+
 if not DATASET_PATH.exists():
     st.error("Run `python src/pipeline.py` first to fetch telemetry and build the dataset.")
     st.stop()
@@ -161,55 +197,18 @@ except Exception as e:
     st.error(f"Failed to load resources: {e}")
     st.stop()
 
+circuits = get_circuits()
+
 drivers = sorted(df["driver"].unique())
 palette = px.colors.qualitative.Plotly
 color_map = {d: palette[i % len(palette)] for i, d in enumerate(drivers)}
 
-tab1, tab2, tab3, tab4 = st.tabs(["Telemetry Overlay", "Driver Radar", "Mystery Driver", "Race Pace Dashboard"])
+tab1, tab2, tab3 = st.tabs(["Driver Radar", "Mystery Driver", "Race Dashboard"])
 
 # ================================================================
-# TAB 1 — Telemetry Overlay
+# TAB 1 — Driver Radar
 # ================================================================
 with tab1:
-    st.subheader("Average Telemetry Trace Comparison")
-
-    c1, c2, c3 = st.columns(3)
-    driver_a = c1.selectbox("Driver A", drivers, index=0, key="ta_a")
-    driver_b = c2.selectbox("Driver B", drivers, index=min(1, len(drivers) - 1), key="ta_b")
-    channel = c3.selectbox("Channel", list(TRACE_COLS.keys()), key="ta_ch")
-
-    trace_col = TRACE_COLS[channel]
-
-    if trace_col not in df.columns:
-        st.info("Telemetry trace columns not found. Re-run `python src/pipeline.py` to regenerate the dataset.")
-    else:
-        x = np.arange(N_POINTS)
-        fig = go.Figure()
-        for drv in (driver_a, driver_b):
-            rows = df[df["driver"] == drv][trace_col]
-            if rows.empty:
-                continue
-            traces = np.vstack([row for row in rows])
-            avg = traces.mean(axis=0)
-            fig.add_trace(go.Scatter(
-                x=x, y=avg,
-                mode="lines",
-                name=drv,
-                line=dict(color=color_map[drv], width=2.5),
-            ))
-        fig.update_layout(
-            title=f"Average {channel} — {driver_a} vs {driver_b}",
-            xaxis_title="Normalised Distance (0–200 points)",
-            yaxis_title=channel,
-            legend_title="Driver",
-            hovermode="x unified",
-        )
-        st.plotly_chart(fig, width="stretch", key="tab1_telemetry_overlay")
-
-# ================================================================
-# TAB 2 — Driver Radar
-# ================================================================
-with tab2:
     st.subheader("Driver Style Fingerprint")
 
     selected = st.multiselect(
@@ -253,9 +252,9 @@ with tab2:
         st.plotly_chart(fig, width="stretch", key="tab2_driver_radar")
 
 # ================================================================
-# TAB 3 — Mystery Driver
+# TAB 2 — Mystery Driver
 # ================================================================
-with tab3:
+with tab2:
     st.subheader("Can the model identify the driver?")
 
     lap_idx = st.selectbox(
@@ -309,9 +308,587 @@ with tab3:
 RACE_PALETTE = px.colors.qualitative.Dark24
 
 
-def _driver_color_map(driver_numbers: list) -> dict:
-    """Assign a distinct colour to each driver number."""
-    return {d: RACE_PALETTE[i % len(RACE_PALETTE)] for i, d in enumerate(sorted(driver_numbers))}
+def _fastest_lap_trace(
+    telemetry_df: pd.DataFrame,
+    driver_acronym: str,
+    channel: str,
+) -> tuple[np.ndarray | None, float | None, int | None]:
+    """
+    Extract the fastest lap telemetry trace for a driver from the FastF1 dataset.
+
+    Parameters
+    ----------
+    telemetry_df : pd.DataFrame
+        The FastF1 ``dataset.parquet`` already loaded at startup (global ``df``).
+    driver_acronym : str
+        3-letter driver code as stored in ``df["driver"]``, e.g. ``"HAM"``.
+    channel : str
+        One of ``"Speed"``, ``"Throttle"``, ``"Brake"``.
+
+    Returns
+    -------
+    (trace, lap_time, lap_number) where trace is a float64 ndarray of length N_POINTS,
+    or (None, None, None) if the driver or channel is not found.
+    lap_number is the driver's own lap number (e.g. lap 32 of their race), or None
+    if the dataset pre-dates the lap_number column.
+
+    Note: this function is now used only by the Driver Radar and Mystery Driver tabs,
+    which still read from the static dataset.parquet. The Race Dashboard telemetry
+    section uses _fetch_fastest_lap_openf1() and _fetch_fastest_lap_all_openf1()
+    instead, which pull live data from the OpenF1 API for the user-selected session.
+    """
+    trace_col = TRACE_COLS.get(channel)
+    if trace_col is None or trace_col not in telemetry_df.columns:
+        return None, None, None
+
+    drv_df = telemetry_df[telemetry_df["driver"] == driver_acronym].dropna(
+        subset=["lap_time_seconds"]
+    )
+    if drv_df.empty:
+        return None, None, None
+
+    fastest_row = drv_df.sort_values("lap_time_seconds").iloc[0]
+    lap_time = float(fastest_row["lap_time_seconds"])
+    trace = np.asarray(fastest_row[trace_col], dtype=float)
+    lap_number: int | None = int(fastest_row["lap_number"]) if "lap_number" in fastest_row.index else None
+    return trace, lap_time, lap_number
+
+
+def _get_fastest_lap_all(
+    telemetry_df: pd.DataFrame,
+    driver_acronym: str,
+) -> dict | None:
+    """
+    Return all resampled traces for a driver's fastest lap, or None if not found.
+
+    Keys: 'speed', 'x', 'y', 'lap_time', 'lap_number'.
+    'x' and 'y' are None if the dataset pre-dates the x_trace/y_trace columns.
+
+    Note: this function is now used only to supply X/Y circuit coordinates to Track Map
+    from dataset.parquet (the only available source for XY). All other telemetry in the
+    Race Dashboard is fetched live via _fetch_fastest_lap_all_openf1().
+    """
+    drv_df = telemetry_df[telemetry_df["driver"] == driver_acronym].dropna(
+        subset=["lap_time_seconds"]
+    )
+    if drv_df.empty:
+        return None
+    row = drv_df.sort_values("lap_time_seconds").iloc[0]
+    return {
+        "speed": np.asarray(row["speed_trace"], dtype=float),
+        "x": np.asarray(row["x_trace"], dtype=float) if "x_trace" in row.index else None,
+        "y": np.asarray(row["y_trace"], dtype=float) if "y_trace" in row.index else None,
+        "lap_time": float(row["lap_time_seconds"]),
+        "lap_number": int(row["lap_number"]) if "lap_number" in row.index else None,
+    }
+
+
+def _fetch_fastest_lap_openf1(
+    session_key: int | str,
+    driver_number: int,
+    laps_df: pd.DataFrame,
+    channel: str,
+) -> tuple[np.ndarray | None, float | None, int | None]:
+    """
+    Fetch the fastest-lap telemetry trace for a driver from the OpenF1 car_data API.
+
+    Parameters
+    ----------
+    session_key : int | str
+        The OpenF1 session key for the currently loaded session, or ``"latest"``
+        for the live session.
+    driver_number : int
+        The OpenF1 driver number (e.g. 44 for Hamilton).
+    laps_df : pd.DataFrame
+        The laps DataFrame already fetched from OpenF1 for this session.
+        Used to identify the fastest lap and its time window — avoids a second API call.
+    channel : str
+        One of ``"Speed"``, ``"Throttle"``, ``"Brake"``.
+
+    Returns
+    -------
+    (trace, lap_time, lap_number) where trace is a float64 ndarray of length N_POINTS,
+    or (None, None, None) on any failure.
+
+    How it works
+    ------------
+    1. Filter laps to this driver, drop pit-out laps, find the row with the
+       minimum ``lap_duration``.
+    2. Use ``date_start`` and ``date_start + lap_duration`` as the car_data
+       time window (ISO-8601 strings passed to ``date>`` / ``date<``).
+    3. Fetch car_data from OpenF1 for that window.
+    4. Sort by date, compute a cumulative-distance proxy from speed × dt, then
+       resample the requested channel to N_POINTS evenly spaced distance points
+       using np.interp — matching the normalisation pipeline.py applies.
+    """
+    OPENF1_CHANNEL_COL = {"Speed": "speed", "Throttle": "throttle", "Brake": "brake"}
+    col = OPENF1_CHANNEL_COL.get(channel)
+    if col is None:
+        return None, None, None
+
+    # --- 1. Find the fastest lap for this driver ---
+    drv_laps = laps_df[laps_df["driver_number"] == driver_number].copy()
+    if "is_pit_out_lap" in drv_laps.columns:
+        drv_laps = drv_laps[drv_laps["is_pit_out_lap"] != True]  # noqa: E712
+    drv_laps = drv_laps.dropna(subset=["lap_duration"])
+    if drv_laps.empty:
+        return None, None, None
+
+    fastest = drv_laps.sort_values("lap_duration").iloc[0]
+    lap_time = float(fastest["lap_duration"])
+    lap_number: int | None = int(fastest["lap_number"]) if pd.notna(fastest.get("lap_number")) else None
+
+    # --- 2. Build the time window ---
+    date_start = fastest.get("date_start")
+    if date_start is None or pd.isna(date_start):
+        return None, None, None
+    ts_start = pd.Timestamp(date_start)
+    ts_end = ts_start + pd.Timedelta(seconds=lap_time)
+    # Add a small buffer so we don't clip the final sample
+    date_gte = ts_start.isoformat()
+    date_lte = (ts_end + pd.Timedelta(seconds=0.5)).isoformat()
+
+    # --- 3. Fetch car_data ---
+    client = OpenF1Client(mode="historical")
+    car = client.get_car_data(
+        session_key=session_key,
+        driver_number=driver_number,
+        date_gte=date_gte,
+        date_lte=date_lte,
+    )
+    if car.empty or col not in car.columns or "date" not in car.columns:
+        return None, None, None
+
+    car = car.sort_values("date").reset_index(drop=True)
+    values = car[col].to_numpy(dtype=float)
+    if len(values) < 2:
+        return None, None, None
+
+    # --- 4. Resample to N_POINTS evenly spaced distance points ---
+    # Compute cumulative distance proxy: distance ≈ speed × dt (speed in km/h → m/s)
+    dt = car["date"].diff().dt.total_seconds().fillna(0.0).to_numpy(dtype=float)[1:]
+    speeds_ms = car["speed"].to_numpy(dtype=float)[:-1] / 3.6            # km/h → m/s
+    dist_increments = np.where(np.isfinite(speeds_ms) & np.isfinite(dt), speeds_ms * dt, 0.0)
+    dist = np.concatenate([[0.0], np.cumsum(dist_increments)])
+
+    dist_grid = np.linspace(dist[0], dist[-1], N_POINTS)
+    trace = np.interp(dist_grid, dist, values)
+    return trace, lap_time, lap_number
+
+
+def _fetch_fastest_lap_all_openf1(
+    session_key: int | str,
+    driver_number: int,
+    laps_df: pd.DataFrame,
+) -> dict | None:
+    """
+    Fetch all telemetry channels for a driver's fastest lap from the OpenF1 API.
+
+    Returns a dict with keys: ``'speed'``, ``'throttle'``, ``'brake'``,
+    ``'lap_time'``, ``'lap_number'``, ``'x'``, ``'y'``.
+
+    ``'x'`` and ``'y'`` are always ``None`` — OpenF1 car_data does not include
+    circuit XY coordinates. Track Map falls back to dataset.parquet for these.
+    """
+    drv_laps = laps_df[laps_df["driver_number"] == driver_number].copy()
+    if "is_pit_out_lap" in drv_laps.columns:
+        drv_laps = drv_laps[drv_laps["is_pit_out_lap"] != True]  # noqa: E712
+    drv_laps = drv_laps.dropna(subset=["lap_duration"])
+    if drv_laps.empty:
+        return None
+
+    fastest = drv_laps.sort_values("lap_duration").iloc[0]
+    lap_time = float(fastest["lap_duration"])
+    lap_number: int | None = int(fastest["lap_number"]) if pd.notna(fastest.get("lap_number")) else None
+
+    date_start = fastest.get("date_start")
+    if date_start is None or pd.isna(date_start):
+        return None
+    ts_start = pd.Timestamp(date_start)
+    ts_end = ts_start + pd.Timedelta(seconds=lap_time)
+    date_gte = ts_start.isoformat()
+    date_lte = (ts_end + pd.Timedelta(seconds=0.5)).isoformat()
+
+    client = OpenF1Client(mode="historical")
+    car = client.get_car_data(
+        session_key=session_key,
+        driver_number=driver_number,
+        date_gte=date_gte,
+        date_lte=date_lte,
+    )
+    if car.empty or "date" not in car.columns or "speed" not in car.columns:
+        return None
+
+    car = car.sort_values("date").reset_index(drop=True)
+    speeds = car["speed"].to_numpy(dtype=float)
+    if len(speeds) < 2:
+        return None
+
+    # Cumulative elapsed time from real timestamps — immune to missing samples.
+    cumtime_raw = (car["date"] - car["date"].iloc[0]).dt.total_seconds().to_numpy(dtype=float)
+
+    dt = car["date"].diff().dt.total_seconds().fillna(0.0).to_numpy(dtype=float)[1:]
+    speeds_ms = speeds[:-1] / 3.6
+    dist_increments = np.where(np.isfinite(speeds_ms) & np.isfinite(dt), speeds_ms * dt, 0.0)
+    dist = np.concatenate([[0.0], np.cumsum(dist_increments)])
+    dist_grid = np.linspace(dist[0], dist[-1], N_POINTS)
+
+    def _resample(col: str) -> np.ndarray:
+        if col not in car.columns:
+            return np.full(N_POINTS, np.nan)
+        return np.interp(dist_grid, dist, car[col].to_numpy(dtype=float))
+
+    # Resample cumtime using raw sample index as the independent variable, not dist.
+    # dist can be flat (non-increasing) in slow/stopped sections which makes it an
+    # invalid xp for np.interp and produces incorrect interpolated cumtime values.
+    # The sample index is always strictly increasing, so interpolation is well-defined.
+    raw_idx = np.linspace(0.0, 1.0, len(cumtime_raw))
+    grid_idx = np.linspace(0.0, 1.0, N_POINTS)
+
+    return {
+        "speed": _resample("speed"),
+        "throttle": _resample("throttle"),
+        "brake": _resample("brake"),
+        "cumtime": np.interp(grid_idx, raw_idx, cumtime_raw),  # elapsed seconds at each distance point
+        "x": None,   # not available from OpenF1 car_data; Track Map uses dataset.parquet
+        "y": None,
+        "lap_time": lap_time,
+        "lap_number": lap_number,
+    }
+
+
+def _build_track_map_fig(
+    data_a: dict, acronym_a: str, color_a: str,
+    data_b: dict, acronym_b: str, color_b: str,
+) -> "go.Figure | None":
+    """
+    Circuit coloured by the faster driver per microsector.
+
+    Each of the N-1 distance gaps is coloured by whichever driver had the higher
+    speed at that point. Consecutive same-winner segments are merged into one
+    Scatter trace to keep the figure lightweight.
+    Returns None if X/Y coordinates are missing from the dataset.
+    """
+    x_a, y_a, spd_a = data_a["x"], data_a["y"], data_a["speed"]
+    spd_b = data_b["speed"]
+
+    if x_a is None or y_a is None:
+        return None
+
+    # Upsample to 1000 display points for a smoother circuit outline and finer
+    # microsector boundaries. XY (from circuits.json, 500 pts) and speed traces
+    # (from OpenF1, N_POINTS=200) may have different source lengths, so each is
+    # interpolated on its own unit-interval grid before being mapped to t_fine.
+    N_DISPLAY = 1000
+    t_fine = np.linspace(0.0, 1.0, N_DISPLAY)
+
+    t_xy = np.linspace(0.0, 1.0, len(x_a))
+    x_fine = np.interp(t_fine, t_xy, x_a)
+    y_fine = np.interp(t_fine, t_xy, y_a)
+
+    t_spd = np.linspace(0.0, 1.0, len(spd_a))
+    spd_a_fine = np.interp(t_fine, t_spd, spd_a)
+    spd_b_fine = np.interp(t_fine, t_spd, spd_b)
+
+    # winner[i] = "a" or "b" for the microsector between point i and i+1
+    winner = np.where(spd_a_fine[:-1] >= spd_b_fine[:-1], "a", "b")
+
+    fig = go.Figure()
+
+    # Grey background track (full circuit, behind the coloured segments)
+    fig.add_trace(go.Scatter(
+        x=x_fine, y=y_fine,
+        mode="lines",
+        line=dict(color="rgba(120,120,120,0.25)", width=10),
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+
+    # Group consecutive same-winner segments and draw each as a single trace
+    i = 0
+    n = len(winner)
+    legend_added: dict[str, bool] = {"a": False, "b": False}
+    while i < n:
+        w = winner[i]
+        j = i
+        while j < n and winner[j] == w:
+            j += 1
+        seg_x = x_fine[i: j + 1]
+        seg_y = y_fine[i: j + 1]
+        col = color_a if w == "a" else color_b
+        label = acronym_a if w == "a" else acronym_b
+        fig.add_trace(go.Scatter(
+            x=seg_x, y=seg_y,
+            mode="lines",
+            line=dict(color=col, width=5),
+            name=label,
+            showlegend=not legend_added[w],
+            legendgroup=w,
+            hoverinfo="skip",
+        ))
+        legend_added[w] = True
+        i = j
+
+    fig.update_layout(
+        title=f"Track Map — {acronym_a} vs {acronym_b} (faster driver by microsector)",
+        xaxis=dict(visible=False, scaleanchor="y", scaleratio=1),
+        yaxis=dict(visible=False),
+        legend_title="Faster driver",
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=0, t=40, b=0),
+        height=520,
+    )
+    return fig
+
+
+def _build_time_delta_fig(
+    data_a: dict, acronym_a: str, color_a: str,
+    data_b: dict, acronym_b: str, color_b: str,
+) -> go.Figure:
+    """
+    Redesigned time-delta chart.
+
+    X axis: Lap Distance (0–100%) — symmetric, matches F1 broadcast convention.
+    Y axis: cumulative gap in seconds (positive = A ahead, negative = B ahead).
+
+    Delta is computed from speed traces reconstructed to cumulative time, then
+    differenced. The line is coloured by whichever driver is ahead at each point.
+    Crossover markers, peak advantage markers, and a final-gap annotation are added
+    so the chart is readable at a glance.
+    """
+    def _to_rgba(color: str, alpha: float = 0.30) -> str:
+        """Convert any hex or rgb() colour to an rgba() string Plotly accepts."""
+        if color.startswith("rgba("):
+            return color
+        if color.startswith("rgb("):
+            return color.replace("rgb(", "rgba(").replace(")", f",{alpha})")
+        h = color.lstrip("#")
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+
+    # Use real timestamp-derived cumulative time — avoids speed-reconstruction artifacts
+    # that cause mid-lap delta spikes when car_data samples are unevenly distributed.
+    cumtime_a = data_a["cumtime"]
+    cumtime_b = data_b["cumtime"]
+    delta = cumtime_b - cumtime_a   # positive = A gaining
+
+    n = len(delta)
+    x_pct = np.linspace(0.0, 100.0, n)
+
+    # Per-point plain-language hover text
+    hover_text = [
+        f"{acronym_a} +{abs(d):.3f}s ahead" if d >= 0 else f"{acronym_b} +{abs(d):.3f}s ahead"
+        for d in delta
+    ]
+
+    fig = go.Figure()
+
+    # --- Shaded fill regions (opacity 0.30) ---
+    pos = np.where(delta >= 0, delta, 0.0)
+    neg = np.where(delta < 0, delta, 0.0)
+
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([[x_pct[0]], x_pct, [x_pct[-1]]]),
+        y=np.concatenate([[0], pos, [0]]),
+        mode="lines",
+        fill="tozeroy",
+        fillcolor=_to_rgba(color_a, 0.30),
+        line=dict(width=0),
+        name=f"{acronym_a} faster",
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([[x_pct[0]], x_pct, [x_pct[-1]]]),
+        y=np.concatenate([[0], neg, [0]]),
+        mode="lines",
+        fill="tozeroy",
+        fillcolor=_to_rgba(color_b, 0.30),
+        line=dict(width=0),
+        name=f"{acronym_b} faster",
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+
+    # --- Coloured delta line: A's colour above zero, B's colour below ---
+    delta_a = np.where(delta >= 0, delta, np.nan)
+    delta_b = np.where(delta < 0,  delta, np.nan)
+
+    fig.add_trace(go.Scatter(
+        x=x_pct, y=delta_a,
+        mode="lines",
+        connectgaps=False,
+        line=dict(color=color_a, width=2.5),
+        name=f"{acronym_a} faster",
+        customdata=hover_text,
+        hovertemplate="%{x:.0f}%  —  %{customdata}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_pct, y=delta_b,
+        mode="lines",
+        connectgaps=False,
+        line=dict(color=color_b, width=2.5),
+        name=f"{acronym_b} faster",
+        customdata=hover_text,
+        hovertemplate="%{x:.0f}%  —  %{customdata}<extra></extra>",
+    ))
+
+    # --- Lead-change markers ---
+    crossings = np.where(np.diff(np.sign(delta)) != 0)[0]
+    if len(crossings) > 0:
+        cx = x_pct[crossings]
+        fig.add_trace(go.Scatter(
+            x=cx, y=np.zeros(len(cx)),
+            mode="markers",
+            marker=dict(color="white", size=8, symbol="circle",
+                        line=dict(color="rgba(0,0,0,0.6)", width=1)),
+            name="Lead change",
+            hovertemplate="Lead change at %{x:.0f}%<extra></extra>",
+        ))
+
+    # --- Peak advantage markers (only if meaningful gap > 0.05s) ---
+    max_delta = float(np.nanmax(delta))
+    min_delta = float(np.nanmin(delta))
+
+    if max_delta > 0.05:
+        idx_max = int(np.argmax(delta))
+        fig.add_trace(go.Scatter(
+            x=[x_pct[idx_max]], y=[max_delta],
+            mode="markers",
+            marker=dict(color=color_a, size=10, symbol="triangle-up",
+                        line=dict(color="white", width=1)),
+            name=f"Peak {acronym_a}",
+            hovertemplate=f"Max {acronym_a} +{max_delta:.3f}s at %{{x:.0f}}%<extra></extra>",
+        ))
+
+    if min_delta < -0.05:
+        idx_min = int(np.argmin(delta))
+        fig.add_trace(go.Scatter(
+            x=[x_pct[idx_min]], y=[min_delta],
+            mode="markers",
+            marker=dict(color=color_b, size=10, symbol="triangle-down",
+                        line=dict(color="white", width=1)),
+            name=f"Peak {acronym_b}",
+            hovertemplate=f"Max {acronym_b} +{abs(min_delta):.3f}s at %{{x:.0f}}%<extra></extra>",
+        ))
+
+    # --- Final gap annotation at right edge ---
+    final_gap = float(delta[-1])
+    if abs(final_gap) < 0.001:
+        gap_text = "Dead heat"
+        gap_color = "white"
+    elif final_gap > 0:
+        gap_text = f"+{final_gap:.3f}s\n{acronym_a}"
+        gap_color = color_a
+    else:
+        gap_text = f"{final_gap:.3f}s\n{acronym_b}"
+        gap_color = color_b
+
+    fig.add_annotation(
+        x=x_pct[-1], y=final_gap,
+        text=gap_text,
+        showarrow=True,
+        arrowhead=2,
+        arrowcolor=gap_color,
+        arrowwidth=1.5,
+        ax=40, ay=0,
+        font=dict(color=gap_color, size=12),
+        xanchor="left",
+    )
+
+    # --- Title with subtitle ---
+    lap_a_num = data_a.get("lap_number")
+    lap_b_num = data_b.get("lap_number")
+    lap_a_str = f"Lap {lap_a_num}, {data_a['lap_time']:.3f}s" if lap_a_num else f"{data_a['lap_time']:.3f}s"
+    lap_b_str = f"Lap {lap_b_num}, {data_b['lap_time']:.3f}s" if lap_b_num else f"{data_b['lap_time']:.3f}s"
+    title_text = (
+        f"Lap Time Delta — {acronym_a} vs {acronym_b}"
+        f"<br><sup>{acronym_a}: {lap_a_str}  |  {acronym_b}: {lap_b_str}</sup>"
+    )
+
+    fig.update_layout(
+        title=dict(text=title_text, font=dict(size=14)),
+        xaxis=dict(
+            title="Lap Distance (%)",
+            range=[0, 100],
+            zeroline=False,
+        ),
+        yaxis=dict(
+            title=f"Gap (s)   ↑ {acronym_a} faster   ·   {acronym_b} faster ↓",
+            zeroline=True,
+            zerolinecolor="rgba(255,255,255,0.6)",
+            zerolinewidth=1.5,
+        ),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=460,
+        margin=dict(t=80, b=50, l=60, r=120),
+    )
+    return fig
+
+
+def _driver_color_map(
+    driver_numbers: list,
+    team_colour_map: dict | None = None,
+) -> dict:
+    """
+    Assign a unique colour to each driver number.
+
+    Prefers the team colour from *team_colour_map* when available.
+    If two drivers share the same team colour (teammates), the second one
+    falls back to the next unused Dark24 colour so every driver is distinct.
+    """
+    result: dict = {}
+    used_colours: set[str] = set()
+    palette_idx = 0
+    for d in sorted(driver_numbers):
+        team_col = team_colour_map.get(d) if team_colour_map else None
+        if team_col and team_col not in used_colours:
+            result[d] = team_col
+            used_colours.add(team_col)
+        else:
+            # No team colour, or teammate collision — pick next unused Dark24 colour
+            while RACE_PALETTE[palette_idx % len(RACE_PALETTE)] in used_colours:
+                palette_idx += 1
+            col = RACE_PALETTE[palette_idx % len(RACE_PALETTE)]
+            result[d] = col
+            used_colours.add(col)
+            palette_idx += 1
+    return result
+
+
+def _resolve_pair_colours(
+    drv_a: int,
+    drv_b: int,
+    team_colour_map: dict | None,
+) -> tuple[str, str]:
+    """
+    Return a pair of distinct colours for a two-driver telemetry comparison.
+
+    Rules:
+    - Driver A always gets their team colour (falls back to Dark24[0] if unknown).
+    - Driver B gets their team colour when it differs from Driver A's.
+    - If both drivers share the same team colour (teammates), Driver B gets
+      the next Dark24 colour that is not already used by Driver A.
+    """
+    tc = team_colour_map or {}
+    col_a = tc.get(drv_a) or RACE_PALETTE[0]
+    col_b_candidate = tc.get(drv_b)
+
+    if col_b_candidate and col_b_candidate != col_a:
+        # Different teams — use both team colours directly
+        return col_a, col_b_candidate
+
+    # Same team (or Driver B has no team colour) — find an unused Dark24 colour for B
+    for candidate in RACE_PALETTE:
+        if candidate != col_a:
+            return col_a, candidate
+
+    # Unreachable in practice (Dark24 has 24 colours), but safe fallback
+    return col_a, "#888888"
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -339,6 +916,7 @@ def _render_charts(
     container,
     driver_map: dict | None = None,
     selected_drivers: list | None = None,
+    team_colour_map: dict | None = None,
 ) -> None:
     """Render all Race-Pace charts inside *container*.
 
@@ -350,6 +928,9 @@ def _render_charts(
         when a number has no entry in the map.
     selected_drivers : list, optional
         Subset of driver numbers to display. Defaults to all drivers.
+    team_colour_map : dict, optional
+        Mapping of ``{driver_number: "#RRGGBB"}`` for team colours.
+        Drivers with a unique team colour use it; teammates fall back to Dark24.
     """
     if driver_map is None:
         driver_map = {}
@@ -364,246 +945,257 @@ def _render_charts(
 
     # Resolve the active driver set (filter or all)
     active_drivers = set(selected_drivers) if selected_drivers else set(results["driver_numbers"])
-    cmap = _driver_color_map(list(active_drivers))
+    cmap = _driver_color_map(list(active_drivers), team_colour_map=team_colour_map)
 
     # ---- Chart 1: Rolling Race Pace --------------------------------
-    container.markdown("### Rolling Race Pace")
-    rp = results["rolling_pace"]
-    fig1 = go.Figure()
-    for drv in [d for d in rp.columns if d in active_drivers]:
-        fig1.add_trace(go.Scatter(
-            x=rp.index, y=rp[drv],
-            mode="lines", name=_label(drv),
-            line=dict(color=cmap.get(drv, "#888"), width=2),
-        ))
-    # Session median pace (dashed reference)
-    all_vals = rp.values[~np.isnan(rp.values)]
-    if len(all_vals):
-        median_pace = float(np.median(all_vals))
-        fig1.add_hline(
-            y=median_pace, line_dash="dash", line_color="white",
-            opacity=0.5,
-            annotation_text=f"Median {median_pace:.2f}s",
-            annotation_position="top left",
+    if st.session_state.get("show_rolling_pace", True):
+        container.markdown("### Rolling Race Pace")
+        rp = results["rolling_pace"]
+        fig1 = go.Figure()
+        for drv in [d for d in rp.columns if d in active_drivers]:
+            fig1.add_trace(go.Scatter(
+                x=rp.index, y=rp[drv],
+                mode="lines", name=_label(drv),
+                line=dict(color=cmap.get(drv, "#888"), width=2),
+            ))
+        # Session median pace (dashed reference)
+        all_vals = rp.values[~np.isnan(rp.values)]
+        if len(all_vals):
+            median_pace = float(np.median(all_vals))
+            fig1.add_hline(
+                y=median_pace, line_dash="dash", line_color="white",
+                opacity=0.5,
+                annotation_text=f"Median {median_pace:.2f}s",
+                annotation_position="top left",
+            )
+        fig1.update_layout(
+            xaxis_title="Lap Number", yaxis_title="Rolling Avg Lap Time (s)",
+            hovermode="x unified", legend_title="Driver",
         )
-    fig1.update_layout(
-        xaxis_title="Lap Number", yaxis_title="Rolling Avg Lap Time (s)",
-        hovermode="x unified", legend_title="Driver",
-    )
-    container.plotly_chart(fig1, width="stretch", key="tab4_rolling_pace")
+        container.plotly_chart(fig1, width="stretch", key="tab4_rolling_pace")
 
     # ---- Chart 2 & 3: Gap to Leader + Undercut markers -------------
-    container.markdown("### Gap to Leader")
-    gap = results["gap_to_leader"]
-    undercuts = results["undercuts"]
+    if st.session_state.get("show_gap_to_leader", True):
+        container.markdown("### Gap to Leader")
+        gap = results["gap_to_leader"]
+        undercuts = results["undercuts"]
 
-    fig2 = go.Figure()
-    for drv in [d for d in gap.columns if d in active_drivers]:
-        fig2.add_trace(go.Scatter(
-            x=gap.index, y=gap[drv],
-            mode="lines", name=_label(drv),
-            line=dict(color=cmap.get(drv, "#888"), width=2),
-            fill="tozeroy", opacity=0.3,
-        ))
-    # Overlay undercut/overcut markers (only when both drivers are selected)
-    visible_undercuts = [
-        e for e in undercuts
-        if e["attacking_driver"] in active_drivers and e["defending_driver"] in active_drivers
-    ]
-    for evt in visible_undercuts:
-        lap = evt["lap"]
-        atk = evt["attacking_driver"]
-        kind = evt["type"]
-        marker_symbol = "triangle-up" if kind == "undercut" else "triangle-down"
-        try:
-            y_val = gap.loc[lap, atk].item()  # type: ignore[union-attr]
-        except (KeyError, AttributeError):
-            y_val = 0.0
-        label = f"Lap {lap}: {_label(atk)} {kind} {_label(evt['defending_driver'])}"
-        fig2.add_trace(go.Scatter(
-            x=[lap], y=[y_val],
-            mode="markers+text",
-            marker=dict(
-                symbol=marker_symbol, size=14,
-                color="lime" if kind == "undercut" else "orange",
-                line=dict(width=1, color="white"),
-            ),
-            text=[f"{'▲' if kind == 'undercut' else '▽'}"],
-            textposition="top center",
-            hovertext=[label],
-            hoverinfo="text",
-            showlegend=False,
-        ))
-    fig2.update_layout(
-        xaxis_title="Lap Number", yaxis_title="Gap to Leader (s)",
-        hovermode="x unified", legend_title="Driver",
-    )
-    container.plotly_chart(fig2, width="stretch", key="tab4_gap_to_leader")
+        fig2 = go.Figure()
+        for drv in [d for d in gap.columns if d in active_drivers]:
+            fig2.add_trace(go.Scatter(
+                x=gap.index, y=gap[drv],
+                mode="lines", name=_label(drv),
+                line=dict(color=cmap.get(drv, "#888"), width=2),
+                fill="tozeroy", opacity=0.3,
+            ))
+        # Overlay undercut/overcut markers (only when both drivers are selected)
+        visible_undercuts = [
+            e for e in undercuts
+            if e["attacking_driver"] in active_drivers and e["defending_driver"] in active_drivers
+        ]
+        for evt in visible_undercuts:
+            lap = evt["lap"]
+            atk = evt["attacking_driver"]
+            kind = evt["type"]
+            marker_symbol = "triangle-up" if kind == "undercut" else "triangle-down"
+            try:
+                y_val = gap.loc[lap, atk].item()  # type: ignore[union-attr]
+            except (KeyError, AttributeError):
+                y_val = 0.0
+            label = f"Lap {lap}: {_label(atk)} {kind} {_label(evt['defending_driver'])}"
+            fig2.add_trace(go.Scatter(
+                x=[lap], y=[y_val],
+                mode="markers+text",
+                marker=dict(
+                    symbol=marker_symbol, size=14,
+                    color="lime" if kind == "undercut" else "orange",
+                    line=dict(width=1, color="white"),
+                ),
+                text=[f"{'▲' if kind == 'undercut' else '▽'}"],
+                textposition="top center",
+                hovertext=[label],
+                hoverinfo="text",
+                showlegend=False,
+            ))
+        fig2.update_layout(
+            xaxis_title="Lap Number", yaxis_title="Gap to Leader (s)",
+            hovermode="x unified", legend_title="Driver",
+        )
+        container.plotly_chart(fig2, width="stretch", key="tab4_gap_to_leader")
 
     # ---- Chart 4: Projected Finishing Order -------------------------
-    container.markdown("### Projected Finishing Order")
-    projections = [p for p in results["projections"] if p["driver"] in active_drivers]
-    if projections:
-        # Winner time comes from the first active (non-DNF) driver
-        active = [p for p in projections if p.get("status") != "DNF"]
-        winner_time = active[0]["projected_total_time"] if active else 0
-        proj_data = []
-        for p in projections:
-            is_dnf = p.get("status") == "DNF"
-            gap_to_win = 0.0 if is_dnf else p["projected_total_time"] - winner_time
-            change = p.get("position_change")
-            if is_dnf:
-                bar_color = "#555555"
-            elif change is not None and change > 0:
-                bar_color = "#2ecc71"
-            elif change is not None and change < 0:
-                bar_color = "#e74c3c"
-            else:
-                bar_color = "#95a5a6"
-            cur = p.get("current_position", "?")
-            proj_pos = p["projected_position"]
-            label = "DNF" if is_dnf else f"P{cur} → P{proj_pos}"
-            proj_data.append({
-                "driver": _label(p["driver"]),
-                "gap": round(gap_to_win, 2),
-                "color": bar_color,
-                "label": label,
-            })
-        # Reverse so P1 is at the top of the horizontal bar chart
-        proj_data = proj_data[::-1]
-        fig4 = go.Figure(go.Bar(
-            x=[d["gap"] for d in proj_data],
-            y=[d["driver"] for d in proj_data],
-            orientation="h",
-            marker_color=[d["color"] for d in proj_data],
-            text=[d["label"] for d in proj_data],
-            textposition="outside",
-            hovertemplate="Driver %{y}<br>Gap: +%{x:.2f}s<extra></extra>",
-        ))
-        fig4.update_layout(
-            xaxis_title="Projected Gap to Winner (s)",
-            yaxis_title="Driver",
-            showlegend=False,
-        )
-        container.plotly_chart(fig4, width="stretch", key="tab4_projected_order")
-    else:
-        container.info("Not enough data to project finishing order.")
+    if st.session_state.get("show_projected_order", True):
+        container.markdown("### Projected Finishing Order")
+        projections = [p for p in results["projections"] if p["driver"] in active_drivers]
+        if projections:
+            # Winner time comes from the first active (non-DNF) driver
+            active = [p for p in projections if p.get("status") != "DNF"]
+            winner_time = active[0]["projected_total_time"] if active else 0
+            proj_data = []
+            for p in projections:
+                is_dnf = p.get("status") == "DNF"
+                gap_to_win = 0.0 if is_dnf else p["projected_total_time"] - winner_time
+                change = p.get("position_change")
+                if is_dnf:
+                    bar_color = "#555555"
+                elif change is not None and change > 0:
+                    bar_color = "#2ecc71"
+                elif change is not None and change < 0:
+                    bar_color = "#e74c3c"
+                else:
+                    bar_color = "#95a5a6"
+                cur = p.get("current_position", "?")
+                proj_pos = p["projected_position"]
+                label = "DNF" if is_dnf else f"P{cur} → P{proj_pos}"
+                proj_data.append({
+                    "driver": _label(p["driver"]),
+                    "gap": round(gap_to_win, 2),
+                    "color": bar_color,
+                    "label": label,
+                })
+            # Reverse so P1 is at the top of the horizontal bar chart
+            proj_data = proj_data[::-1]
+            fig4 = go.Figure(go.Bar(
+                x=[d["gap"] for d in proj_data],
+                y=[d["driver"] for d in proj_data],
+                orientation="h",
+                marker_color=[d["color"] for d in proj_data],
+                text=[d["label"] for d in proj_data],
+                textposition="outside",
+                hovertemplate="Driver %{y}<br>Gap: +%{x:.2f}s<extra></extra>",
+            ))
+            fig4.update_layout(
+                xaxis_title="Projected Gap to Winner (s)",
+                yaxis_title="Driver",
+                showlegend=False,
+            )
+            container.plotly_chart(fig4, width="stretch", key="tab4_projected_order")
+        else:
+            container.info("Not enough data to project finishing order.")
 
     # ---- Chart 5: Average Race Pace --------------------------------
-    container.markdown("### Average Race Pace")
-    pace_sum = results["pace_summary"]
-    if pace_sum.empty:
-        container.info("Not enough clean lap data for pace summary.")
-    else:
-        pace_sum = pace_sum.reset_index()
-        pace_sum = pace_sum[pace_sum["driver_number"].isin(active_drivers)]
-        pace_sum["label"] = pace_sum["driver_number"].apply(_label)
-        pace_sum = pace_sum.sort_values("median_pace", ascending=False)  # fastest at top
-        fig5 = go.Figure(go.Bar(
-            x=pace_sum["median_pace"],
-            y=pace_sum["label"],
-            orientation="h",
-            marker=dict(
-                color=pace_sum["std_pace"],
-                colorscale="Viridis",
-                showscale=True,
-                colorbar=dict(title="Pace Std Dev (s)"),
-            ),
-            customdata=pace_sum[["mean_pace", "std_pace", "fastest_lap", "lap_count"]].values,
-            hovertemplate=(
-                "<b>%{y}</b><br>"
-                "Median: %{x:.3f}s<br>"
-                "Mean: %{customdata[0]:.3f}s<br>"
-                "Std Dev: %{customdata[1]:.3f}s<br>"
-                "Fastest lap: %{customdata[2]:.3f}s<br>"
-                "Laps counted: %{customdata[3]}<extra></extra>"
-            ),
-        ))
-        fig5.update_layout(
-            xaxis_title="Median Lap Time (s)",
-            yaxis_title="Driver",
-            showlegend=False,
-        )
-        container.plotly_chart(fig5, width="stretch", key="tab4_avg_pace")
-
-    # ---- Chart 6: Race Pace Ranking --------------------------------
-    container.markdown("### Race Pace Ranking")
-    if pace_sum.empty:
-        container.info("Not enough clean lap data for pace ranking.")
-    else:
-        ranked = pace_sum.sort_values("mean_pace")
-        bar_colors = [cmap.get(int(row["driver_number"]), "#888") for _, row in ranked.iterrows()]
-        fig6 = go.Figure(go.Bar(
-            x=ranked["label"],
-            y=ranked["mean_pace"],
-            error_y=dict(type="data", array=ranked["std_pace"].tolist(), visible=True),
-            marker_color=bar_colors,
-            text=ranked["fastest_lap"].round(3).astype(str) + "s",
-            textposition="outside",
-            hovertemplate=(
-                "<b>%{x}</b><br>"
-                "Mean pace: %{y:.3f}s<br>"
-                "Fastest lap: %{text}<extra></extra>"
-            ),
-        ))
-        fig6.update_layout(
-            xaxis_title="Driver",
-            yaxis_title="Mean Lap Time (s)",
-            showlegend=False,
-        )
-        container.plotly_chart(fig6, width="stretch", key="tab4_pace_ranking")
-
-    # ---- Chart 7: Tyre Degradation by Compound ---------------------
-    container.markdown("### Tyre Degradation by Compound")
-    tyre_deg = results["tyre_deg"]
-    tyre_deg = tyre_deg[tyre_deg["driver_number"].isin(active_drivers)]
-    if tyre_deg.empty:
-        container.info("Stint data unavailable — tyre degradation chart requires stint information.")
-    else:
-        COMPOUND_COLORS = {
-            "SOFT": "#e8002d",
-            "MEDIUM": "#ffd700",
-            "HARD": "#cccccc",
-            "INTERMEDIATE": "#39b54a",
-            "WET": "#0067ff",
-        }
-        fig7 = go.Figure()
-        for compound, grp in tyre_deg.groupby("compound"):
-            color = COMPOUND_COLORS.get(str(compound).upper(), "#888888")
-            fig7.add_trace(go.Scatter(
-                x=grp["mean_pace"],
-                y=grp["deg_per_lap"],
-                mode="markers",
-                name=str(compound),
-                marker=dict(color=color, size=10, line=dict(width=1, color="white")),
-                customdata=grp[["driver_number", "laps_in_stint"]].assign(
-                    label=grp["driver_number"].apply(_label)
-                )[["label", "laps_in_stint"]].values,
+    if st.session_state.get("show_avg_pace", True):
+        container.markdown("### Average Race Pace")
+        pace_sum = results["pace_summary"]
+        if pace_sum.empty:
+            container.info("Not enough clean lap data for pace summary.")
+        else:
+            pace_sum = pace_sum.reset_index()
+            pace_sum = pace_sum[pace_sum["driver_number"].isin(active_drivers)]
+            pace_sum["label"] = pace_sum["driver_number"].apply(_label)
+            pace_sum = pace_sum.sort_values("median_pace", ascending=False)  # fastest at top
+            fig5 = go.Figure(go.Bar(
+                x=pace_sum["median_pace"],
+                y=pace_sum["label"],
+                orientation="h",
+                marker=dict(
+                    color=pace_sum["std_pace"],
+                    colorscale="Viridis",
+                    showscale=True,
+                    colorbar=dict(title="Pace Std Dev (s)"),
+                ),
+                customdata=pace_sum[["mean_pace", "std_pace", "fastest_lap", "lap_count"]].values,
                 hovertemplate=(
-                    "<b>%{customdata[0]}</b> — " + str(compound) + "<br>"
-                    "Mean pace: %{x:.3f}s<br>"
-                    "Degradation: %{y:+.4f}s/lap<br>"
-                    "Laps in stint: %{customdata[1]}<extra></extra>"
+                    "<b>%{y}</b><br>"
+                    "Median: %{x:.3f}s<br>"
+                    "Mean: %{customdata[0]:.3f}s<br>"
+                    "Std Dev: %{customdata[1]:.3f}s<br>"
+                    "Fastest lap: %{customdata[2]:.3f}s<br>"
+                    "Laps counted: %{customdata[3]}<extra></extra>"
                 ),
             ))
-        fig7.add_hline(
-            y=0, line_dash="dash", line_color="white",
-            opacity=0.4, annotation_text="No degradation",
-            annotation_position="top left",
-        )
-        fig7.update_layout(
-            xaxis_title="Mean Stint Pace (s)",
-            yaxis_title="Degradation (s / lap)",
-            legend_title="Compound",
-        )
-        container.plotly_chart(fig7, width="stretch", key="tab4_tyre_deg")
+            fig5.update_layout(
+                xaxis_title="Median Lap Time (s)",
+                yaxis_title="Driver",
+                showlegend=False,
+            )
+            container.plotly_chart(fig5, width="stretch", key="tab4_avg_pace")
+
+    # ---- Chart 6: Race Pace Ranking --------------------------------
+    if st.session_state.get("show_pace_ranking", True):
+        container.markdown("### Race Pace Ranking")
+        pace_sum = results["pace_summary"]
+        if pace_sum.empty:
+            container.info("Not enough clean lap data for pace ranking.")
+        else:
+            pace_sum = pace_sum.reset_index()
+            pace_sum = pace_sum[pace_sum["driver_number"].isin(active_drivers)]
+            pace_sum["label"] = pace_sum["driver_number"].apply(_label)
+            ranked = pace_sum.sort_values("mean_pace")
+            bar_colors = [cmap.get(int(row["driver_number"]), "#888") for _, row in ranked.iterrows()]
+            fig6 = go.Figure(go.Bar(
+                x=ranked["label"],
+                y=ranked["mean_pace"],
+                error_y=dict(type="data", array=ranked["std_pace"].tolist(), visible=True),
+                marker_color=bar_colors,
+                text=ranked["fastest_lap"].round(3).astype(str) + "s",
+                textposition="outside",
+                hovertemplate=(
+                    "<b>%{x}</b><br>"
+                    "Mean pace: %{y:.3f}s<br>"
+                    "Fastest lap: %{text}<extra></extra>"
+                ),
+            ))
+            fig6.update_layout(
+                xaxis_title="Driver",
+                yaxis_title="Mean Lap Time (s)",
+                showlegend=False,
+            )
+            container.plotly_chart(fig6, width="stretch", key="tab4_pace_ranking")
+
+    # ---- Chart 7: Tyre Degradation by Compound ---------------------
+    if st.session_state.get("show_tyre_deg", True):
+        container.markdown("### Tyre Degradation by Compound")
+        tyre_deg = results["tyre_deg"]
+        tyre_deg = tyre_deg[tyre_deg["driver_number"].isin(active_drivers)]
+        if tyre_deg.empty:
+            container.info("Stint data unavailable — tyre degradation chart requires stint information.")
+        else:
+            COMPOUND_COLORS = {
+                "SOFT": "#e8002d",
+                "MEDIUM": "#ffd700",
+                "HARD": "#cccccc",
+                "INTERMEDIATE": "#39b54a",
+                "WET": "#0067ff",
+            }
+            fig7 = go.Figure()
+            for compound, grp in tyre_deg.groupby("compound"):
+                color = COMPOUND_COLORS.get(str(compound).upper(), "#888888")
+                fig7.add_trace(go.Scatter(
+                    x=grp["mean_pace"],
+                    y=grp["deg_per_lap"],
+                    mode="markers",
+                    name=str(compound),
+                    marker=dict(color=color, size=10, line=dict(width=1, color="white")),
+                    customdata=grp[["driver_number", "laps_in_stint"]].assign(
+                        label=grp["driver_number"].apply(_label)
+                    )[["label", "laps_in_stint"]].values,
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b> — " + str(compound) + "<br>"
+                        "Mean pace: %{x:.3f}s<br>"
+                        "Degradation: %{y:+.4f}s/lap<br>"
+                        "Laps in stint: %{customdata[1]}<extra></extra>"
+                    ),
+                ))
+            fig7.add_hline(
+                y=0, line_dash="dash", line_color="white",
+                opacity=0.4, annotation_text="No degradation",
+                annotation_position="top left",
+            )
+            fig7.update_layout(
+                xaxis_title="Mean Stint Pace (s)",
+                yaxis_title="Degradation (s / lap)",
+                legend_title="Compound",
+            )
+            container.plotly_chart(fig7, width="stretch", key="tab4_tyre_deg")
 
 
-# ---- Tab 4 content -----------------------------------------------
+# ---- Tab 3 content -----------------------------------------------
 
-with tab4:
-    st.subheader("Race Pace Dashboard")
+with tab3:
+    st.subheader("Race Dashboard")
 
+    # ---- Race Analysis ---------------------------------------------
     mode = st.radio(
         "Mode",
         ["🗂️ Historical (select a race)", "📡 Live (current race weekend)"],
@@ -696,14 +1288,23 @@ with tab4:
                     st.error("No lap data returned for this session.")
                 else:
                     driver_map: dict = {}
+                    team_colour_map: dict = {}
                     if not drivers_df.empty and "driver_number" in drivers_df.columns and "name_acronym" in drivers_df.columns:
                         driver_map = {
                             int(row["driver_number"]): str(row["name_acronym"])
                             for _, row in drivers_df.iterrows()
                             if pd.notna(row["driver_number"]) and pd.notna(row["name_acronym"])
                         }
+                        if "team_colour" in drivers_df.columns:
+                            team_colour_map = {
+                                int(row["driver_number"]): f"#{str(row['team_colour']).strip().upper()}"
+                                for _, row in drivers_df.iterrows()
+                                if pd.notna(row["driver_number"]) and pd.notna(row.get("team_colour"))
+                            }
                     st.session_state["rp_hist_analyser"] = RaceAnalyser(laps, stints, position)
                     st.session_state["rp_hist_driver_map"] = driver_map
+                    st.session_state["rp_hist_team_colour_map"] = team_colour_map
+                    st.session_state["rp_hist_session_key"] = session_key
         else:
             st.info("Select a year and Grand Prix, then click **Fetch Sessions** to see available sessions.")
 
@@ -712,6 +1313,117 @@ with tab4:
             _analyser = st.session_state["rp_hist_analyser"]
             _dmap = st.session_state["rp_hist_driver_map"]
             _all_drvs = sorted(_analyser._clean["driver_number"].dropna().unique().tolist())
+            # ---- Fastest Lap Telemetry Comparison ------------------
+            if st.session_state.get("show_telemetry", True):
+                st.markdown("### Fastest Lap Telemetry Comparison")
+            _tc1, _tc2, _tc3 = st.columns(3)
+            _tel_drv_a = _tc1.selectbox(
+                "Driver A",
+                options=_all_drvs,
+                format_func=lambda n: _dmap.get(int(n), str(n)),
+                key="rp_tel_drv_a",
+            )
+            _tel_drv_b = _tc2.selectbox(
+                "Driver B",
+                options=_all_drvs,
+                index=min(1, len(_all_drvs) - 1),
+                format_func=lambda n: _dmap.get(int(n), str(n)),
+                key="rp_tel_drv_b",
+            )
+            _tel_channel = _tc3.selectbox(
+                "Channel",
+                options=SPECIAL_CHANNELS + list(TRACE_COLS.keys()),
+                key="rp_tel_channel",
+            )
+
+            def _dlabel(n: int) -> str:
+                return _dmap.get(n, str(n))
+
+            if not st.session_state.get("show_telemetry", True):
+                pass  # section hidden by user
+            elif _tel_drv_a is None or _tel_drv_b is None:
+                st.info("Select two drivers to compare telemetry.")
+            else:
+                _drv_a_int, _drv_b_int = int(_tel_drv_a), int(_tel_drv_b)
+                _col_a, _col_b = _resolve_pair_colours(
+                    _drv_a_int, _drv_b_int,
+                    st.session_state.get("rp_hist_team_colour_map"),
+                )
+                _tel_cmap = _driver_color_map(
+                    list(_all_drvs),
+                    team_colour_map=st.session_state.get("rp_hist_team_colour_map"),
+                )
+
+                _hist_sk: int | str | None = st.session_state.get("rp_hist_session_key")
+                _hist_laps = _analyser._laps
+
+                if _hist_sk is None:
+                    st.info("Session not loaded yet. Load a race first.")
+                elif _tel_channel in SPECIAL_CHANNELS:
+                    with st.spinner("Fetching fastest-lap telemetry from OpenF1..."):
+                        _data_a = _fetch_fastest_lap_all_openf1(_hist_sk, _drv_a_int, _hist_laps)
+                        _data_b = _fetch_fastest_lap_all_openf1(_hist_sk, _drv_b_int, _hist_laps)
+                    if _data_a is None:
+                        st.caption(f"Could not fetch telemetry for {_dlabel(_drv_a_int)} from OpenF1.")
+                    elif _data_b is None:
+                        st.caption(f"Could not fetch telemetry for {_dlabel(_drv_b_int)} from OpenF1.")
+                    elif _tel_channel == "Track Map":
+                        _gp_name = st.session_state.get("rp_gp", "")
+                        _circuit = circuits.get(_gp_name)
+                        if _circuit is None:
+                            st.info(f"No circuit data for '{_gp_name}'. Run `python src/generate_circuits.py` to generate it.")
+                        else:
+                            _cx = np.asarray(_circuit["x"], dtype=float)
+                            _cy = np.asarray(_circuit["y"], dtype=float)
+                            _acronym_a, _acronym_b = _dlabel(_drv_a_int), _dlabel(_drv_b_int)
+                            _map_a = {"x": _cx, "y": _cy, "speed": _data_a["speed"]}
+                            _map_b = {"x": _cx, "y": _cy, "speed": _data_b["speed"]}
+                            _special_fig = _build_track_map_fig(
+                                _map_a, _acronym_a, _col_a,
+                                _map_b, _acronym_b, _col_b,
+                            )
+                            if _special_fig is not None:
+                                st.plotly_chart(_special_fig, width="stretch", key="tab3_track_map_hist")
+                    elif _tel_channel == "Time Delta":
+                        _special_fig = _build_time_delta_fig(
+                            _data_a, _dlabel(_drv_a_int), _col_a,
+                            _data_b, _dlabel(_drv_b_int), _col_b,
+                        )
+                        st.plotly_chart(_special_fig, width="stretch", key="tab3_time_delta_hist")
+                else:
+                    _tel_fig = go.Figure()
+                    _any_trace = False
+                    for _drv_int in (_drv_a_int, _drv_b_int):
+                        with st.spinner(f"Fetching {_tel_channel} telemetry for {_dlabel(_drv_int)}..."):
+                            _trace, _lap_t, _lap_num = _fetch_fastest_lap_openf1(
+                                _hist_sk, _drv_int, _hist_laps, _tel_channel
+                            )
+                        if _trace is None:
+                            st.caption(f"Could not fetch {_tel_channel} telemetry for {_dlabel(_drv_int)} from OpenF1.")
+                            continue
+                        _any_trace = True
+                        _lap_label = f"Lap {_lap_num}, {_lap_t:.3f}s" if _lap_num is not None else f"{_lap_t:.3f}s"
+                        _tel_fig.add_trace(go.Scatter(
+                            x=np.arange(N_POINTS), y=_trace,
+                            mode="lines",
+                            name=f"{_dlabel(_drv_int)} ({_lap_label})",
+                            line=dict(color=_tel_cmap.get(_drv_int, "#888"), width=2.5),
+                        ))
+                    if _any_trace:
+                        _tel_fig.update_layout(
+                            title=(
+                                f"Fastest Lap {_tel_channel} — "
+                                f"{_dlabel(_drv_a_int)} vs {_dlabel(_drv_b_int)}"
+                            ),
+                            xaxis_title="Normalised Distance (0–200 points)",
+                            yaxis_title=_tel_channel,
+                            legend_title="Driver",
+                            hovermode="x unified",
+                        )
+                        st.plotly_chart(_tel_fig, width="stretch", key="tab3_tel_hist")
+
+            st.divider()
+
             _selected = st.multiselect(
                 "Drivers",
                 options=_all_drvs,
@@ -725,6 +1437,7 @@ with tab4:
                 st,
                 driver_map=_dmap,
                 selected_drivers=_selected or _all_drvs,
+                team_colour_map=st.session_state.get("rp_hist_team_colour_map"),
             )
 
     else:
@@ -771,13 +1484,19 @@ with tab4:
                 live_drivers_df = client.get_live_drivers()
                 st.session_state["rp_last_refresh"] = datetime.now().strftime("%H:%M:%S")
 
-            # Build / refresh driver map
+            # Build / refresh driver map and team colour map
             if not live_drivers_df.empty and "driver_number" in live_drivers_df.columns and "name_acronym" in live_drivers_df.columns:
                 st.session_state["rp_live_driver_map"] = {
                     int(row["driver_number"]): str(row["name_acronym"])
                     for _, row in live_drivers_df.iterrows()
                     if pd.notna(row["driver_number"]) and pd.notna(row["name_acronym"])
                 }
+                if "team_colour" in live_drivers_df.columns:
+                    st.session_state["rp_live_team_colour_map"] = {
+                        int(row["driver_number"]): f"#{str(row['team_colour']).strip().upper()}"
+                        for _, row in live_drivers_df.iterrows()
+                        if pd.notna(row["driver_number"]) and pd.notna(row.get("team_colour"))
+                    }
 
             if laps.empty:
                 st.warning("No active session found. Try during a race weekend.")
@@ -785,6 +1504,116 @@ with tab4:
                 analyser = RaceAnalyser(laps, stints, position)
                 _live_dmap = st.session_state["rp_live_driver_map"]
                 _all_drvs = sorted(analyser._clean["driver_number"].dropna().unique().tolist())
+
+                # ---- Fastest Lap Telemetry Comparison (live) -------
+                if st.session_state.get("show_telemetry", True):
+                    st.markdown("### Fastest Lap Telemetry Comparison")
+                _lc1, _lc2, _lc3 = st.columns(3)
+                _ltel_drv_a = _lc1.selectbox(
+                    "Driver A",
+                    options=_all_drvs,
+                    format_func=lambda n: _live_dmap.get(int(n), str(n)),
+                    key="rp_live_tel_drv_a",
+                )
+                _ltel_drv_b = _lc2.selectbox(
+                    "Driver B",
+                    options=_all_drvs,
+                    index=min(1, len(_all_drvs) - 1),
+                    format_func=lambda n: _live_dmap.get(int(n), str(n)),
+                    key="rp_live_tel_drv_b",
+                )
+                _ltel_channel = _lc3.selectbox(
+                    "Channel",
+                    options=SPECIAL_CHANNELS + list(TRACE_COLS.keys()),
+                    key="rp_live_tel_channel",
+                )
+
+                def _live_dlabel(n: int) -> str:
+                    return _live_dmap.get(n, str(n))
+
+                if not st.session_state.get("show_telemetry", True):
+                    pass  # section hidden by user
+                elif _ltel_drv_a is None or _ltel_drv_b is None:
+                    st.info("Select two drivers to compare telemetry.")
+                else:
+                    _ldrv_a_int, _ldrv_b_int = int(_ltel_drv_a), int(_ltel_drv_b)
+                    _lcol_a, _lcol_b = _resolve_pair_colours(
+                        _ldrv_a_int, _ldrv_b_int,
+                        st.session_state.get("rp_live_team_colour_map"),
+                    )
+                    _ltel_cmap = _driver_color_map(
+                        list(_all_drvs),
+                        team_colour_map=st.session_state.get("rp_live_team_colour_map"),
+                    )
+
+                    # Live mode: use "latest" as the session key for car_data calls
+                    _live_laps = analyser._laps
+
+                    if _ltel_channel in SPECIAL_CHANNELS:
+                        with st.spinner("Fetching fastest-lap telemetry from OpenF1..."):
+                            _ldata_a = _fetch_fastest_lap_all_openf1("latest", _ldrv_a_int, _live_laps)
+                            _ldata_b = _fetch_fastest_lap_all_openf1("latest", _ldrv_b_int, _live_laps)
+                        if _ldata_a is None:
+                            st.caption(f"Could not fetch telemetry for {_live_dlabel(_ldrv_a_int)} from OpenF1.")
+                        elif _ldata_b is None:
+                            st.caption(f"Could not fetch telemetry for {_live_dlabel(_ldrv_b_int)} from OpenF1.")
+                        elif _ltel_channel == "Track Map":
+                            _live_gp = st.session_state.get("rp_live_meeting_name", "")
+                            _lcircuit = circuits.get(_live_gp) if _live_gp else None
+                            if _lcircuit is None:
+                                st.info("Circuit outline unavailable for the current live session.")
+                            else:
+                                _lcx = np.asarray(_lcircuit["x"], dtype=float)
+                                _lcy = np.asarray(_lcircuit["y"], dtype=float)
+                                _lacronym_a, _lacronym_b = _live_dlabel(_ldrv_a_int), _live_dlabel(_ldrv_b_int)
+                                _lmap_a = {"x": _lcx, "y": _lcy, "speed": _ldata_a["speed"]}
+                                _lmap_b = {"x": _lcx, "y": _lcy, "speed": _ldata_b["speed"]}
+                                _lspecial_fig = _build_track_map_fig(
+                                    _lmap_a, _lacronym_a, _lcol_a,
+                                    _lmap_b, _lacronym_b, _lcol_b,
+                                )
+                                if _lspecial_fig is not None:
+                                    st.plotly_chart(_lspecial_fig, width="stretch", key="tab3_track_map_live")
+                        elif _ltel_channel == "Time Delta":
+                            _lspecial_fig = _build_time_delta_fig(
+                                _ldata_a, _live_dlabel(_ldrv_a_int), _lcol_a,
+                                _ldata_b, _live_dlabel(_ldrv_b_int), _lcol_b,
+                            )
+                            st.plotly_chart(_lspecial_fig, width="stretch", key="tab3_time_delta_live")
+                    else:
+                        _ltel_fig = go.Figure()
+                        _lany_trace = False
+                        for _ldrv_int in (_ldrv_a_int, _ldrv_b_int):
+                            with st.spinner(f"Fetching {_ltel_channel} telemetry for {_live_dlabel(_ldrv_int)}..."):
+                                _ltrace, _llap_t, _llap_num = _fetch_fastest_lap_openf1(
+                                    "latest", _ldrv_int, _live_laps, _ltel_channel
+                                )
+                            if _ltrace is None:
+                                st.caption(f"Could not fetch {_ltel_channel} telemetry for {_live_dlabel(_ldrv_int)} from OpenF1.")
+                                continue
+                            _lany_trace = True
+                            _llap_label = f"Lap {_llap_num}, {_llap_t:.3f}s" if _llap_num is not None else f"{_llap_t:.3f}s"
+                            _ltel_fig.add_trace(go.Scatter(
+                                x=np.arange(N_POINTS), y=_ltrace,
+                                mode="lines",
+                                name=f"{_live_dlabel(_ldrv_int)} ({_llap_label})",
+                                line=dict(color=_ltel_cmap.get(_ldrv_int, "#888"), width=2.5),
+                            ))
+                        if _lany_trace:
+                            _ltel_fig.update_layout(
+                                title=(
+                                    f"Fastest Lap {_ltel_channel} — "
+                                    f"{_live_dlabel(_ldrv_a_int)} vs {_live_dlabel(_ldrv_b_int)}"
+                                ),
+                                xaxis_title="Normalised Distance (0–200 points)",
+                                yaxis_title=_ltel_channel,
+                                legend_title="Driver",
+                                hovermode="x unified",
+                            )
+                            st.plotly_chart(_ltel_fig, width="stretch", key="tab3_tel_live")
+
+                st.divider()
+
                 _selected = st.multiselect(
                     "Drivers",
                     options=_all_drvs,
@@ -799,6 +1628,7 @@ with tab4:
                         st,
                         driver_map=_live_dmap,
                         selected_drivers=_selected or _all_drvs,
+                        team_colour_map=st.session_state.get("rp_live_team_colour_map"),
                     )
         except Exception as exc:
             st.warning(f"Live refresh failed: {exc}")

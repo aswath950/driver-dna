@@ -91,7 +91,7 @@ def extract_session_telemetry(
             dist = tel["Distance"].to_numpy(dtype=float)
             dist_grid = np.linspace(dist[0], dist[-1], N_POINTS)
 
-            channels = ["Speed", "Throttle", "Brake", "nGear", "RPM"]
+            channels = ["Speed", "Throttle", "Brake", "nGear", "RPM", "X", "Y"]
             resampled: dict[str, np.ndarray] = {}
             for ch in channels:
                 if ch not in tel.columns:
@@ -120,6 +120,7 @@ def extract_session_telemetry(
 
             row = {
                 "driver": driver,
+                "lap_number": int(lap["LapNumber"]),
                 "lap_time_seconds": lap["LapTime"].total_seconds(),
                 "mean_speed": float(np.nanmean(spd)),
                 "max_speed": float(np.nanmax(spd)),
@@ -134,6 +135,9 @@ def extract_session_telemetry(
                 "speed_trace": spd.tolist(),
                 "throttle_trace": thr.tolist(),
                 "brake_trace": brk.tolist(),
+                # Circuit XY coordinates for track map (metres, arbitrary origin)
+                "x_trace": resampled["X"].tolist(),
+                "y_trace": resampled["Y"].tolist(),
             }
             rows.append(row)
 

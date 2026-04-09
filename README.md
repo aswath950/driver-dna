@@ -1,4 +1,4 @@
-# Driver DNA + Race Pace
+# Driver DNA + Race Dashboard
 
 **Can a machine learning model tell two F1 drivers apart from their telemetry alone — without ever seeing their name?**
 
@@ -12,19 +12,30 @@ Driver DNA Fingerprinter extracts lap telemetry from FastF1, engineers driving-s
 
 Extracts telemetry from qualifying/race sessions, engineers 10 scalar driving-style features per lap, and trains an XGBoost classifier to identify drivers. The Streamlit dashboard includes:
 
-- **Telemetry Overlay** — compare two drivers' average Speed, Throttle, or Brake trace across all their laps
 - **Driver Radar** — spider chart of normalised style features for 2–4 drivers
 - **Mystery Driver** — pick any lap, let the model guess the driver, then reveal whether it was right
 
-### 🏁 Race Pace Dashboard
+### 🏁 Race Dashboard
 
 Real-time and historical race analysis powered by the OpenF1 API (no API key required).
+
+**Fastest Lap Telemetry Comparison** — compare the single fastest recorded lap between two drivers, live from the OpenF1 API for the selected session. Five channels are available:
+
+| Channel | What it shows |
+|---|---|
+| **Time Delta** | Cumulative time gap through the lap. X axis = elapsed lap time, Y axis = Δ gap (positive = Driver A ahead). Shaded regions show which driver is gaining at each point. |
+| **Track Map** | Circuit outline coloured by the faster driver per microsector (~999 segments). Each segment is coloured by whichever driver had higher speed at that distance point. Circuit geometry comes from a pre-generated static store (`data/circuits.json`) keyed by Grand Prix name — always shows the correct track for the selected race. |
+| **Speed** | Overlaid speed trace (km/h) vs. distance through the lap |
+| **Throttle** | Overlaid throttle application (%) vs. distance |
+| **Brake** | Overlaid brake pressure (%) vs. distance |
+
+Driver colours are assigned from team colours (sourced live from the OpenF1 `/drivers` endpoint). When two drivers from the **same team** are compared, one receives an alternative colour from a distinct palette to ensure they are always visually distinguishable. Legend labels include both the driver acronym and the lap number used.
 
 **Live mode** — connects to the OpenF1 live feed during an active F1 session. Auto-refreshes at a configurable interval (10s / 30s / 60s) with a pulsing LIVE badge. Only works during active F1 race weekends.
 
 **Historical mode** — analyse any race from 2022 onwards. Select a year and Grand Prix, and all charts load from the OpenF1 archive.
 
-**7 analysis charts:**
+**7 race analysis charts:**
 
 | Chart | What it shows |
 |---|---|
@@ -44,8 +55,10 @@ All driver labels display 3-letter acronyms (e.g. HAM, VER) rather than raw driv
 
 | Source | What it provides | Link |
 |---|---|---|
-| **FastF1** | High-frequency car telemetry (speed, throttle, brake, steering, gear, RPM) per lap | https://docs.fastf1.dev |
-| **OpenF1** | Live and historical race data — lap times, tyre stints, track positions | https://openf1.org |
+| **FastF1** | High-frequency car telemetry (speed, throttle, brake, steering, gear, RPM) per lap — used by `pipeline.py` for the Driver DNA dataset and by `generate_circuits.py` for circuit XY geometry | https://docs.fastf1.dev |
+| **OpenF1** | Live and historical race data — lap times, tyre stints, track positions, car telemetry, and driver/team metadata | https://openf1.org |
+
+> `data/circuits.json` (circuit XY outlines) and `data/dataset.parquet` (Driver DNA training data) are both git-ignored and must be generated locally before the full dashboard is available.
 
 ---
 
@@ -69,8 +82,19 @@ Each lap is compressed into **10 scalar features** that capture driving style:
 ### 3. XGBoost classifier (`src/model.py`)
 A gradient-boosted tree classifier is trained with **5-fold stratified cross-validation**. Each driver is one class. The model learns the combination of scalar features that makes each driver's style distinct. SHAP values reveal which features matter most.
 
-### 4. Streamlit dashboard (`src/app.py`)
-Four interactive tabs covering both the Driver DNA analysis and the Race Pace Dashboard described in the Features section above.
+### 4. Circuit geometry store (`src/generate_circuits.py`)
+A one-off script that uses FastF1 to extract the XY circuit outline for every Grand Prix in the dashboard dropdown and writes them to `data/circuits.json`. Each entry contains **500 evenly resampled distance points** for a smooth rendering resolution. The script is resume-safe — it skips circuits already written and saves after each one. Run once before launching the dashboard.
+
+### 5. Streamlit dashboard (`src/app.py`)
+Three interactive tabs covering both the Driver DNA analysis and the Race Dashboard:
+
+| Tab | Contents |
+|---|---|
+| **Driver Radar** | Normalised driving-style spider chart for 2–4 drivers |
+| **Mystery Driver** | ML model prediction with probability breakdown |
+| **Race Dashboard** | Fastest Lap Telemetry Comparison (5 channels, live OpenF1 data) + full race analysis (7 charts) |
+
+The Race Dashboard's Fastest Lap Telemetry Comparison fetches car telemetry directly from the OpenF1 `car_data` API for the user-selected session and drivers — it is not reading from `dataset.parquet`. The Track Map channel draws circuit geometry from `data/circuits.json` (keyed by Grand Prix name) and colours it by live speed data, so the correct track is always shown regardless of which session was last run through `pipeline.py`.
 
 ---
 
@@ -90,9 +114,17 @@ pip install -r requirements.txt
 
 ## Usage
 
-### 1. Extract telemetry and build the dataset
+### 1. Generate circuit outlines (required for Track Map)
 
-Downloads the session from the F1 timing feed and writes `data/dataset.parquet`:
+Downloads XY geometry for all 24 Grand Prix circuits and writes `data/circuits.json`. Run once; takes 10–30 minutes due to FastF1 downloads. Progress is saved after each circuit so the script can be interrupted and resumed.
+
+```bash
+python src/generate_circuits.py
+```
+
+### 2. Extract telemetry and build the Driver DNA dataset
+
+Downloads the session from the F1 timing feed and writes `data/dataset.parquet`. Required for the Driver Radar and Mystery Driver tabs.
 
 ```bash
 python src/pipeline.py
@@ -100,7 +132,7 @@ python src/pipeline.py
 
 > First run will download and cache session data — this takes a few minutes.
 
-### 2. Train the classifier
+### 3. Train the classifier
 
 Runs 5-fold CV, saves the model, label encoder, accuracy, confusion matrix, and SHAP plot to `models/`:
 
@@ -108,13 +140,15 @@ Runs 5-fold CV, saves the model, label encoder, accuracy, confusion matrix, and 
 python src/model.py
 ```
 
-### 3. Launch the dashboard
+### 4. Launch the dashboard
 
 ```bash
 streamlit run src/app.py
 ```
 
-> **Note:** The Race Pace Dashboard's live mode only works during active F1 race weekends (practice, qualifying, or race sessions). Historical mode works any time for races from 2022 onwards.
+> **Note:** The Race Dashboard's live mode only works during active F1 race weekends (practice, qualifying, or race sessions). Historical mode works any time for races from 2022 onwards.
+>
+> The Race Dashboard's Fastest Lap Telemetry and race analysis charts work independently of `dataset.parquet` — they query the OpenF1 API directly. Only the Driver Radar and Mystery Driver tabs require steps 2 and 3.
 
 ---
 
@@ -152,6 +186,9 @@ Streamlit's file-watcher reruns the script on save, which re-executes past any p
 **pipeline.py waits for input when debugging**
 `pipeline.py` uses `input()` prompts. These appear in the VS Code integrated terminal — click the terminal panel and type your responses there.
 
+**Track Map shows "No circuit data"**
+`data/circuits.json` has not been generated yet. Run `python src/generate_circuits.py` once (with the venv active). The script is resume-safe — re-run it to add any missing circuits.
+
 **FastF1 cache**
 On first run, FastF1 downloads session data to `./data/`. This can take several minutes. Subsequent runs read from cache and are fast.
 
@@ -161,22 +198,25 @@ On first run, FastF1 downloads session data to `./data/`. This can take several 
 
 ```
 driver-dna/
-├── data/               # FastF1 cache + dataset.parquet (git-ignored)
-├── models/             # Saved model files (git-ignored)
+├── data/                        # FastF1 cache + generated data files (git-ignored)
+│   ├── dataset.parquet          # Driver DNA training data (pipeline.py output)
+│   └── circuits.json            # Circuit XY outlines for Track Map (generate_circuits.py output)
+├── models/                      # Saved model files (git-ignored)
 │   ├── driver_dna_clf.joblib
 │   ├── label_encoder.joblib
 │   ├── accuracy.txt
 │   ├── confusion_matrix.html
 │   └── shap_importance.png
 ├── src/
-│   ├── pipeline.py     # Data extraction & feature engineering
-│   ├── model.py        # Train, evaluate, save classifier
-│   ├── openf1.py       # OpenF1 API client (live + historical)
-│   ├── race_engine.py  # Pace analysis, tyre degradation, undercut detection, projections
-│   └── app.py          # Streamlit dashboard (4 tabs)
+│   ├── pipeline.py              # Data extraction & feature engineering (FastF1)
+│   ├── model.py                 # Train, evaluate, save XGBoost classifier
+│   ├── generate_circuits.py     # One-off script: generate data/circuits.json
+│   ├── openf1.py                # OpenF1 API client (live + historical modes)
+│   ├── race_engine.py           # Pace analysis, tyre degradation, undercut detection, projections
+│   └── app.py                   # Streamlit dashboard (3 tabs)
 ├── .streamlit/
-│   └── config.toml     # Dark theme with F1 red (#E8002D)
-├── streamlit_app.py    # Streamlit Community Cloud entry point
+│   └── config.toml              # Dark theme with F1 red (#E8002D)
+├── streamlit_app.py             # Streamlit Community Cloud entry point
 ├── requirements.txt
 └── README.md
 ```
