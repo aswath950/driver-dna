@@ -11,6 +11,7 @@ Expected columns from dataset.parquet:
 """
 
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -39,13 +40,13 @@ SPECIAL_CHANNELS = ["Track Map", "Time Delta"]
 RADAR_FEATURES = ["mean_speed", "throttle_mean", "throttle_std", "brake_events", "steer_std", "gear_changes"]
 # Sidebar visibility toggle keys — order determines display order in the expander
 CHART_KEYS = {
-    "Fastest Lap Telemetry": "show_telemetry",
-    "Rolling Race Pace":     "show_rolling_pace",
-    "Gap to Leader":         "show_gap_to_leader",
-    "Projected Finish":      "show_projected_order",
-    "Average Race Pace":     "show_avg_pace",
-    "Race Pace Ranking":     "show_pace_ranking",
-    "Tyre Degradation":      "show_tyre_deg",
+    "Fastest Lap Telemetry": ("show_telemetry",      True),
+    "Rolling Race Pace":     ("show_rolling_pace",    False),
+    "Gap to Leader":         ("show_gap_to_leader",   False),
+    "Projected Finish":      ("show_projected_order", False),
+    "Average Race Pace":     ("show_avg_pace",        False),
+    "Race Pace Ranking":     ("show_pace_ranking",    True),
+    "Tyre Degradation":      ("show_tyre_deg",        True),
 }
 
 # --- Session state defaults for non-widget keys only ---------------
@@ -69,6 +70,11 @@ STATE_DEFAULTS: dict = {
     "rp_live_driver_map": {},
     "rp_live_team_colour_map": {},   # {int(driver_number): "#RRGGBB"}
     "rp_live_meeting_name": "",      # GP name for live Track Map circuit lookup
+    # Tab 2 — Mystery Driver / LLM Explainer
+    "md_explanation": None,          # str | None — cached LLM explanation
+    "md_prediction_ready": False,    # bool — True after Identify Driver runs
+    "md_last_explain_ts": 0.0,       # float — unix timestamp of last explain call
+    "md_last_lap_idx": None,         # int | None — lap index of last prediction
 }
 
 st.set_page_config(page_title="Driver DNA Fingerprinter", layout="wide")
@@ -116,8 +122,11 @@ with st.sidebar:
     st.divider()
     with st.expander("Visible Charts", expanded=False):
         st.caption("Toggle sections on or off in the Race Dashboard.")
-        for _chart_label, _chart_key in CHART_KEYS.items():
-            st.checkbox(_chart_label, value=True, key=_chart_key)
+        for _chart_label, (_chart_key, _chart_default) in CHART_KEYS.items():
+            st.checkbox(_chart_label, value=_chart_default, key=_chart_key)
+        st.divider()
+        st.checkbox("Live Mode", value=False, key="show_live_mode")
+        st.caption("Enable to access live race weekend data.")
 
     # -- Health Check expander --
     st.divider()
@@ -181,6 +190,149 @@ def get_circuits() -> dict:
         return json.load(f)
 
 
+# ── LLM Explainer helpers ───────────────────────────────────────────────────
+
+@st.cache_resource
+def get_shap_explainer(_clf):
+    """Cache a shap.TreeExplainer. Underscore prefix prevents Streamlit hashing clf."""
+    import shap
+    return shap.TreeExplainer(_clf)
+
+
+def compute_shap_for_prediction(
+    explainer, X_input: np.ndarray, pred_class_idx: int
+) -> np.ndarray:
+    """Return 1-D SHAP values (n_features,) for the predicted class only.
+
+    X_input always has shape (1, n_features), so the first axis of the raw
+    SHAP output is a reliable discriminator:
+      - New SHAP (>=0.41): (n_samples=1, n_features, n_classes) → shape[0] == 1
+      - Old SHAP:          (n_classes, n_samples=1, n_features) → shape[0] == n_classes
+    """
+    raw = explainer.shap_values(X_input)
+    arr = np.array(raw)
+    if arr.ndim == 2:           # binary: (1, n_features)
+        return arr[0]
+    elif arr.ndim == 3:
+        if arr.shape[0] == 1:   # new SHAP: (1, n_features, n_classes)
+            return arr[0, :, pred_class_idx]
+        else:                   # old SHAP: (n_classes, 1, n_features)
+            return arr[pred_class_idx, 0, :]
+    return np.abs(arr).mean(axis=tuple(range(arr.ndim - 1)))      # fallback
+
+
+_FEATURE_BOUNDS: dict = {
+    "lap_time_seconds":  (60.0,  200.0),
+    "mean_speed":        (50.0,  380.0),
+    "max_speed":         (80.0,  420.0),
+    "min_speed":         (0.0,   250.0),
+    "throttle_mean":     (0.0,   100.0),
+    "throttle_std":      (0.0,    60.0),
+    "brake_mean":        (0.0,   100.0),
+    "brake_events":      (0.0,   200.0),
+    "gear_changes":      (0.0,  1500.0),
+    "steer_std":         (0.0,   100.0),
+}
+
+
+def _validate_feature_values(feature_dict: dict) -> tuple:
+    """Check all values are finite floats within F1-reasonable bounds.
+    Returns (True, '') on success or (False, reason) on failure."""
+    import math
+    for feat, val in feature_dict.items():
+        try:
+            fval = float(val)
+        except (TypeError, ValueError):
+            return False, f"Feature '{feat}' is not numeric."
+        if not math.isfinite(fval):
+            return False, f"Feature '{feat}' is not finite (got {val})."
+        lo, hi = _FEATURE_BOUNDS.get(feat, (-1e9, 1e9))
+        if not (lo <= fval <= hi):
+            return False, f"Feature '{feat}' value {fval:.2f} outside expected range [{lo}, {hi}]."
+    return True, ""
+
+
+def _sanitize_driver_name(name: str, known_drivers: list) -> str:
+    """Validate driver name is in the known list before prompt interpolation.
+    Raises ValueError if not found — prevents prompt injection."""
+    if name not in known_drivers:
+        raise ValueError(f"Unknown driver '{name}' — not in model's class list.")
+    return name
+
+
+def _get_openai_api_key():
+    """Read API key from st.secrets with os.environ fallback. Returns None if absent."""
+    try:
+        return st.secrets["openai"]["api_key"]
+    except (KeyError, FileNotFoundError):
+        pass
+    return os.environ.get("OPENAI_API_KEY")
+
+
+def _build_explain_prompt(
+    pred_driver: str,
+    confidence: float,
+    feature_dict: dict,
+    shap_dict: dict,
+    percentile_dict: dict,
+) -> tuple:
+    """Build (system_msg, user_msg) for GPT-4o-mini. All interpolated values are
+    pre-validated floats or a sanitized driver name — no raw user text enters the prompt.
+    Total prompt stays under ~500 tokens."""
+    ranked = sorted(shap_dict.items(), key=lambda x: abs(x[1]), reverse=True)
+    lines = [
+        f"  {f}: {feature_dict[f]:.2f}  "
+        f"(p{percentile_dict[f]:.0f}, SHAP: {'+'if shap_dict[f] >= 0 else ''}{shap_dict[f]:.4f})"
+        for f, _ in ranked
+    ]
+    system_msg = (
+        "You are an F1 telemetry analyst assistant embedded in a machine learning dashboard. "
+        "Explain ML model predictions in clear, engaging prose for a motorsport audience. "
+        "Focus on the top 2-3 features by SHAP magnitude. Be concise (3-5 sentences). "
+        "Do not speculate beyond the data. No markdown, bullet points, or headers."
+    )
+    user_msg = (
+        f"An XGBoost classifier predicted this lap was driven by {pred_driver} "
+        f"with {confidence:.1%} confidence.\n\n"
+        "Feature values (percentile rank vs all drivers, SHAP contribution toward this prediction):\n"
+        + "\n".join(lines)
+        + "\n\nExplain in 3-5 plain prose sentences WHY the model made this prediction, "
+        "citing the 2-3 features with the largest |SHAP| values and their actual numbers."
+    )
+    return system_msg, user_msg
+
+
+def _call_openai_explainer(api_key: str, system_msg: str, user_msg: str) -> tuple:
+    """Call GPT-4o-mini. Returns (text, None) on success or (None, error_msg) on failure.
+    Raw exceptions are never surfaced to the UI."""
+    try:
+        from openai import OpenAI, AuthenticationError, RateLimitError, APIError
+        client = OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            max_tokens=300,
+            temperature=0.4,
+        )
+        text = resp.choices[0].message.content
+        if not text:
+            return None, "OpenAI returned an empty response. Try again."
+        return text.strip(), None
+    except AuthenticationError:
+        return None, "OpenAI API key is invalid. Check `.streamlit/secrets.toml`."
+    except RateLimitError:
+        return None, "OpenAI rate limit reached. Wait a moment and try again."
+    except APIError as e:
+        return None, f"OpenAI service error ({type(e).__name__}). Try again shortly."
+    except Exception:
+        return None, "Unexpected error contacting OpenAI. Try again."
+
+# ── End LLM Explainer helpers ───────────────────────────────────────────────
+
+
 if not DATASET_PATH.exists():
     st.error("Run `python src/pipeline.py` first to fetch telemetry and build the dataset.")
     st.stop()
@@ -192,6 +344,7 @@ if not model_path.exists():
 
 try:
     clf, le = get_model()
+    shap_explainer = get_shap_explainer(clf)
     df = get_data()
 except Exception as e:
     st.error(f"Failed to load resources: {e}")
@@ -264,6 +417,11 @@ with tab2:
         key="mystery_lap",
     )
 
+    # Clear stale explanation whenever the user picks a different lap
+    if st.session_state.get("md_last_lap_idx") != lap_idx:
+        st.session_state["md_prediction_ready"] = False
+        st.session_state["md_explanation"] = None
+
     if st.button("Identify Driver", key="identify_btn"):
         lap_row = df.iloc[lap_idx]
         actual_driver = lap_row["driver"]
@@ -271,6 +429,7 @@ with tab2:
         X_input = lap_row[FEATURE_COLS].to_numpy().reshape(1, -1)
         proba = clf.predict_proba(X_input)[0]
         pred_driver = le.classes_[proba.argmax()]
+        pred_class_idx = int(proba.argmax())
 
         prob_df = pd.DataFrame({
             "Driver": le.classes_,
@@ -299,6 +458,99 @@ with tab2:
         else:
             st.error(f"Wrong! The model predicted **{pred_driver}** but the actual driver was **{actual_driver}**.")
 
+        # Persist state so the explainer button can read it on the next rerun
+        st.session_state["md_prediction_ready"] = True
+        st.session_state["md_last_lap_idx"] = lap_idx
+        st.session_state["md_explanation"] = None           # clear on new prediction
+        st.session_state["_md_pred_driver"] = pred_driver
+        st.session_state["_md_confidence"] = float(proba.max())
+        st.session_state["_md_X_input"] = X_input
+        st.session_state["_md_pred_class_idx"] = pred_class_idx
+
+    # ── Explain button — only visible after a prediction has been made ──────
+    _RATE_LIMIT_SECS = 10
+
+    if st.session_state.get("md_prediction_ready"):
+        api_key = _get_openai_api_key()
+
+        if api_key is None:
+            st.warning(
+                "OpenAI API key not configured. To enable AI explanations:\n\n"
+                "1. Open `.streamlit/secrets.toml`\n"
+                "2. Replace the placeholder with your real key:\n"
+                "```toml\n[openai]\napi_key = \"sk-proj-...\"\n```\n"
+                "3. Restart the app."
+            )
+        else:
+            elapsed = time.time() - st.session_state.get("md_last_explain_ts", 0.0)
+            cooldown = max(0.0, _RATE_LIMIT_SECS - elapsed)
+            btn_label = (
+                f"Explain this Prediction (wait {cooldown:.0f}s)"
+                if cooldown > 0
+                else "Explain this Prediction"
+            )
+
+            if st.button(btn_label, key="explain_btn", disabled=cooldown > 0):
+                _pred_driver    = st.session_state["_md_pred_driver"]
+                _confidence     = st.session_state["_md_confidence"]
+                _X_input        = st.session_state["_md_X_input"]
+                _pred_class_idx = st.session_state["_md_pred_class_idx"]
+
+                lap_features = {
+                    feat: float(_X_input[0, i])
+                    for i, feat in enumerate(FEATURE_COLS)
+                }
+
+                # Guardrail 1 — validate feature values are finite and in-bounds
+                valid, reason = _validate_feature_values(lap_features)
+                if not valid:
+                    st.error(f"Input validation failed: {reason}")
+                else:
+                    # Guardrail 2 — sanitize driver name before prompt interpolation
+                    try:
+                        safe_driver = _sanitize_driver_name(_pred_driver, list(le.classes_))
+                    except ValueError as exc:
+                        st.error(str(exc))
+                        safe_driver = None
+
+                    if safe_driver is not None:
+                        with st.spinner("Asking the AI to explain this prediction..."):
+                            # Compute SHAP values for this single sample
+                            shap_vals = compute_shap_for_prediction(
+                                shap_explainer, _X_input, _pred_class_idx
+                            )
+                            shap_dict = {
+                                feat: float(shap_vals[i])
+                                for i, feat in enumerate(FEATURE_COLS)
+                            }
+
+                            # Percentile rank of this lap vs the full dataset
+                            percentile_dict = {
+                                feat: float(
+                                    np.mean(df[feat].dropna().values <= lap_features[feat]) * 100
+                                )
+                                for feat in FEATURE_COLS
+                            }
+
+                            system_msg, user_msg = _build_explain_prompt(
+                                safe_driver, _confidence,
+                                lap_features, shap_dict, percentile_dict,
+                            )
+                            explanation, err = _call_openai_explainer(
+                                api_key, system_msg, user_msg
+                            )
+
+                            if err:
+                                st.error(err)
+                            else:
+                                st.session_state["md_explanation"] = explanation
+
+                        st.session_state["md_last_explain_ts"] = time.time()
+
+    # Display cached explanation — persists across reruns without re-calling the API
+    if st.session_state.get("md_explanation"):
+        st.info(st.session_state["md_explanation"])
+
 # ================================================================
 # TAB 4 — Race Pace Dashboard
 # ================================================================
@@ -307,80 +559,6 @@ with tab2:
 
 RACE_PALETTE = px.colors.qualitative.Dark24
 
-
-def _fastest_lap_trace(
-    telemetry_df: pd.DataFrame,
-    driver_acronym: str,
-    channel: str,
-) -> tuple[np.ndarray | None, float | None, int | None]:
-    """
-    Extract the fastest lap telemetry trace for a driver from the FastF1 dataset.
-
-    Parameters
-    ----------
-    telemetry_df : pd.DataFrame
-        The FastF1 ``dataset.parquet`` already loaded at startup (global ``df``).
-    driver_acronym : str
-        3-letter driver code as stored in ``df["driver"]``, e.g. ``"HAM"``.
-    channel : str
-        One of ``"Speed"``, ``"Throttle"``, ``"Brake"``.
-
-    Returns
-    -------
-    (trace, lap_time, lap_number) where trace is a float64 ndarray of length N_POINTS,
-    or (None, None, None) if the driver or channel is not found.
-    lap_number is the driver's own lap number (e.g. lap 32 of their race), or None
-    if the dataset pre-dates the lap_number column.
-
-    Note: this function is now used only by the Driver Radar and Mystery Driver tabs,
-    which still read from the static dataset.parquet. The Race Dashboard telemetry
-    section uses _fetch_fastest_lap_openf1() and _fetch_fastest_lap_all_openf1()
-    instead, which pull live data from the OpenF1 API for the user-selected session.
-    """
-    trace_col = TRACE_COLS.get(channel)
-    if trace_col is None or trace_col not in telemetry_df.columns:
-        return None, None, None
-
-    drv_df = telemetry_df[telemetry_df["driver"] == driver_acronym].dropna(
-        subset=["lap_time_seconds"]
-    )
-    if drv_df.empty:
-        return None, None, None
-
-    fastest_row = drv_df.sort_values("lap_time_seconds").iloc[0]
-    lap_time = float(fastest_row["lap_time_seconds"])
-    trace = np.asarray(fastest_row[trace_col], dtype=float)
-    lap_number: int | None = int(fastest_row["lap_number"]) if "lap_number" in fastest_row.index else None
-    return trace, lap_time, lap_number
-
-
-def _get_fastest_lap_all(
-    telemetry_df: pd.DataFrame,
-    driver_acronym: str,
-) -> dict | None:
-    """
-    Return all resampled traces for a driver's fastest lap, or None if not found.
-
-    Keys: 'speed', 'x', 'y', 'lap_time', 'lap_number'.
-    'x' and 'y' are None if the dataset pre-dates the x_trace/y_trace columns.
-
-    Note: this function is now used only to supply X/Y circuit coordinates to Track Map
-    from dataset.parquet (the only available source for XY). All other telemetry in the
-    Race Dashboard is fetched live via _fetch_fastest_lap_all_openf1().
-    """
-    drv_df = telemetry_df[telemetry_df["driver"] == driver_acronym].dropna(
-        subset=["lap_time_seconds"]
-    )
-    if drv_df.empty:
-        return None
-    row = drv_df.sort_values("lap_time_seconds").iloc[0]
-    return {
-        "speed": np.asarray(row["speed_trace"], dtype=float),
-        "x": np.asarray(row["x_trace"], dtype=float) if "x_trace" in row.index else None,
-        "y": np.asarray(row["y_trace"], dtype=float) if "y_trace" in row.index else None,
-        "lap_time": float(row["lap_time_seconds"]),
-        "lap_number": int(row["lap_number"]) if "lap_number" in row.index else None,
-    }
 
 
 def _fetch_fastest_lap_openf1(
@@ -1196,9 +1374,12 @@ with tab3:
     st.subheader("Race Dashboard")
 
     # ---- Race Analysis ---------------------------------------------
+    _mode_options = ["🗂️ Historical (select a race)"]
+    if st.session_state.get("show_live_mode", False):
+        _mode_options.append("📡 Live (current race weekend)")
     mode = st.radio(
         "Mode",
-        ["🗂️ Historical (select a race)", "📡 Live (current race weekend)"],
+        _mode_options,
         horizontal=True,
         key="rp_mode",
     )
@@ -1442,198 +1623,201 @@ with tab3:
 
     else:
         # ---- LIVE MODE ----
-        st.markdown(
-            """
-            <style>
-            @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
-            .live-badge {
-                display: inline-block;
-                font-size: 1.4rem;
-                font-weight: 700;
-                color: #ff4444;
-                animation: pulse 1.5s ease-in-out infinite;
-            }
-            </style>
-            <span class="live-badge">🔴 LIVE</span>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        refresh_interval = st.selectbox(
-            "Auto-refresh interval",
-            options=[10, 30, 60],
-            format_func=lambda s: f"{s}s",
-            key="rp_refresh",
-        )
-        live_laps_remaining = st.number_input(
-            "Estimated laps remaining", min_value=0, value=20, key="rp_live_laps",
-        )
-
-        chart_container = st.empty()
-
-        try:
-            # Persist live client across reruns so watermarks survive
-            if st.session_state["rp_live_client"] is None:
-                st.session_state["rp_live_client"] = OpenF1Client(mode="live")
-            client = st.session_state["rp_live_client"]
-
-            with st.spinner("Fetching live data from OpenF1..."):
-                laps = client.get_live_laps()
-                stints = client.get_live_stints()
-                position = client.get_live_position()
-                live_drivers_df = client.get_live_drivers()
-                st.session_state["rp_last_refresh"] = datetime.now().strftime("%H:%M:%S")
-
-            # Build / refresh driver map and team colour map
-            if not live_drivers_df.empty and "driver_number" in live_drivers_df.columns and "name_acronym" in live_drivers_df.columns:
-                st.session_state["rp_live_driver_map"] = {
-                    int(row["driver_number"]): str(row["name_acronym"])
-                    for _, row in live_drivers_df.iterrows()
-                    if pd.notna(row["driver_number"]) and pd.notna(row["name_acronym"])
+        if not st.session_state.get("show_live_mode", False):
+            st.info("Enable **Live Mode** in the sidebar (Visible Charts) to access live race weekend data.")
+        else:
+            st.markdown(
+                """
+                <style>
+                @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+                .live-badge {
+                    display: inline-block;
+                    font-size: 1.4rem;
+                    font-weight: 700;
+                    color: #ff4444;
+                    animation: pulse 1.5s ease-in-out infinite;
                 }
-                if "team_colour" in live_drivers_df.columns:
-                    st.session_state["rp_live_team_colour_map"] = {
-                        int(row["driver_number"]): f"#{str(row['team_colour']).strip().upper()}"
+                </style>
+                <span class="live-badge">🔴 LIVE</span>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            refresh_interval = st.selectbox(
+                "Auto-refresh interval",
+                options=[10, 30, 60],
+                format_func=lambda s: f"{s}s",
+                key="rp_refresh",
+            )
+            live_laps_remaining = st.number_input(
+                "Estimated laps remaining", min_value=0, value=20, key="rp_live_laps",
+            )
+    
+            chart_container = st.empty()
+    
+            try:
+                # Persist live client across reruns so watermarks survive
+                if st.session_state["rp_live_client"] is None:
+                    st.session_state["rp_live_client"] = OpenF1Client(mode="live")
+                client = st.session_state["rp_live_client"]
+    
+                with st.spinner("Fetching live data from OpenF1..."):
+                    laps = client.get_live_laps()
+                    stints = client.get_live_stints()
+                    position = client.get_live_position()
+                    live_drivers_df = client.get_live_drivers()
+                    st.session_state["rp_last_refresh"] = datetime.now().strftime("%H:%M:%S")
+    
+                # Build / refresh driver map and team colour map
+                if not live_drivers_df.empty and "driver_number" in live_drivers_df.columns and "name_acronym" in live_drivers_df.columns:
+                    st.session_state["rp_live_driver_map"] = {
+                        int(row["driver_number"]): str(row["name_acronym"])
                         for _, row in live_drivers_df.iterrows()
-                        if pd.notna(row["driver_number"]) and pd.notna(row.get("team_colour"))
+                        if pd.notna(row["driver_number"]) and pd.notna(row["name_acronym"])
                     }
-
-            if laps.empty:
-                st.warning("No active session found. Try during a race weekend.")
-            else:
-                analyser = RaceAnalyser(laps, stints, position)
-                _live_dmap = st.session_state["rp_live_driver_map"]
-                _all_drvs = sorted(analyser._clean["driver_number"].dropna().unique().tolist())
-
-                # ---- Fastest Lap Telemetry Comparison (live) -------
-                if st.session_state.get("show_telemetry", True):
-                    st.markdown("### Fastest Lap Telemetry Comparison")
-                _lc1, _lc2, _lc3 = st.columns(3)
-                _ltel_drv_a = _lc1.selectbox(
-                    "Driver A",
-                    options=_all_drvs,
-                    format_func=lambda n: _live_dmap.get(int(n), str(n)),
-                    key="rp_live_tel_drv_a",
-                )
-                _ltel_drv_b = _lc2.selectbox(
-                    "Driver B",
-                    options=_all_drvs,
-                    index=min(1, len(_all_drvs) - 1),
-                    format_func=lambda n: _live_dmap.get(int(n), str(n)),
-                    key="rp_live_tel_drv_b",
-                )
-                _ltel_channel = _lc3.selectbox(
-                    "Channel",
-                    options=SPECIAL_CHANNELS + list(TRACE_COLS.keys()),
-                    key="rp_live_tel_channel",
-                )
-
-                def _live_dlabel(n: int) -> str:
-                    return _live_dmap.get(n, str(n))
-
-                if not st.session_state.get("show_telemetry", True):
-                    pass  # section hidden by user
-                elif _ltel_drv_a is None or _ltel_drv_b is None:
-                    st.info("Select two drivers to compare telemetry.")
+                    if "team_colour" in live_drivers_df.columns:
+                        st.session_state["rp_live_team_colour_map"] = {
+                            int(row["driver_number"]): f"#{str(row['team_colour']).strip().upper()}"
+                            for _, row in live_drivers_df.iterrows()
+                            if pd.notna(row["driver_number"]) and pd.notna(row.get("team_colour"))
+                        }
+    
+                if laps.empty:
+                    st.warning("No active session found. Try during a race weekend.")
                 else:
-                    _ldrv_a_int, _ldrv_b_int = int(_ltel_drv_a), int(_ltel_drv_b)
-                    _lcol_a, _lcol_b = _resolve_pair_colours(
-                        _ldrv_a_int, _ldrv_b_int,
-                        st.session_state.get("rp_live_team_colour_map"),
+                    analyser = RaceAnalyser(laps, stints, position)
+                    _live_dmap = st.session_state["rp_live_driver_map"]
+                    _all_drvs = sorted(analyser._clean["driver_number"].dropna().unique().tolist())
+    
+                    # ---- Fastest Lap Telemetry Comparison (live) -------
+                    if st.session_state.get("show_telemetry", True):
+                        st.markdown("### Fastest Lap Telemetry Comparison")
+                    _lc1, _lc2, _lc3 = st.columns(3)
+                    _ltel_drv_a = _lc1.selectbox(
+                        "Driver A",
+                        options=_all_drvs,
+                        format_func=lambda n: _live_dmap.get(int(n), str(n)),
+                        key="rp_live_tel_drv_a",
                     )
-                    _ltel_cmap = _driver_color_map(
-                        list(_all_drvs),
-                        team_colour_map=st.session_state.get("rp_live_team_colour_map"),
+                    _ltel_drv_b = _lc2.selectbox(
+                        "Driver B",
+                        options=_all_drvs,
+                        index=min(1, len(_all_drvs) - 1),
+                        format_func=lambda n: _live_dmap.get(int(n), str(n)),
+                        key="rp_live_tel_drv_b",
                     )
-
-                    # Live mode: use "latest" as the session key for car_data calls
-                    _live_laps = analyser._laps
-
-                    if _ltel_channel in SPECIAL_CHANNELS:
-                        with st.spinner("Fetching fastest-lap telemetry from OpenF1..."):
-                            _ldata_a = _fetch_fastest_lap_all_openf1("latest", _ldrv_a_int, _live_laps)
-                            _ldata_b = _fetch_fastest_lap_all_openf1("latest", _ldrv_b_int, _live_laps)
-                        if _ldata_a is None:
-                            st.caption(f"Could not fetch telemetry for {_live_dlabel(_ldrv_a_int)} from OpenF1.")
-                        elif _ldata_b is None:
-                            st.caption(f"Could not fetch telemetry for {_live_dlabel(_ldrv_b_int)} from OpenF1.")
-                        elif _ltel_channel == "Track Map":
-                            _live_gp = st.session_state.get("rp_live_meeting_name", "")
-                            _lcircuit = circuits.get(_live_gp) if _live_gp else None
-                            if _lcircuit is None:
-                                st.info("Circuit outline unavailable for the current live session.")
-                            else:
-                                _lcx = np.asarray(_lcircuit["x"], dtype=float)
-                                _lcy = np.asarray(_lcircuit["y"], dtype=float)
-                                _lacronym_a, _lacronym_b = _live_dlabel(_ldrv_a_int), _live_dlabel(_ldrv_b_int)
-                                _lmap_a = {"x": _lcx, "y": _lcy, "speed": _ldata_a["speed"]}
-                                _lmap_b = {"x": _lcx, "y": _lcy, "speed": _ldata_b["speed"]}
-                                _lspecial_fig = _build_track_map_fig(
-                                    _lmap_a, _lacronym_a, _lcol_a,
-                                    _lmap_b, _lacronym_b, _lcol_b,
-                                )
-                                if _lspecial_fig is not None:
-                                    st.plotly_chart(_lspecial_fig, width="stretch", key="tab3_track_map_live")
-                        elif _ltel_channel == "Time Delta":
-                            _lspecial_fig = _build_time_delta_fig(
-                                _ldata_a, _live_dlabel(_ldrv_a_int), _lcol_a,
-                                _ldata_b, _live_dlabel(_ldrv_b_int), _lcol_b,
-                            )
-                            st.plotly_chart(_lspecial_fig, width="stretch", key="tab3_time_delta_live")
+                    _ltel_channel = _lc3.selectbox(
+                        "Channel",
+                        options=SPECIAL_CHANNELS + list(TRACE_COLS.keys()),
+                        key="rp_live_tel_channel",
+                    )
+    
+                    def _live_dlabel(n: int) -> str:
+                        return _live_dmap.get(n, str(n))
+    
+                    if not st.session_state.get("show_telemetry", True):
+                        pass  # section hidden by user
+                    elif _ltel_drv_a is None or _ltel_drv_b is None:
+                        st.info("Select two drivers to compare telemetry.")
                     else:
-                        _ltel_fig = go.Figure()
-                        _lany_trace = False
-                        for _ldrv_int in (_ldrv_a_int, _ldrv_b_int):
-                            with st.spinner(f"Fetching {_ltel_channel} telemetry for {_live_dlabel(_ldrv_int)}..."):
-                                _ltrace, _llap_t, _llap_num = _fetch_fastest_lap_openf1(
-                                    "latest", _ldrv_int, _live_laps, _ltel_channel
+                        _ldrv_a_int, _ldrv_b_int = int(_ltel_drv_a), int(_ltel_drv_b)
+                        _lcol_a, _lcol_b = _resolve_pair_colours(
+                            _ldrv_a_int, _ldrv_b_int,
+                            st.session_state.get("rp_live_team_colour_map"),
+                        )
+                        _ltel_cmap = _driver_color_map(
+                            list(_all_drvs),
+                            team_colour_map=st.session_state.get("rp_live_team_colour_map"),
+                        )
+    
+                        # Live mode: use "latest" as the session key for car_data calls
+                        _live_laps = analyser._laps
+    
+                        if _ltel_channel in SPECIAL_CHANNELS:
+                            with st.spinner("Fetching fastest-lap telemetry from OpenF1..."):
+                                _ldata_a = _fetch_fastest_lap_all_openf1("latest", _ldrv_a_int, _live_laps)
+                                _ldata_b = _fetch_fastest_lap_all_openf1("latest", _ldrv_b_int, _live_laps)
+                            if _ldata_a is None:
+                                st.caption(f"Could not fetch telemetry for {_live_dlabel(_ldrv_a_int)} from OpenF1.")
+                            elif _ldata_b is None:
+                                st.caption(f"Could not fetch telemetry for {_live_dlabel(_ldrv_b_int)} from OpenF1.")
+                            elif _ltel_channel == "Track Map":
+                                _live_gp = st.session_state.get("rp_live_meeting_name", "")
+                                _lcircuit = circuits.get(_live_gp) if _live_gp else None
+                                if _lcircuit is None:
+                                    st.info("Circuit outline unavailable for the current live session.")
+                                else:
+                                    _lcx = np.asarray(_lcircuit["x"], dtype=float)
+                                    _lcy = np.asarray(_lcircuit["y"], dtype=float)
+                                    _lacronym_a, _lacronym_b = _live_dlabel(_ldrv_a_int), _live_dlabel(_ldrv_b_int)
+                                    _lmap_a = {"x": _lcx, "y": _lcy, "speed": _ldata_a["speed"]}
+                                    _lmap_b = {"x": _lcx, "y": _lcy, "speed": _ldata_b["speed"]}
+                                    _lspecial_fig = _build_track_map_fig(
+                                        _lmap_a, _lacronym_a, _lcol_a,
+                                        _lmap_b, _lacronym_b, _lcol_b,
+                                    )
+                                    if _lspecial_fig is not None:
+                                        st.plotly_chart(_lspecial_fig, width="stretch", key="tab3_track_map_live")
+                            elif _ltel_channel == "Time Delta":
+                                _lspecial_fig = _build_time_delta_fig(
+                                    _ldata_a, _live_dlabel(_ldrv_a_int), _lcol_a,
+                                    _ldata_b, _live_dlabel(_ldrv_b_int), _lcol_b,
                                 )
-                            if _ltrace is None:
-                                st.caption(f"Could not fetch {_ltel_channel} telemetry for {_live_dlabel(_ldrv_int)} from OpenF1.")
-                                continue
-                            _lany_trace = True
-                            _llap_label = f"Lap {_llap_num}, {_llap_t:.3f}s" if _llap_num is not None else f"{_llap_t:.3f}s"
-                            _ltel_fig.add_trace(go.Scatter(
-                                x=np.arange(N_POINTS), y=_ltrace,
-                                mode="lines",
-                                name=f"{_live_dlabel(_ldrv_int)} ({_llap_label})",
-                                line=dict(color=_ltel_cmap.get(_ldrv_int, "#888"), width=2.5),
-                            ))
-                        if _lany_trace:
-                            _ltel_fig.update_layout(
-                                title=(
-                                    f"Fastest Lap {_ltel_channel} — "
-                                    f"{_live_dlabel(_ldrv_a_int)} vs {_live_dlabel(_ldrv_b_int)}"
-                                ),
-                                xaxis_title="Normalised Distance (0–200 points)",
-                                yaxis_title=_ltel_channel,
-                                legend_title="Driver",
-                                hovermode="x unified",
-                            )
-                            st.plotly_chart(_ltel_fig, width="stretch", key="tab3_tel_live")
-
-                st.divider()
-
-                _selected = st.multiselect(
-                    "Drivers",
-                    options=_all_drvs,
-                    default=_all_drvs,
-                    format_func=lambda n: _live_dmap.get(int(n), str(n)),
-                    key="rp_driver_filter",
-                )
-                with chart_container.container():
-                    _render_charts(
-                        analyser,
-                        live_laps_remaining,
-                        st,
-                        driver_map=_live_dmap,
-                        selected_drivers=_selected or _all_drvs,
-                        team_colour_map=st.session_state.get("rp_live_team_colour_map"),
+                                st.plotly_chart(_lspecial_fig, width="stretch", key="tab3_time_delta_live")
+                        else:
+                            _ltel_fig = go.Figure()
+                            _lany_trace = False
+                            for _ldrv_int in (_ldrv_a_int, _ldrv_b_int):
+                                with st.spinner(f"Fetching {_ltel_channel} telemetry for {_live_dlabel(_ldrv_int)}..."):
+                                    _ltrace, _llap_t, _llap_num = _fetch_fastest_lap_openf1(
+                                        "latest", _ldrv_int, _live_laps, _ltel_channel
+                                    )
+                                if _ltrace is None:
+                                    st.caption(f"Could not fetch {_ltel_channel} telemetry for {_live_dlabel(_ldrv_int)} from OpenF1.")
+                                    continue
+                                _lany_trace = True
+                                _llap_label = f"Lap {_llap_num}, {_llap_t:.3f}s" if _llap_num is not None else f"{_llap_t:.3f}s"
+                                _ltel_fig.add_trace(go.Scatter(
+                                    x=np.arange(N_POINTS), y=_ltrace,
+                                    mode="lines",
+                                    name=f"{_live_dlabel(_ldrv_int)} ({_llap_label})",
+                                    line=dict(color=_ltel_cmap.get(_ldrv_int, "#888"), width=2.5),
+                                ))
+                            if _lany_trace:
+                                _ltel_fig.update_layout(
+                                    title=(
+                                        f"Fastest Lap {_ltel_channel} — "
+                                        f"{_live_dlabel(_ldrv_a_int)} vs {_live_dlabel(_ldrv_b_int)}"
+                                    ),
+                                    xaxis_title="Normalised Distance (0–200 points)",
+                                    yaxis_title=_ltel_channel,
+                                    legend_title="Driver",
+                                    hovermode="x unified",
+                                )
+                                st.plotly_chart(_ltel_fig, width="stretch", key="tab3_tel_live")
+    
+                    st.divider()
+    
+                    _selected = st.multiselect(
+                        "Drivers",
+                        options=_all_drvs,
+                        default=_all_drvs,
+                        format_func=lambda n: _live_dmap.get(int(n), str(n)),
+                        key="rp_driver_filter",
                     )
-        except Exception as exc:
-            st.warning(f"Live refresh failed: {exc}")
-
-        # Only auto-rerun if still on live mode — prevents resetting other tabs
-        if st.session_state.get("rp_mode", "").startswith("📡"):
-            time.sleep(refresh_interval)
-            st.rerun()
+                    with chart_container.container():
+                        _render_charts(
+                            analyser,
+                            live_laps_remaining,
+                            st,
+                            driver_map=_live_dmap,
+                            selected_drivers=_selected or _all_drvs,
+                            team_colour_map=st.session_state.get("rp_live_team_colour_map"),
+                        )
+            except Exception as exc:
+                st.warning(f"Live refresh failed: {exc}")
+    
+            # Only auto-rerun if still on live mode — prevents resetting other tabs
+            if st.session_state.get("rp_mode", "").startswith("📡"):
+                time.sleep(refresh_interval)
+                st.rerun()
