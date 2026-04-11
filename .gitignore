@@ -37,6 +37,7 @@ Thumbs.db
 
 # Env files
 .env
+.streamlit/secrets.toml
 
 # Claude Code local settings (contain absolute user paths)
 .claude/

@@ -147,11 +147,38 @@ def extract_session_telemetry(
     return pd.DataFrame(rows)
 
 
+META_PATH = CACHE_DIR / "dataset_meta.json"
+
+SESSION_TYPE_LABELS: dict[str, str] = {
+    "R":   "Race",
+    "Q":   "Qualifying",
+    "S":   "Sprint",
+    "SS":  "Sprint Shootout",
+    "FP1": "Practice 1",
+    "FP2": "Practice 2",
+    "FP3": "Practice 3",
+}
+
+
 def save_dataset(df: pd.DataFrame, path: Path = DATASET_PATH) -> None:
     """Persist the feature DataFrame to parquet."""
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, index=False)
     print(f"Saved {len(df)} laps → {path}")
+
+
+def save_meta(year: int, grand_prix: str, session_type: str) -> None:
+    """Persist session metadata alongside the dataset for display in the dashboard."""
+    import json
+    meta = {
+        "year": year,
+        "grand_prix": grand_prix,
+        "session_type": session_type,
+        "session_label": SESSION_TYPE_LABELS.get(session_type, session_type),
+    }
+    META_PATH.parent.mkdir(parents=True, exist_ok=True)
+    META_PATH.write_text(json.dumps(meta, indent=2))
+    print(f"Saved metadata → {META_PATH}")
 
 
 def load_dataset(path: Path = DATASET_PATH) -> pd.DataFrame:
@@ -218,3 +245,4 @@ if __name__ == "__main__":
     )
     print(df)
     save_dataset(df)
+    save_meta(year, grand_prix, session_type)

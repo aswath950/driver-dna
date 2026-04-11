@@ -9,3 +9,4 @@ plotly
 joblib
 matplotlib
 requests
+openai>=1.0.0
