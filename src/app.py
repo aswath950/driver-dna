@@ -31,6 +31,7 @@ from race_engine import RaceAnalyser
 DATASET_PATH = DATA_DIR / "dataset.parquet"
 CIRCUITS_PATH = DATA_DIR / "circuits.json"
 ACCURACY_PATH = MODELS_DIR / "accuracy.txt"
+DATASET_META_PATH = DATA_DIR / "dataset_meta.json"
 N_POINTS = 200
 TRACE_COLS = {"Speed": "speed_trace", "Throttle": "throttle_trace", "Brake": "brake_trace"}
 # OpenF1 car_data column names for the same channels
@@ -75,6 +76,10 @@ STATE_DEFAULTS: dict = {
     "md_prediction_ready": False,    # bool — True after Identify Driver runs
     "md_last_explain_ts": 0.0,       # float — unix timestamp of last explain call
     "md_last_lap_idx": None,         # int | None — lap index of last prediction
+    # Tab 3 — Race Intelligence Chat Agent (ca_ prefix)
+    "ca_messages": [],               # list[dict] — {role, content} history, capped at 20
+    "ca_last_send_ts": 0.0,          # float — unix timestamp of last user message (rate limiting)
+    "ca_session_cache_key": None,    # int|str|None — clears history when loaded session changes
 }
 
 st.set_page_config(page_title="Driver DNA Fingerprinter", layout="wide")
@@ -190,6 +195,15 @@ def get_circuits() -> dict:
         return json.load(f)
 
 
+@st.cache_data
+def get_dataset_meta() -> dict:
+    """Load session metadata written by pipeline.py alongside dataset.parquet."""
+    if not DATASET_META_PATH.exists():
+        return {}
+    with open(DATASET_META_PATH) as f:
+        return json.load(f)
+
+
 # ── LLM Explainer helpers ───────────────────────────────────────────────────
 
 @st.cache_resource
@@ -279,6 +293,7 @@ def _build_explain_prompt(
     """Build (system_msg, user_msg) for GPT-4o-mini. All interpolated values are
     pre-validated floats or a sanitized driver name — no raw user text enters the prompt.
     Total prompt stays under ~500 tokens."""
+
     ranked = sorted(shap_dict.items(), key=lambda x: abs(x[1]), reverse=True)
     lines = [
         f"  {f}: {feature_dict[f]:.2f}  "
@@ -330,7 +345,477 @@ def _call_openai_explainer(api_key: str, system_msg: str, user_msg: str) -> tupl
     except Exception:
         return None, "Unexpected error contacting OpenAI. Try again."
 
+
+def _call_openai_chat(api_key: str, messages: list, tools: list) -> tuple:
+    """Call GPT-4o-mini with optional tool definitions for the chat agent.
+
+    Returns one of three shapes:
+      ("text",       final_text,      None)  — LLM produced a final answer
+      ("tool_calls", tool_calls_list, None)  — LLM wants to invoke tools
+      (None,         None,            error) — API failure
+    """
+    try:
+        from openai import OpenAI, AuthenticationError, RateLimitError, APIError
+        client = OpenAI(api_key=api_key)
+        if tools:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                max_tokens=500,
+                temperature=0.4,
+            )
+        else:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                max_tokens=500,
+                temperature=0.4,
+            )
+        choice = resp.choices[0]
+        msg = choice.message
+        if choice.finish_reason == "tool_calls" and msg.tool_calls:
+            return "tool_calls", msg.tool_calls, None
+        text = msg.content
+        if not text:
+            return None, None, "OpenAI returned an empty response. Try again."
+        return "text", text.strip(), None
+    except AuthenticationError:
+        return None, None, "OpenAI API key is invalid. Check `.streamlit/secrets.toml`."
+    except RateLimitError:
+        return None, None, "OpenAI rate limit reached. Wait a moment and try again."
+    except APIError as e:
+        return None, None, f"OpenAI service error ({type(e).__name__}). Try again shortly."
+    except Exception:
+        return None, None, "Unexpected error contacting OpenAI. Try again."
+
 # ── End LLM Explainer helpers ───────────────────────────────────────────────
+
+# ============================================================================
+# RACE INTELLIGENCE CHAT AGENT
+# ============================================================================
+
+# -- Security constants ------------------------------------------------------
+
+_CA_MAX_INPUT_LEN = 500        # max user message length (chars)
+_CA_MAX_TOOLS_PER_ROUND = 3    # max tool calls processed per LLM response
+
+_CA_ALLOWED_TOOLS: set[str] = {
+    "get_rolling_pace", "get_gap_to_leader", "detect_strategy_events",
+    "project_finishing_order", "get_tyre_degradation", "get_pace_summary",
+}
+
+_CA_TOOL_ARG_SCHEMAS: dict[str, dict] = {
+    "get_rolling_pace":        {"window": (int, 2, 15), "top_n": (int, 1, 20)},
+    "detect_strategy_events":  {"lookahead": (int, 1, 10)},
+    "project_finishing_order": {"laps_remaining": (int, 1, 80)},
+}
+
+# -- System prompt -----------------------------------------------------------
+
+_CA_SYSTEM_PROMPT: str = (
+    "You are Race Intelligence, an expert F1 race analyst embedded in a live telemetry "
+    "dashboard. You have access to real-time race data for the currently loaded session.\n\n"
+    "Your tools:\n"
+    "  get_rolling_pace        — recent lap pace trend per driver\n"
+    "  get_gap_to_leader       — cumulative time gap from each driver to the leader\n"
+    "  detect_strategy_events  — undercut and overcut detections\n"
+    "  project_finishing_order — projected final race order\n"
+    "  get_tyre_degradation    — degradation rate per driver/compound/stint\n"
+    "  get_pace_summary        — aggregate mean, median, fastest lap per driver\n\n"
+    "Rules:\n"
+    "- Always call at least one tool before answering pace, strategy, or position questions.\n"
+    "- Synthesise tool data into a concise, confident answer (3-6 sentences).\n"
+    "- Cite specific numbers from the data (lap times, gaps, degradation rates).\n"
+    "- Use F1 driver acronyms (e.g. VER, NOR, HAM) as provided by the tools.\n"
+    "- If data is insufficient, say so clearly.\n"
+    "- No markdown, bullet points, or headers — plain prose only.\n"
+    "- Do not speculate beyond the available data."
+)
+
+# -- Tool definitions (OpenAI function-calling schema) -----------------------
+
+_CA_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_rolling_pace",
+            "description": (
+                "Returns rolling-average lap pace (seconds) per driver over a sliding window. "
+                "Use to identify the driver with the strongest recent race pace."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "window": {"type": "integer", "description": "Laps in rolling window. Default 5, range 2-15.", "default": 5},
+                    "top_n":  {"type": "integer", "description": "Drivers to include. Default 5, max 20.", "default": 5},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_gap_to_leader",
+            "description": "Returns current cumulative time gap (seconds) from each driver to the race leader.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "detect_strategy_events",
+            "description": (
+                "Detects undercut and overcut events — position changes caused by pit-stop timing. "
+                "Use for strategy questions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lookahead": {"type": "integer", "description": "Laps after pit to check for position swap. Default 3, range 1-10.", "default": 3},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_finishing_order",
+            "description": "Projects final race finishing order based on current pace and tyre degradation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "laps_remaining": {"type": "integer", "description": "Estimated laps remaining in the race. Range 1-80."},
+                },
+                "required": ["laps_remaining"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_tyre_degradation",
+            "description": "Returns tyre degradation rates (seconds per lap lost) per driver by stint and compound.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pace_summary",
+            "description": "Returns aggregate race pace statistics per driver: mean, median, std dev, fastest lap, lap count.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+]
+
+# -- Guardrail helpers -------------------------------------------------------
+
+def _ca_sanitize_input(text: str) -> tuple:
+    """Sanitize user chat input before it reaches the LLM.
+    Returns (cleaned_text, None) on success or ('', error_reason) if rejected."""
+    text = text.strip()
+    if not text:
+        return "", "Please enter a question."
+    if len(text) > _CA_MAX_INPUT_LEN:
+        return "", f"Message too long ({len(text)} chars). Please keep it under {_CA_MAX_INPUT_LEN} characters."
+    # Strip null bytes and ASCII control chars (0x00-0x1F) except newline/tab
+    cleaned = "".join(ch for ch in text if ch in ("\n", "\t") or ord(ch) >= 0x20)
+    if not cleaned:
+        return "", "Message contained only invalid characters."
+    return cleaned, None
+
+
+def _ca_validate_tool_args(tool_name: str, args: dict) -> tuple:
+    """Validate and clamp LLM-supplied tool arguments against known schemas.
+    Returns (cleaned_args, None) on success or ({}, error_string) on failure."""
+    schema = _CA_TOOL_ARG_SCHEMAS.get(tool_name, {})
+    cleaned: dict = {}
+    for key, (typ, lo, hi) in schema.items():
+        raw = args.get(key)
+        if raw is None:
+            cleaned[key] = lo   # use lower bound as safe default
+            continue
+        try:
+            val = typ(raw)
+        except (ValueError, TypeError):
+            return {}, f"Tool '{tool_name}': argument '{key}' must be {typ.__name__}, got {raw!r}"
+        cleaned[key] = max(lo, min(val, hi))
+    return cleaned, None
+
+# -- Tool executors ----------------------------------------------------------
+
+def _ca_tool_get_rolling_pace(analyser, driver_map: dict, window: int = 5, top_n: int = 5) -> str:
+    window = max(2, min(int(window), 15))
+    top_n  = max(1, min(int(top_n), 20))
+    df = analyser.rolling_pace(window=window)
+    if df.empty:
+        return "No rolling pace data available yet."
+    latest = df.iloc[-1].dropna().sort_values()
+    valid = [(k, v) for k, v in latest.items() if int(k) in driver_map][:top_n]
+    if not valid:
+        return "No valid driver pace data available."
+    lines = [f"  P{i+1}: {driver_map[int(drv)]}  {pace:.3f}s/lap" for i, (drv, pace) in enumerate(valid)]
+    return f"Rolling pace (window={window} laps), latest lap:\n" + "\n".join(lines)
+
+
+def _ca_tool_get_gap_to_leader(analyser, driver_map: dict) -> str:
+    df = analyser.gap_to_leader()
+    if df.empty:
+        return "No gap data available yet."
+    latest = df.iloc[-1].dropna().sort_values()
+    valid = [(k, v) for k, v in latest.items() if int(k) in driver_map]
+    if not valid:
+        return "No gap data for known drivers."
+    lines = [f"  {driver_map[int(drv)]}: +{gap:.3f}s" for drv, gap in valid]
+    return f"Gap to leader at lap {df.index[-1]}:\n" + "\n".join(lines)
+
+
+def _ca_tool_detect_strategy_events(analyser, driver_map: dict, lookahead: int = 3) -> str:
+    lookahead = max(1, min(int(lookahead), 10))
+    events = analyser.detect_undercuts(lookahead=lookahead)
+    if not events:
+        return "No undercut or overcut events detected in this race."
+    lines = [
+        f"  Lap {e['lap']}: "
+        f"{driver_map.get(int(e['attacking_driver']), str(e['attacking_driver']))} "
+        f"{e['type']}d "
+        f"{driver_map.get(int(e['defending_driver']), str(e['defending_driver']))}"
+        for e in events
+    ]
+    return f"Strategy events detected ({len(events)} total):\n" + "\n".join(lines)
+
+
+def _ca_tool_project_finishing_order(analyser, driver_map: dict, laps_remaining: int = 10) -> str:
+    laps_remaining = max(1, min(int(laps_remaining), 80))
+    projections = analyser.project_finishing_order(laps_remaining=laps_remaining)
+    if not projections:
+        return "Insufficient data to project finishing order."
+    lines = []
+    for p in projections:
+        label = driver_map.get(int(p["driver"]), str(p["driver"]))
+        if p.get("status") == "DNF":
+            lines.append(f"  P{p['projected_position']}: {label} (DNF)")
+        else:
+            change = p.get("position_change")
+            if change is not None:
+                arrow = f" [{'↑' if change > 0 else '↓' if change < 0 else '='}{abs(change)}]"
+            else:
+                arrow = ""
+            lines.append(f"  P{p['projected_position']}: {label}{arrow}")
+    return f"Projected finishing order ({laps_remaining} laps remaining):\n" + "\n".join(lines)
+
+
+def _ca_tool_get_tyre_degradation(analyser, driver_map: dict) -> str:
+    df = analyser.tyre_degradation()
+    if df.empty:
+        return "No tyre degradation data available."
+    if "driver_number" in df.columns:
+        df = df[df["driver_number"].apply(lambda x: int(x) in driver_map)]
+    if df.empty:
+        return "No degradation data for known drivers."
+    lines = [
+        f"  {driver_map.get(int(r['driver_number']), str(r['driver_number']))} "
+        f"(S{int(r.get('stint_number', 0))}, {str(r.get('compound', '?')).upper()}, "
+        f"{int(r.get('laps_in_stint', 0))} laps): "
+        f"{r.get('deg_per_lap', float('nan')):+.3f}s/lap, "
+        f"{r.get('mean_pace', float('nan')):.3f}s mean"
+        for _, r in df.iterrows()
+    ]
+    return "Tyre degradation per driver/stint:\n" + "\n".join(lines)
+
+
+def _ca_tool_get_pace_summary(analyser, driver_map: dict) -> str:
+    df = analyser.pace_summary()
+    if df.empty:
+        return "No pace summary data available."
+    lines = [
+        f"  {driver_map[int(drv_num)]}: mean={row['mean_pace']:.3f}s, "
+        f"median={row['median_pace']:.3f}s, fastest={row['fastest_lap']:.3f}s, "
+        f"laps={int(row['lap_count'])}"
+        for drv_num, row in df.iterrows()
+        if int(drv_num) in driver_map
+    ]
+    if not lines:
+        return "No pace summary data for known drivers."
+    return "Pace summary:\n" + "\n".join(lines)
+
+# -- Tool dispatcher ---------------------------------------------------------
+
+def _ca_dispatch_tool(tool_name: str, tool_args: dict, analyser, driver_map: dict) -> str:
+    """Route an LLM tool_call to the correct executor with full validation."""
+    if tool_name not in _CA_ALLOWED_TOOLS:
+        return f"Tool '{tool_name}' is not a recognised tool — skipped."
+
+    cleaned_args, arg_err = _ca_validate_tool_args(tool_name, tool_args)
+    if arg_err:
+        return arg_err
+    tool_args = cleaned_args
+
+    try:
+        if tool_name == "get_rolling_pace":
+            return _ca_tool_get_rolling_pace(
+                analyser, driver_map,
+                window=int(tool_args.get("window", 5)),
+                top_n=int(tool_args.get("top_n", 5)),
+            )
+        elif tool_name == "get_gap_to_leader":
+            return _ca_tool_get_gap_to_leader(analyser, driver_map)
+        elif tool_name == "detect_strategy_events":
+            return _ca_tool_detect_strategy_events(
+                analyser, driver_map,
+                lookahead=int(tool_args.get("lookahead", 3)),
+            )
+        elif tool_name == "project_finishing_order":
+            try:
+                lr = int(tool_args["laps_remaining"])
+            except (KeyError, ValueError, TypeError):
+                lr = 10
+            return _ca_tool_project_finishing_order(analyser, driver_map, laps_remaining=lr)
+        elif tool_name == "get_tyre_degradation":
+            return _ca_tool_get_tyre_degradation(analyser, driver_map)
+        elif tool_name == "get_pace_summary":
+            return _ca_tool_get_pace_summary(analyser, driver_map)
+    except (ValueError, TypeError) as e:
+        return f"Tool '{tool_name}' argument error: {e}"
+    except Exception:
+        return f"Tool '{tool_name}' execution failed (unexpected error)."
+    return f"Tool '{tool_name}' produced no output."
+
+# -- Message history helpers -------------------------------------------------
+
+def _ca_append_message(role: str, content: str) -> None:
+    """Append to chat history. Truncates long messages and caps history at 20 entries."""
+    if len(content) > 2000:
+        content = content[:2000] + " [truncated]"
+    st.session_state["ca_messages"].append({"role": role, "content": content})
+    if len(st.session_state["ca_messages"]) > 20:
+        st.session_state["ca_messages"] = st.session_state["ca_messages"][-20:]
+
+
+def _ca_maybe_clear_history(session_cache_key) -> None:
+    """Clear chat history when the loaded session changes."""
+    if st.session_state["ca_session_cache_key"] != session_cache_key:
+        st.session_state["ca_messages"] = []
+        st.session_state["ca_session_cache_key"] = session_cache_key
+
+# -- Orchestration -----------------------------------------------------------
+
+def _ca_run_chat_turn(user_message: str, analyser, driver_map: dict, api_key: str) -> tuple:
+    """Run one chat turn with the tool-calling loop.
+    Returns (answer_text, None) on success or (None, error_string) on failure."""
+    MAX_TOOL_ROUNDS = 3
+
+    messages: list[dict] = [{"role": "system", "content": _CA_SYSTEM_PROMPT}]
+    for m in st.session_state["ca_messages"]:
+        messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": user_message})
+
+    for _ in range(MAX_TOOL_ROUNDS):
+        kind, payload, err = _call_openai_chat(api_key, messages, _CA_TOOLS)
+        if err:
+            return None, err
+        if kind == "text":
+            return payload, None
+        if kind == "tool_calls":
+            # Append the assistant's tool-call request in the format OpenAI requires
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in payload
+                ],
+            })
+            # Execute each tool (capped per round) and append results
+            for tc in payload[:_CA_MAX_TOOLS_PER_ROUND]:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                result = _ca_dispatch_tool(tc.function.name, args, analyser, driver_map)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+
+    # Fell through all rounds — force a synthesis pass with no tools
+    messages.append({
+        "role": "user",
+        "content": "Summarise what you found in the tool results above.",
+    })
+    kind, payload, err = _call_openai_chat(api_key, messages, [])
+    if err:
+        return None, err
+    if kind == "text":
+        return payload, None
+    return None, "Could not generate a response after tool execution."
+
+# -- Chat UI -----------------------------------------------------------------
+
+def _render_chat_panel(analyser, driver_map: dict, session_cache_key) -> None:
+    """Render the Race Intelligence chat panel below the race analysis charts."""
+    _ca_maybe_clear_history(session_cache_key)
+    api_key = _get_openai_api_key()
+
+    st.divider()
+    st.markdown("#### 🤖 Race Intelligence — Ask me anything about this race")
+
+    # Render existing message history
+    for msg in st.session_state["ca_messages"]:
+        with st.chat_message(msg["role"]):
+            st.text(msg["content"])
+
+    user_input = st.chat_input("Ask a question about the race...", key="ca_input")
+
+    if user_input:
+        # Guardrail 0 — sanitize input
+        user_input, input_err = _ca_sanitize_input(user_input)
+        if input_err:
+            st.warning(input_err)
+            return
+
+        # Rate limit check
+        elapsed = time.time() - st.session_state["ca_last_send_ts"]
+        if elapsed < 5.0:
+            st.warning(f"Please wait {5.0 - elapsed:.1f}s before sending another message.")
+            return
+
+        # API key check
+        if not api_key:
+            st.error(
+                "No OpenAI API key configured. "
+                "Add `[openai]\\napi_key = 'sk-...'` to `.streamlit/secrets.toml`."
+            )
+            return
+
+        with st.chat_message("user"):
+            st.text(user_input)
+        _ca_append_message("user", user_input)
+        st.session_state["ca_last_send_ts"] = time.time()
+
+        with st.chat_message("assistant"):
+            with st.spinner("Analysing race data..."):
+                answer, error = _ca_run_chat_turn(user_input, analyser, driver_map, api_key)
+            if error:
+                st.error(error)
+                st.session_state["ca_messages"].pop()   # remove failed user message
+            else:
+                st.text(answer)
+                _ca_append_message("assistant", answer)
+
+# ── End Race Intelligence Chat Agent ────────────────────────────────────────
 
 
 if not DATASET_PATH.exists():
@@ -410,10 +895,25 @@ with tab1:
 with tab2:
     st.subheader("Can the model identify the driver?")
 
+    _meta = get_dataset_meta()
+    if _meta:
+        _col1, _col2, _col3 = st.columns(3)
+        _col1.metric("Grand Prix", _meta.get("grand_prix", "—"))
+        _col2.metric("Season", str(_meta.get("year", "—")))
+        _col3.metric("Session", _meta.get("session_label", _meta.get("session_type", "—")))
+    else:
+        st.caption("Training session info unavailable — re-run `python src/pipeline.py` to generate it.")
+
+    def _fmt_lap(i: int) -> str:
+        row = df.iloc[i]
+        driver = row.get("driver", "???")
+        lap_num = row.get("lap_number", i + 1)
+        return f"{driver} (Lap {int(lap_num)})"
+
     lap_idx = st.selectbox(
         "Pick a lap",
         range(len(df)),
-        format_func=lambda i: f"Lap {i + 1}",
+        format_func=_fmt_lap,
         key="mystery_lap",
     )
 
@@ -485,9 +985,9 @@ with tab2:
             elapsed = time.time() - st.session_state.get("md_last_explain_ts", 0.0)
             cooldown = max(0.0, _RATE_LIMIT_SECS - elapsed)
             btn_label = (
-                f"Explain this Prediction (wait {cooldown:.0f}s)"
+                f"✨ Ask AI to Explain (wait {cooldown:.0f}s)"
                 if cooldown > 0
-                else "Explain this Prediction"
+                else "✨ Ask AI to Explain"
             )
 
             if st.button(btn_label, key="explain_btn", disabled=cooldown > 0):
@@ -527,7 +1027,7 @@ with tab2:
                             # Percentile rank of this lap vs the full dataset
                             percentile_dict = {
                                 feat: float(
-                                    np.mean(df[feat].dropna().values <= lap_features[feat]) * 100
+                                    (df[feat].dropna() <= lap_features[feat]).mean() * 100
                                 )
                                 for feat in FEATURE_COLS
                             }
@@ -1621,6 +2121,11 @@ with tab3:
                 team_colour_map=st.session_state.get("rp_hist_team_colour_map"),
             )
 
+            # ── Race Intelligence Chat Agent ─────────────────────────
+            _hist_cache_key = st.session_state.get("rp_hist_session_key")
+            if _hist_cache_key is not None:
+                _render_chat_panel(_analyser, _dmap, session_cache_key=_hist_cache_key)
+
     else:
         # ---- LIVE MODE ----
         if not st.session_state.get("show_live_mode", False):
@@ -1814,6 +2319,8 @@ with tab3:
                             selected_drivers=_selected or _all_drvs,
                             team_colour_map=st.session_state.get("rp_live_team_colour_map"),
                         )
+                    # ── Race Intelligence Chat Agent ──────────────────
+                    _render_chat_panel(analyser, _live_dmap, session_cache_key="live")
             except Exception as exc:
                 st.warning(f"Live refresh failed: {exc}")
     

@@ -1,8 +1,8 @@
-# Driver DNA + Race Dashboard
+# Driver DNA + Race Intelligence Dashboard
 
-**Can a machine learning model tell two F1 drivers apart from their telemetry alone — without ever seeing their name?**
+**Can a machine learning model identify an F1 driver purely from their telemetry — without ever seeing their name?**
 
-Driver DNA is an end-to-end ML system that extracts lap telemetry from FastF1, engineers driving-style features, and trains an XGBoost classifier to identify F1 drivers purely from how they brake, accelerate, steer, and shift. It is paired with a real-time race analytics dashboard powered by the OpenF1 API, and an **Agentic AI layer** that uses GPT-4o-mini to generate natural language explanations of model predictions — combining Explainable AI (XAI) with Generative AI.
+Driver DNA is a full-stack AI/ML platform built on F1 telemetry data. It combines an XGBoost driver-identification model with an Explainable AI layer, a real-time race analytics engine, and two Agentic AI features powered by GPT-4o-mini — all served through an interactive Streamlit dashboard.
 
 ---
 
@@ -10,84 +10,98 @@ Driver DNA is an end-to-end ML system that extracts lap telemetry from FastF1, e
 
 | Category | Technologies |
 |---|---|
-| **Machine Learning** | XGBoost, scikit-learn, SHAP (Explainable AI) |
-| **Generative AI / LLM** | OpenAI API (`gpt-4o-mini`), prompt engineering, structured tool output |
-| **Data Engineering** | FastF1, pandas, NumPy, Parquet, feature engineering, time-series resampling |
-| **Visualisation** | Streamlit, Plotly (interactive charts, radar/spider charts, scatter, bar) |
+| **Machine Learning** | XGBoost (multi-class classification), scikit-learn, SHAP (Explainable AI), 5-fold stratified cross-validation |
+| **Agentic AI / LLM** | OpenAI API (`gpt-4o-mini`), OpenAI tool calling (function calling), multi-step agent orchestration, prompt engineering |
+| **Data Engineering** | FastF1, pandas, NumPy, Apache Parquet, time-series resampling, distance-normalised feature extraction |
+| **Visualisation** | Streamlit, Plotly (spider/radar charts, time-series, scatter, bar, track maps) |
 | **APIs** | OpenF1 REST API (live + historical), OpenAI Chat Completions API |
-| **ML Ops** | joblib model serialisation, 5-fold stratified cross-validation, SHAP feature importance |
-| **Security** | Input validation, prompt injection prevention, API key management (`st.secrets`), rate limiting |
+| **MLOps** | joblib model serialisation, SHAP feature importance, confusion matrix evaluation |
+| **Security** | Prompt injection prevention, input sanitisation, API key management (`st.secrets`), tool name allowlisting, rate limiting, LLM response sanitisation |
 
 ---
 
-## Features
+## Agentic AI Features
 
-### 🧬 Driver DNA Fingerprinter
+### 🤖 Feature 1 — Race Intelligence Chat Agent
 
-Extracts telemetry from qualifying/race sessions, engineers 10 scalar driving-style features per lap, and trains an XGBoost multi-class classifier to identify drivers. The Streamlit dashboard includes:
+A conversational AI analyst embedded directly in the Race Dashboard. Users ask natural language questions about any loaded race and the agent autonomously decides which analytical tools to invoke, executes them against live race data, and synthesises a data-grounded answer.
 
-- **Driver Radar** — normalised spider chart of driving-style features for 2–4 drivers side by side
-- **Mystery Driver** — pick any lap, let the model predict the driver, then reveal whether it was correct
+**Architecture — OpenAI Tool Calling (Function Calling):**
 
-### 🤖 AI-Powered Prediction Explainer (Agentic AI)
+```
+User question
+     ↓
+GPT-4o-mini decides which tools to call
+     ↓
+App executes tools against RaceAnalyser (real data)
+     ↓
+Results returned to GPT-4o-mini
+     ↓
+GPT-4o-mini synthesises a natural language answer
+     ↓
+Answer displayed in chat UI
+```
 
-After any Mystery Driver prediction, an **"Explain this Prediction"** button triggers an Agentic AI pipeline:
+This is the same pattern used in enterprise AI platforms (Salesforce Einstein, GitHub Copilot Workspace, Palantir AIP).
 
-1. **SHAP inference** — computes per-feature SHAP values at runtime using `shap.TreeExplainer`, isolating the contribution of each driving-style feature to the predicted class
-2. **Percentile context** — ranks the lap's feature values against the full dataset distribution
-3. **Prompt construction** — builds a structured prompt embedding the SHAP values, feature magnitudes, and percentile ranks — all pre-validated inputs, no raw user text
-4. **LLM generation** — calls OpenAI `gpt-4o-mini` via the Chat Completions API to produce a concise natural language explanation
+**6 tools exposed to the agent:**
 
-Example output:
-> *"The model identified this as Verstappen with 73% confidence. The key signals were unusually high brake_events (91st percentile) and low steer_std (8th percentile), indicating aggressive, precise braking with surgical steering control. max_speed at the 88th percentile added further evidence of the high-speed commitment typical of his style."*
+| Tool | Calls | Returns |
+|---|---|---|
+| `get_rolling_pace` | `analyser.rolling_pace(window)` | Per-driver rolling-average lap times |
+| `get_gap_to_leader` | `analyser.gap_to_leader()` | Cumulative gap per driver to the leader |
+| `detect_strategy_events` | `analyser.detect_undercuts()` | Undercut / overcut detections |
+| `project_finishing_order` | `analyser.project_finishing_order(laps_remaining)` | Projected final classification |
+| `get_tyre_degradation` | `analyser.tyre_degradation()` | Degradation rate per driver/compound |
+| `get_pace_summary` | `analyser.pace_summary()` | Mean, median, fastest lap per driver |
 
-**Security guardrails implemented:**
-- API key loaded exclusively from `st.secrets` / environment variable — never hardcoded
-- Driver names validated against the model's class list before prompt interpolation (prompt injection prevention)
-- Feature values checked for finite floats within domain-specific bounds before the API call
-- All OpenAI exception types caught and mapped to user-friendly messages (raw errors never surfaced)
-- 10-second session-level rate limiter with a disabled button + countdown label
-- `max_tokens=300` hard cap to prevent runaway API costs
+**Example interactions:**
+> *"Who has the best pace over the last 10 laps?"*
+> *"Is Verstappen likely to undercut Norris? What does the gap look like?"*
+> *"Which driver has the worst tyre degradation on softs?"*
+> *"Who is projected to win with 20 laps remaining?"*
 
-### 🏁 Race Dashboard
+**Security guardrails (11 layers):**
 
-Real-time and historical race analysis powered by the OpenF1 API (no API key required).
-
-**Fastest Lap Telemetry Comparison** — five channels comparing two drivers over their single fastest recorded lap:
-
-| Channel | What it shows |
-|---|---|
-| **Time Delta** | Cumulative time gap through the lap. Shaded regions show where each driver is gaining. |
-| **Track Map** | Circuit coloured by faster driver per microsector (~999 segments). Geometry from pre-generated `data/circuits.json`. |
-| **Speed** | Overlaid speed traces (km/h) vs. distance |
-| **Throttle** | Overlaid throttle application (%) vs. distance |
-| **Brake** | Overlaid brake pressure (%) vs. distance |
-
-**Live mode** — connects to the OpenF1 live feed during an active F1 session. Auto-refreshes at a configurable interval (10s / 30s / 60s). Only active during race weekends.
-
-**Historical mode** — analyse any race from 2022 onwards from the OpenF1 archive.
-
-**7 race analysis charts:**
-
-| Chart | What it shows |
-|---|---|
-| **Rolling Race Pace** | 5-lap rolling-average lap time. Pit-out laps and safety car laps filtered automatically. |
-| **Gap to Leader** | Cumulative time gap to the race leader per lap, shaded per driver. |
-| **Undercut / Overcut Alerts** | Triangle markers on the gap chart where pit strategy caused a position swap. |
-| **Projected Finishing Order** | Projected final gaps accounting for current pace, tyre degradation (+0.07 s/lap after 20 laps), and DNF flags. |
-| **Average Race Pace** | Horizontal bars per driver, coloured by consistency (Viridis scale). Hover shows mean, median, std dev, fastest lap, lap count. |
-| **Race Pace Ranking** | Vertical bars sorted fastest to slowest with ± std dev error bars. |
-| **Tyre Degradation by Compound** | Scatter of mean stint pace vs. degradation rate (s/lap) from linear regression, coloured by compound. |
+| # | Threat | Mitigation |
+|---|---|---|
+| 0 | Prompt injection via long/malicious input | `_ca_sanitize_input()` — strips control chars, 500-char limit |
+| 1 | Out-of-range LLM-supplied tool args | `_ca_validate_tool_args()` — schema validation + clamping |
+| 2 | HTML/link injection via LLM response | `st.text()` renders plain text only |
+| 3 | Unknown tool names from LLM | `_CA_ALLOWED_TOOLS` explicit allowlist |
+| 4 | Tool call flood attack | `_CA_MAX_TOOLS_PER_ROUND = 3` cap |
+| 5 | History poisoning via long responses | Per-message 2000-char truncation |
+| 6 | Hardcoded API key | `_get_openai_api_key()` reads `st.secrets` / env var only |
+| 7 | Infinite agent loop | `MAX_TOOL_ROUNDS = 3` hard cap |
+| 8 | Context window / cost blowout | 20-message history cap + `max_tokens=500` |
+| 9 | API spam / cost abuse | 5-second per-session rate limiter |
+| 10 | Corrupt state on failed turn | User message popped from history on API error |
 
 ---
 
-## How It Works
+### ✨ Feature 2 — XAI Prediction Explainer
+
+After the Mystery Driver ML prediction, an AI explanation pipeline runs automatically when the user clicks **✨ Ask AI to Explain**. It bridges classical ML explainability (SHAP) with generative AI narration.
+
+**Pipeline:**
+1. **SHAP inference** — `shap.TreeExplainer` computes per-feature SHAP values for the single predicted sample at runtime, identifying each feature's contribution to the predicted driver class
+2. **Percentile ranking** — each feature value is ranked against the full training dataset distribution
+3. **Structured prompt** — SHAP values, feature magnitudes, and percentile ranks are assembled into a validated prompt (no raw user text enters the prompt)
+4. **LLM narration** — `gpt-4o-mini` produces a plain-English explanation via the Chat Completions API
+5. **Session cache** — explanation is stored in `st.session_state` to avoid repeat API calls
+
+**Example output:**
+> *"The model identified this as Verstappen with 73% confidence. The key signals were unusually high brake_events at the 91st percentile and low steer_std at the 8th percentile — indicating aggressive, precisely timed braking with surgical steering control. max_speed at the 88th percentile further reinforced the high-speed commitment characteristic of his telemetry fingerprint."*
+
+---
+
+## Machine Learning Pipeline
 
 ### 1. Data extraction (`src/pipeline.py`)
-FastF1 pulls high-frequency telemetry from the F1 timing feed. Invalid laps (in-laps, out-laps, deleted times) are dropped. Each lap is resampled to **200 evenly spaced distance-based points** via linear interpolation — normalising every lap to the same length regardless of circuit or speed.
+FastF1 pulls high-frequency telemetry from the F1 live timing feed. Invalid laps (in-laps, out-laps, deleted times) are excluded. Each valid lap is resampled to **200 evenly spaced distance-based points** via linear interpolation — normalising every lap to the same resolution regardless of circuit length or car speed.
 
 ### 2. Feature engineering (`src/pipeline.py`)
-Each lap is compressed into **10 scalar features** capturing driving style:
+Each lap is compressed into **10 scalar driving-style features:**
 
 | Feature | What it captures |
 |---|---|
@@ -95,26 +109,48 @@ Each lap is compressed into **10 scalar features** capturing driving style:
 | `mean_speed`, `max_speed`, `min_speed` | Speed profile across the lap |
 | `throttle_mean`, `throttle_std` | Throttle aggression and smoothness |
 | `brake_mean`, `brake_events` | Braking intensity and frequency |
-| `gear_changes` | Shift frequency (mechanical aggression) |
+| `gear_changes` | Shift frequency — mechanical aggression |
 | `steer_std` | Steering smoothness |
 
-### 3. XGBoost classifier + SHAP (`src/model.py`)
-A gradient-boosted tree classifier is trained with **5-fold stratified cross-validation**. Each driver is one class. SHAP `TreeExplainer` identifies which features drive each prediction — both globally (training-time importance chart) and locally (per-prediction at inference time for the LLM explainer).
+### 3. XGBoost classifier (`src/model.py`)
+A gradient-boosted tree multi-class classifier trained with **5-fold stratified cross-validation**. Each F1 driver is one class. SHAP `TreeExplainer` generates both global feature importance (saved as a chart at training time) and local per-prediction explanations at inference time.
 
-### 4. Agentic AI explainer (`src/app.py`)
-At prediction time, `shap.TreeExplainer` computes SHAP values for the single input sample. These values, along with percentile ranks against the full dataset, are assembled into a structured prompt and sent to `gpt-4o-mini` via the OpenAI Chat Completions API. The response is cached in Streamlit session state to avoid repeat API calls.
+### 4. Circuit geometry store (`src/generate_circuits.py`)
+A one-off script extracts XY circuit outlines for all 24 Grand Prix from FastF1 and writes them to `data/circuits.json` at **500 resampled distance points** per circuit. Resume-safe — skips circuits already written.
 
-### 5. Circuit geometry store (`src/generate_circuits.py`)
-A one-off script that uses FastF1 to extract XY circuit outlines for all 24 Grand Prix and writes them to `data/circuits.json` at **500 evenly resampled distance points** per circuit. Resume-safe — skips circuits already written.
+---
 
-### 6. Streamlit dashboard (`src/app.py`)
-Three interactive tabs:
+## Race Dashboard
 
-| Tab | Contents |
+Real-time and historical race analysis powered by the OpenF1 API. No API key required.
+
+### Fastest Lap Telemetry Comparison
+
+Five channels comparing two drivers over their fastest recorded lap, fetched live from OpenF1:
+
+| Channel | What it shows |
 |---|---|
-| **Driver Radar** | Normalised driving-style spider chart for 2–4 drivers |
-| **Mystery Driver** | ML prediction with probability breakdown + GPT-4o-mini XAI explanation |
-| **Race Dashboard** | Fastest Lap Telemetry (5 channels, live OpenF1) + 7 race analysis charts |
+| **Time Delta** | Cumulative time gap through the lap. Shaded regions show where each driver is gaining. |
+| **Track Map** | Circuit outline coloured by faster driver per microsector (~999 segments). |
+| **Speed** | Overlaid speed traces (km/h) vs. distance |
+| **Throttle** | Overlaid throttle application (%) vs. distance |
+| **Brake** | Overlaid brake pressure (%) vs. distance |
+
+### 7 Race Analysis Charts
+
+| Chart | What it shows |
+|---|---|
+| **Rolling Race Pace** | 5-lap rolling-average lap time per driver. Pit-out and safety car laps filtered automatically. |
+| **Gap to Leader** | Cumulative time gap to the race leader per lap, shaded per driver. |
+| **Undercut / Overcut Alerts** | Triangle markers on the gap chart at the exact lap a pit strategy caused a position swap. |
+| **Projected Finishing Order** | Projected final gaps accounting for current pace, tyre degradation (+0.07 s/lap after 20 laps), and DNF flags. |
+| **Average Race Pace** | Bars per driver coloured by consistency (Viridis scale). Hover shows mean, median, std dev, fastest lap, lap count. |
+| **Race Pace Ranking** | Bars sorted fastest to slowest with ±std dev error bars. |
+| **Tyre Degradation by Compound** | Scatter of mean stint pace vs. degradation rate (s/lap) from per-stint linear regression. |
+
+**Live mode** — connects to the OpenF1 live feed during an active F1 race weekend. Auto-refreshes at 10s / 30s / 60s intervals.
+
+**Historical mode** — analyse any race from 2022 onwards from the OpenF1 archive.
 
 ---
 
@@ -122,17 +158,46 @@ Three interactive tabs:
 
 | Source | What it provides |
 |---|---|
-| **FastF1** | High-frequency car telemetry (speed, throttle, brake, steering, gear, RPM) per lap — used to build the Driver DNA training dataset and circuit geometry |
+| **FastF1** | High-frequency car telemetry (speed, throttle, brake, steering, gear, RPM) per lap — used to build the Driver DNA training dataset and circuit geometry store |
 | **OpenF1 API** | Live and historical race data — lap times, tyre stints, track positions, car telemetry, driver/team metadata. No API key required. |
-| **OpenAI API** | `gpt-4o-mini` Chat Completions for natural language prediction explanations |
+| **OpenAI API** | `gpt-4o-mini` via Chat Completions — powers both the XAI explainer and the Race Intelligence chat agent |
 
-> `data/circuits.json` and `data/dataset.parquet` are git-ignored and must be generated locally. See Setup below.
+---
+
+## Project Structure
+
+```
+driver-dna/
+├── src/
+│   ├── app.py                   # Streamlit dashboard — 3 tabs, XAI explainer, chat agent
+│   ├── pipeline.py              # Data extraction, telemetry resampling, feature engineering
+│   ├── model.py                 # XGBoost training, CV evaluation, SHAP analysis
+│   ├── race_engine.py           # Pace analytics, gap tracking, undercut detection, projections
+│   ├── openf1.py                # OpenF1 REST API client (live + historical modes)
+│   └── generate_circuits.py     # One-off: generates data/circuits.json
+├── data/                        # Git-ignored — generated locally
+│   ├── dataset.parquet          # Driver DNA training data (pipeline.py output)
+│   ├── dataset_meta.json        # Session metadata — GP name, year, session type
+│   └── circuits.json            # Circuit XY outlines for Track Map
+├── models/                      # Git-ignored — generated locally
+│   ├── driver_dna_clf.joblib    # Trained XGBoost classifier
+│   ├── label_encoder.joblib     # sklearn LabelEncoder
+│   ├── accuracy.txt             # Cross-validation accuracy
+│   ├── confusion_matrix.html    # Per-driver confusion matrix heatmap
+│   └── shap_importance.png      # Global SHAP feature importance chart
+├── .streamlit/
+│   ├── config.toml              # Dark theme, F1 red (#E8002D)
+│   └── secrets.toml             # OpenAI API key — gitignored, never commit
+├── streamlit_app.py             # Streamlit Community Cloud entry point
+├── requirements.txt
+└── README.md
+```
 
 ---
 
 ## Setup
 
-### 1. Clone and install dependencies
+### 1. Clone and install
 
 ```bash
 git clone <repo-url>
@@ -142,28 +207,28 @@ source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-> **Always use the project venv.** Running with a system Python (e.g. Anaconda) causes `ImportError: numpy.core.multiarray failed to import` due to numpy/pandas version conflicts. Verify with `which python` — it should point to `.venv/bin/python`.
+> **Always activate the project venv first.** Running with a system Python (e.g. Anaconda) causes `ImportError: numpy.core.multiarray failed to import` due to numpy/pandas version mismatches. Verify with `which python` — it should point to `.venv/bin/python`.
 
 ### 2. Configure the OpenAI API key
 
-The LLM explainer requires an OpenAI API key with billing enabled (paid tier). Create `.streamlit/secrets.toml`:
+Both AI features (XAI Explainer and Race Intelligence Chat) require an OpenAI paid API account. Create `.streamlit/secrets.toml` (this file is gitignored):
 
 ```toml
 [openai]
 api_key = "sk-proj-..."
 ```
 
-This file is gitignored. For Streamlit Community Cloud deployment, use the **Secrets** panel in the app settings instead of a local file.
-
-Alternatively, export as an environment variable:
+Or export as an environment variable:
 
 ```bash
 export OPENAI_API_KEY="sk-proj-..."
 ```
 
-### 3. Generate circuit outlines (required for Track Map)
+For Streamlit Community Cloud deployment, add the key via the **Secrets** panel in the app settings instead of a local file.
 
-Downloads XY geometry for all 24 Grand Prix circuits and writes `data/circuits.json`. Run once — takes 10–30 minutes due to FastF1 downloads. Resume-safe.
+### 3. Generate circuit outlines *(required for Track Map)*
+
+Downloads XY geometry for all 24 Grand Prix circuits and writes `data/circuits.json`. Run once — takes 10–30 minutes. Resume-safe.
 
 ```bash
 python src/generate_circuits.py
@@ -171,7 +236,7 @@ python src/generate_circuits.py
 
 ### 4. Build the Driver DNA dataset
 
-Downloads session data from the F1 timing feed and writes `data/dataset.parquet`. Required for Driver Radar and Mystery Driver tabs.
+Downloads session data from the F1 timing feed, engineers features, and writes `data/dataset.parquet` and `data/dataset_meta.json`. Required for the Driver Radar and Mystery Driver tabs.
 
 ```bash
 python src/pipeline.py
@@ -179,7 +244,7 @@ python src/pipeline.py
 
 ### 5. Train the classifier
 
-Runs 5-fold stratified CV, saves the model, label encoder, accuracy, confusion matrix, and SHAP importance plot to `models/`:
+Runs 5-fold stratified CV, saves the model, label encoder, accuracy, confusion matrix, and SHAP importance chart to `models/`:
 
 ```bash
 python src/model.py
@@ -191,37 +256,7 @@ python src/model.py
 streamlit run src/app.py
 ```
 
-> The Race Dashboard live mode only works during active F1 race weekends. Historical mode works any time from 2022 onwards. The Race Dashboard charts query the OpenF1 API directly and do not require steps 4–5.
-
----
-
-## Project Structure
-
-```
-driver-dna/
-├── data/                        # FastF1 cache + generated files (git-ignored)
-│   ├── dataset.parquet          # Driver DNA training data (pipeline.py output)
-│   └── circuits.json            # Circuit XY outlines for Track Map
-├── models/                      # Saved model artefacts (git-ignored)
-│   ├── driver_dna_clf.joblib    # Trained XGBoost classifier
-│   ├── label_encoder.joblib     # sklearn LabelEncoder
-│   ├── accuracy.txt             # Cross-validation accuracy
-│   ├── confusion_matrix.html    # Per-driver confusion matrix heatmap
-│   └── shap_importance.png      # Global SHAP feature importance chart
-├── src/
-│   ├── pipeline.py              # Data extraction & feature engineering (FastF1)
-│   ├── model.py                 # XGBoost training, CV evaluation, SHAP analysis
-│   ├── generate_circuits.py     # One-off: generate data/circuits.json
-│   ├── openf1.py                # OpenF1 REST API client (live + historical)
-│   ├── race_engine.py           # Pace analytics, tyre degradation, undercut detection
-│   └── app.py                   # Streamlit dashboard (3 tabs + LLM explainer)
-├── .streamlit/
-│   ├── config.toml              # Dark theme, F1 red (#E8002D)
-│   └── secrets.toml             # OpenAI API key — gitignored, never commit
-├── streamlit_app.py             # Streamlit Community Cloud entry point
-├── requirements.txt
-└── README.md
-```
+> The Race Dashboard and Race Intelligence chat agent work independently of steps 4–5 — they query the OpenF1 API directly. Live mode only works during active F1 race weekends; historical mode works any time from 2022 onwards.
 
 ---
 
@@ -240,19 +275,19 @@ A VS Code debug configuration is included at [`.vscode/launch.json`](.vscode/lau
 ### Common Issues
 
 **`ImportError: numpy.core.multiarray failed to import`**
-Running with the wrong Python interpreter. In VS Code: `⇧⌘P` → **Python: Select Interpreter** → choose the `.venv` entry.
-
-**`ModuleNotFoundError` when debugging**
-`PYTHONPATH` must be set to `src/`. The `launch.json` sets this automatically. From the terminal: `source .venv/bin/activate` first.
+Wrong Python interpreter. In VS Code: `⇧⌘P` → **Python: Select Interpreter** → choose the `.venv` entry.
 
 **Track Map shows "No circuit data"**
 `data/circuits.json` not yet generated. Run `python src/generate_circuits.py`.
 
-**LLM explainer: "OpenAI rate limit reached"**
-The OpenAI API requires a paid account. Free-tier accounts have no API access — billing must be enabled at `platform.openai.com/settings/billing`.
+**Race Intelligence / XAI Explainer: "OpenAI rate limit reached"**
+The OpenAI API requires a paid account. Free-tier accounts have no API access — enable billing at `platform.openai.com/settings/billing`.
 
-**LLM explainer: "OpenAI API key not configured"**
-`.streamlit/secrets.toml` is missing or the key placeholder was not replaced. See Setup step 2.
+**Race Intelligence / XAI Explainer: "OpenAI API key not configured"**
+`.streamlit/secrets.toml` is missing or the placeholder key was not replaced. See Setup step 2.
+
+**Mystery Driver tab shows "—" for Grand Prix / Season / Session**
+`data/dataset_meta.json` was not generated (it is written by `pipeline.py` alongside `dataset.parquet`). Re-run `python src/pipeline.py` to generate it.
 
 ---
 
@@ -260,6 +295,6 @@ The OpenAI API requires a paid account. Free-tier accounts have no API access �
 
 > Run the full pipeline and fill these in with your results.
 
-- **Finding 1** — e.g. which feature had the highest mean SHAP value across all drivers, and what driving behaviour it reflects
-- **Finding 2** — e.g. which pair of drivers the model most often confused, and a data-backed explanation
-- **Finding 3** — e.g. overall CV accuracy vs. random-chance baseline (1 / number of drivers)
+- **Finding 1** — which feature had the highest mean SHAP value across all drivers, and what driving behaviour it reflects
+- **Finding 2** — which pair of drivers the model most often confused, and a data-backed explanation
+- **Finding 3** — overall CV accuracy vs. random-chance baseline (1 / number of drivers)
