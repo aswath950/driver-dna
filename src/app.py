@@ -39,6 +39,26 @@ OPENF1_TRACE_COLS = {"Speed": "speed", "Throttle": "throttle", "Brake": "brake"}
 # Channels that require special rendering (not a simple 1D line overlay)
 SPECIAL_CHANNELS = ["Track Map", "Time Delta"]
 RADAR_FEATURES = ["mean_speed", "throttle_mean", "throttle_std", "brake_events", "steer_std", "gear_changes"]
+EXTENDED_RADAR_FEATURES = [
+    "mean_speed", "max_speed", "min_speed",
+    "throttle_mean", "throttle_std", "throttle_pickup_pct",
+    "brake_mean", "brake_events", "trail_brake_score",
+    "steer_std", "gear_changes", "coasting_pct",
+]
+FEATURE_LABELS = {
+    "mean_speed":           "Avg Speed",
+    "max_speed":            "Top Speed",
+    "min_speed":            "Corner Speed",
+    "throttle_mean":        "Throttle Input",
+    "throttle_std":         "Throttle Variation",
+    "brake_mean":           "Brake Pressure",
+    "brake_events":         "Brake Frequency",
+    "steer_std":            "Steering Precision",
+    "gear_changes":         "Gear Shifts",
+    "coasting_pct":         "Coasting %",
+    "throttle_pickup_pct":  "Full Throttle %",
+    "trail_brake_score":    "Trail Braking",
+}
 # Sidebar visibility toggle keys — order determines display order in the expander
 CHART_KEYS = {
     "Fastest Lap Telemetry": ("show_telemetry",      True),
@@ -202,6 +222,47 @@ def get_dataset_meta() -> dict:
         return {}
     with open(DATASET_META_PATH) as f:
         return json.load(f)
+
+
+# ── Radar derived-feature computation ───────────────────────────────────────
+
+@st.cache_data
+def compute_extended_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute coasting_pct, throttle_pickup_pct, trail_brake_score per lap from traces."""
+    records = []
+    for _, row in df.iterrows():
+        try:
+            thr = np.array(row["throttle_trace"], dtype=float)
+            brk = np.array(row["brake_trace"], dtype=float)
+            records.append({
+                "driver": row["driver"],
+                "lap_number": row.get("lap_number", 0),
+                "coasting_pct": float(np.nanmean((thr < 2) & (brk < 1))),
+                "throttle_pickup_pct": float(np.nanmean(thr > 80)),
+                "trail_brake_score": float(np.nanmean((thr > 0) & (brk > 0))),
+            })
+        except Exception:
+            continue
+    if not records:
+        df["coasting_pct"] = np.nan
+        df["throttle_pickup_pct"] = np.nan
+        df["trail_brake_score"] = np.nan
+        return df
+    ext = pd.DataFrame(records)
+    return df.merge(ext, on=["driver", "lap_number"], how="left")
+
+
+def compute_mean_trace(df: pd.DataFrame, driver: str, col: str) -> np.ndarray:
+    """Return mean of a 200-point trace column across all laps for a driver."""
+    rows = df[df["driver"] == driver][col]
+    stack = np.stack([np.array(r, dtype=float) for r in rows])
+    return np.nanmean(stack, axis=0)
+
+
+def compute_sector_means(df: pd.DataFrame, driver: str, col: str) -> list[float]:
+    """Split 200-point trace into three equal zones and return mean per zone."""
+    stack = np.stack([np.array(r, dtype=float) for r in df[df["driver"] == driver][col]])
+    return [float(np.nanmean(stack[:, s])) for s in [slice(0, 67), slice(67, 134), slice(134, 200)]]
 
 
 # ── LLM Explainer helpers ───────────────────────────────────────────────────
@@ -841,6 +902,75 @@ drivers = sorted(df["driver"].unique())
 palette = px.colors.qualitative.Plotly
 color_map = {d: palette[i % len(palette)] for i, d in enumerate(drivers)}
 
+def classify_archetype(norm_means: dict) -> tuple[str, str]:
+    """Assign a driving style archetype from normalised (0-1) feature means."""
+    if norm_means.get("brake_events", 0) > 0.65 and norm_means.get("brake_mean", 0) > 0.60:
+        return "Aggressive Braker", "💥"
+    if norm_means.get("trail_brake_score", 0) > 0.55 and norm_means.get("steer_std", 0) > 0.60:
+        return "Trail Braking Specialist", "🎯"
+    if norm_means.get("mean_speed", 0) > 0.70 and norm_means.get("coasting_pct", 0) < 0.35:
+        return "High Entry Speed", "🚀"
+    if norm_means.get("throttle_pickup_pct", 0) > 0.60 and norm_means.get("throttle_std", 0) < 0.40:
+        return "Smooth Operator", "🧊"
+    if norm_means.get("gear_changes", 0) > 0.65 and norm_means.get("steer_std", 0) > 0.55:
+        return "Technical Driver", "⚙️"
+    return "Balanced Driver", "⚖️"
+
+
+def _build_throttle_map_fig(df: pd.DataFrame, selected: list[str], color_map: dict) -> go.Figure:
+    """Build a multi-panel track map coloured by mean throttle per driver."""
+    from plotly.subplots import make_subplots
+    n = len(selected)
+    fig = make_subplots(
+        rows=1, cols=n,
+        subplot_titles=selected,
+        horizontal_spacing=0.04,
+    )
+    for i, drv in enumerate(selected, start=1):
+        df_drv = df[df["driver"] == drv]
+        try:
+            x = np.nanmean(np.stack([np.array(r, dtype=float) for r in df_drv["x_trace"]]), axis=0)
+            y = np.nanmean(np.stack([np.array(r, dtype=float) for r in df_drv["y_trace"]]), axis=0)
+            thr = np.nanmean(np.stack([np.array(r, dtype=float) for r in df_drv["throttle_trace"]]), axis=0)
+        except Exception:
+            continue
+        # Background outline
+        fig.add_trace(
+            go.Scatter(x=x, y=y, mode="lines",
+                       line=dict(color="#333333", width=6),
+                       showlegend=False, hoverinfo="skip"),
+            row=1, col=i,
+        )
+        # Throttle-coloured layer
+        fig.add_trace(
+            go.Scatter(
+                x=x, y=y, mode="markers",
+                marker=dict(
+                    color=thr,
+                    colorscale="RdYlGn",
+                    cmin=0, cmax=100,
+                    size=4,
+                    colorbar=dict(title="Throttle %", thickness=12, len=0.6) if i == n else None,
+                    showscale=(i == n),
+                ),
+                name=drv,
+                showlegend=False,
+                hovertemplate=f"<b>{drv}</b><br>Throttle: %{{marker.color:.0f}}%<extra></extra>",
+            ),
+            row=1, col=i,
+        )
+        axis_cfg = dict(visible=False, scaleanchor=f"y{i if i > 1 else ''}", scaleratio=1)
+        fig.update_xaxes(axis_cfg, row=1, col=i)
+        fig.update_yaxes(dict(visible=False), row=1, col=i)
+    fig.update_layout(
+        height=340,
+        margin=dict(l=10, r=30, t=40, b=10),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
 tab1, tab2, tab3 = st.tabs(["Driver Radar", "Mystery Driver", "Race Dashboard"])
 
 # ================================================================
@@ -861,15 +991,30 @@ with tab1:
     elif len(selected) > 4:
         st.warning("Select at most 4 drivers.")
     else:
-        feat_df = df[RADAR_FEATURES].copy()
+        # ── Compute extended trace-derived features ──────────────────────
+        df_ext = compute_extended_features(df)
+
+        radar_mode = st.radio(
+            "Radar dimensions",
+            ["Standard (6)", "Extended (12)"],
+            horizontal=True,
+            key="radar_mode",
+        )
+        use_extended = "Extended" in radar_mode
+        features = EXTENDED_RADAR_FEATURES if use_extended else RADAR_FEATURES
+
+        # Build normalised driver means for the chosen feature set
+        feat_df = df_ext[features].copy()
         feat_min = feat_df.min()
         feat_max = feat_df.max()
         norm_df = (feat_df - feat_min) / (feat_max - feat_min).replace(0, 1)
-        norm_df["driver"] = df["driver"].values
+        norm_df["driver"] = df_ext["driver"].values
+        driver_means = norm_df.groupby("driver")[features].mean()
 
-        driver_means = norm_df.groupby("driver")[RADAR_FEATURES].mean()
+        # Human-readable axis labels
+        theta_labels = [FEATURE_LABELS.get(f, f) for f in features]
+        categories = theta_labels + [theta_labels[0]]
 
-        categories = RADAR_FEATURES + [RADAR_FEATURES[0]]
         fig = go.Figure()
         for drv in selected:
             vals = driver_means.loc[drv].tolist()
@@ -886,8 +1031,140 @@ with tab1:
             polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
             title="Driver Style Radar (normalised 0–1)",
             legend_title="Driver",
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
         )
-        st.plotly_chart(fig, width="stretch", key="tab2_driver_radar")
+        st.plotly_chart(fig, width="stretch", key="tab1_driver_radar")
+
+        # ── Archetype cards ──────────────────────────────────────────────
+        # Use extended normalised means for archetype classification
+        ext_feat_df = df_ext[EXTENDED_RADAR_FEATURES].copy()
+        ext_norm_df = (ext_feat_df - ext_feat_df.min()) / (ext_feat_df.max() - ext_feat_df.min()).replace(0, 1)
+        ext_norm_df["driver"] = df_ext["driver"].values
+        ext_driver_means = ext_norm_df.groupby("driver")[EXTENDED_RADAR_FEATURES].mean()
+
+        arch_cols = st.columns(len(selected))
+        for col_idx, drv in enumerate(selected):
+            norm_vals = ext_driver_means.loc[drv].to_dict()
+            archetype, emoji = classify_archetype(norm_vals)
+            drv_color = color_map[drv]
+            arch_cols[col_idx].markdown(
+                f"""<div style="background:#1e1e2e; border-left:4px solid {drv_color};
+                border-radius:6px; padding:12px; margin:4px 0;">
+                <div style="font-size:1.6em">{emoji}</div>
+                <div style="font-weight:700; color:{drv_color}; font-size:1.1em">{drv}</div>
+                <div style="color:#aaa; font-size:0.9em; margin-top:4px">{archetype}</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
+        st.divider()
+
+        # ── Speed Trace Overlay ──────────────────────────────────────────
+        st.markdown("### Speed Profile Comparison")
+        st.caption("Average speed at each point along the lap — reveals where each driver goes faster.")
+        fig_speed = go.Figure()
+        for drv in selected:
+            try:
+                trace = compute_mean_trace(df_ext, drv, "speed_trace")
+                fig_speed.add_trace(go.Scatter(
+                    x=list(range(200)),
+                    y=trace,
+                    mode="lines",
+                    name=drv,
+                    line=dict(color=color_map[drv], width=2),
+                ))
+            except Exception:
+                continue
+        fig_speed.update_layout(
+            xaxis_title="Lap Distance (normalised)",
+            yaxis_title="Speed (km/h)",
+            hovermode="x unified",
+            legend_title="Driver",
+            height=360,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig_speed, width="stretch", key="tab1_speed_overlay")
+
+        # ── Lap Consistency Heatmap ──────────────────────────────────────
+        st.markdown("### Lap-by-Lap Consistency")
+        st.caption("How variable each driver is across laps — red means less consistent.")
+        cons_records = {
+            drv: {feat: float(df_ext[df_ext["driver"] == drv][feat].std(ddof=0))
+                  for feat in RADAR_FEATURES}
+            for drv in selected
+        }
+        cons_df = pd.DataFrame(cons_records).T
+        norm_cons = (cons_df - cons_df.min()) / (cons_df.max() - cons_df.min() + 1e-9)
+        heatmap_labels = [FEATURE_LABELS.get(f, f) for f in RADAR_FEATURES]
+        fig_heat = go.Figure(go.Heatmap(
+            z=norm_cons.values,
+            x=heatmap_labels,
+            y=list(norm_cons.index),
+            colorscale="Reds",
+            text=cons_df.round(3).values,
+            texttemplate="%{text}",
+            hovertemplate="<b>%{y}</b> — %{x}<br>Std dev: %{text}<extra></extra>",
+            showscale=True,
+            colorbar=dict(title="Inconsistency", thickness=14),
+        ))
+        fig_heat.update_layout(
+            height=300,
+            margin=dict(l=10, r=80, t=20, b=60),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig_heat, width="stretch", key="tab1_consistency_heatmap")
+
+        st.divider()
+
+        # ── Distance-Third Breakdown ─────────────────────────────────────
+        st.markdown("### Lap Zone Performance")
+        st.caption("Lap split into three equal distance zones — shows where each driver excels.")
+        channel_options = {
+            "Speed (km/h)": ("speed_trace", "Speed (km/h)"),
+            "Throttle (%)": ("throttle_trace", "Throttle (%)"),
+            "Braking (0–1)": ("brake_trace", "Braking Intensity"),
+        }
+        sector_channel = st.selectbox(
+            "Channel",
+            list(channel_options.keys()),
+            key="sector_channel",
+        )
+        trace_col, y_label = channel_options[sector_channel]
+        zone_labels = ["Zone 1 (0–33%)", "Zone 2 (33–67%)", "Zone 3 (67–100%)"]
+        fig_sect = go.Figure()
+        for drv in selected:
+            try:
+                zone_vals = compute_sector_means(df_ext, drv, trace_col)
+                fig_sect.add_trace(go.Bar(
+                    name=drv,
+                    x=zone_labels,
+                    y=zone_vals,
+                    marker_color=color_map[drv],
+                ))
+            except Exception:
+                continue
+        fig_sect.update_layout(
+            barmode="group",
+            xaxis_title="Lap Zone",
+            yaxis_title=y_label,
+            legend_title="Driver",
+            height=360,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig_sect, width="stretch", key="tab1_sector_breakdown")
+
+        # ── Throttle Map on Track ────────────────────────────────────────
+        st.markdown("### Throttle Application Map")
+        st.caption("Track outline coloured by average throttle — green: full throttle, red: braking / coasting.")
+        try:
+            fig_tmap = _build_throttle_map_fig(df_ext, selected, color_map)
+            st.plotly_chart(fig_tmap, width="stretch", key="tab1_throttle_map")
+        except Exception as e:
+            st.info(f"Track map unavailable: {e}")
 
 # ================================================================
 # TAB 2 — Mystery Driver
