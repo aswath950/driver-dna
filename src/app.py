@@ -15,6 +15,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from typing import cast
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -59,6 +60,121 @@ FEATURE_LABELS = {
     "throttle_pickup_pct":  "Full Throttle %",
     "trail_brake_score":    "Trail Braking",
 }
+# ── Agentic AI rate limits ───────────────────────────────────────────────────
+_RA_RATE_LIMIT_SECS  = 10   # Reflexion Analyst
+_RAG_RATE_LIMIT_SECS = 10   # RAG DNA Matching
+_RC_RATE_LIMIT_SECS  = 10   # Structured Report Card
+
+# ── RAG: Historical F1 Driver Knowledge Base ─────────────────────────────────
+# 12-element vectors map to EXTENDED_RADAR_FEATURES order:
+# mean_speed, max_speed, min_speed, throttle_mean, throttle_std, throttle_pickup_pct,
+# brake_mean, brake_events, trail_brake_score, steer_std, gear_changes, coasting_pct
+_RAG_HISTORICAL_PROFILES: dict = {
+    "Michael Schumacher": {
+        "era": "1991–2012",
+        "description": (
+            "Seven-time champion defined by clinical trail braking, ultra-high brake pressure, "
+            "and extreme lap-to-lap consistency. Notoriously late on the brakes with massive "
+            "deceleration into corners."
+        ),
+        "vector": [0.85, 0.80, 0.55, 0.80, 0.35, 0.78, 0.90, 0.88, 0.85, 0.0, 0.78, 0.05],
+    },
+    "Ayrton Senna": {
+        "era": "1984–1994",
+        "description": (
+            "Three-time champion known for aggressive braking, exceptional car control under "
+            "trail-braking, and extremely high corner entry speed — he carried massive speed "
+            "through the apex."
+        ),
+        "vector": [0.80, 0.75, 0.90, 0.75, 0.65, 0.70, 0.85, 0.80, 0.80, 0.0, 0.75, 0.04],
+    },
+    "Alain Prost": {
+        "era": "1980–1993",
+        "description": (
+            "The Professor: maximised mechanical grip with smooth, low-variance inputs, minimal "
+            "tyre wear, very high throttle efficiency, and low coasting — economical and precise "
+            "rather than spectacular."
+        ),
+        "vector": [0.75, 0.70, 0.65, 0.85, 0.25, 0.88, 0.40, 0.45, 0.20, 0.0, 0.60, 0.08],
+    },
+    "Fernando Alonso": {
+        "era": "2001–present",
+        "description": (
+            "Two-time champion exceptionally smooth on throttle with very low variation, a high "
+            "coasting percentage in conservation phases, precise gear selection, and moderate "
+            "braking — the master of tyre management."
+        ),
+        "vector": [0.70, 0.65, 0.72, 0.72, 0.28, 0.68, 0.38, 0.42, 0.18, 0.0, 0.72, 0.55],
+    },
+    "Sebastian Vettel": {
+        "era": "2007–2022",
+        "description": (
+            "Four-time champion characterised by very high brake-event frequency with intense, "
+            "precise braking zones, clean throttle application, and an early-apex technique "
+            "that generated strong mechanical grip."
+        ),
+        "vector": [0.82, 0.78, 0.68, 0.76, 0.40, 0.74, 0.60, 0.85, 0.55, 0.0, 0.76, 0.07],
+    },
+    "Lewis Hamilton": {
+        "era": "2007–present",
+        "description": (
+            "Seven-time champion defined by smooth, low-variance throttle application, minimal "
+            "braking relative to the grid, very high corner speed, and exceptional lap-to-lap "
+            "consistency across race stints."
+        ),
+        "vector": [0.85, 0.80, 0.74, 0.75, 0.30, 0.72, 0.25, 0.38, 0.28, 0.0, 0.68, 0.06],
+    },
+    "Max Verstappen": {
+        "era": "2015–present",
+        "description": (
+            "Three-time champion who distinguishes himself with very late braking, high throttle "
+            "variation (aggressive on/off application), significant trail-braking into corners, "
+            "and high steering inputs at low-speed apexes."
+        ),
+        "vector": [0.88, 0.85, 0.72, 0.72, 0.78, 0.68, 0.45, 0.60, 0.55, 0.0, 0.70, 0.12],
+    },
+    "Kimi Räikkönen": {
+        "era": "2001–2021",
+        "description": (
+            "The Iceman: extremely low coasting fraction, smooth and consistent throttle delivery, "
+            "one of the highest full-throttle percentages on the grid, and an exceptionally clean "
+            "steering trace — relentless mechanical efficiency."
+        ),
+        "vector": [0.78, 0.72, 0.70, 0.80, 0.22, 0.85, 0.35, 0.40, 0.15, 0.0, 0.65, 0.04],
+    },
+    "Carlos Sainz": {
+        "era": "2015–present",
+        "description": (
+            "Known for aggressive throttle pickup and trail braking on entry, above-average brake "
+            "pressure relative to the grid, and a high gear-change rate reflecting his attacking, "
+            "high-commitment driving style."
+        ),
+        "vector": [0.76, 0.70, 0.75, 0.74, 0.55, 0.72, 0.65, 0.68, 0.62, 0.0, 0.72, 0.10],
+    },
+    "Nico Rosberg": {
+        "era": "2006–2016",
+        "description": (
+            "One-time champion characterised by clean, systematic driving with consistent lap "
+            "times, one of the highest full-throttle percentages on the grid, moderate coasting "
+            "in fuel-saving phases, and low brake pressure."
+        ),
+        "vector": [0.80, 0.75, 0.68, 0.82, 0.30, 0.82, 0.30, 0.42, 0.22, 0.0, 0.66, 0.14],
+    },
+}
+
+# ── Structured Report Card Schema ────────────────────────────────────────────
+# (type, min_constraint, max_constraint) — None means unconstrained
+_RC_SCHEMA: dict = {
+    "headline":           (str,  None, None),
+    "strengths":          (list, 3,    3),
+    "weaknesses":         (list, 2,    2),
+    "race_craft_rating":  (int,  1,    10),
+    "raw_pace_rating":    (int,  1,    10),
+    "consistency_rating": (int,  1,    10),
+    "tactical_tips":      (list, 2,    2),
+    "style_tags":         (list, 3,    5),
+}
+
 # Sidebar visibility toggle keys — order determines display order in the expander
 CHART_KEYS = {
     "Fastest Lap Telemetry": ("show_telemetry",      True),
@@ -100,6 +216,18 @@ STATE_DEFAULTS: dict = {
     "ca_messages": [],               # list[dict] — {role, content} history, capped at 20
     "ca_last_send_ts": 0.0,          # float — unix timestamp of last user message (rate limiting)
     "ca_session_cache_key": None,    # int|str|None — clears history when loaded session changes
+    # Tab 1 — Reflexion Analyst (ra_ prefix)
+    "ra_last_analyse_ts":  0.0,      # float — rate limit timestamp
+    "ra_result":           None,     # dict | None — {iterations, final_narrative}
+    "ra_analysed_driver":  None,     # str | None
+    # Tab 1 — RAG DNA Matching (rag_ prefix)
+    "rag_last_match_ts":   0.0,      # float — rate limit timestamp
+    "rag_result":          None,     # dict | None — {driver, matches, narrative}
+    "rag_analysed_driver": None,     # str | None
+    # Tab 1 — DNA Report Card (rc_ prefix)
+    "rc_last_report_ts":   0.0,      # float — rate limit timestamp
+    "rc_result":           None,     # dict | None — validated report card
+    "rc_analysed_driver":  None,     # str | None
 }
 
 st.set_page_config(page_title="Driver DNA Fingerprinter", layout="wide")
@@ -381,8 +509,8 @@ def _build_explain_prompt(
 def _call_openai_explainer(api_key: str, system_msg: str, user_msg: str) -> tuple:
     """Call GPT-4o-mini. Returns (text, None) on success or (None, error_msg) on failure.
     Raw exceptions are never surfaced to the UI."""
+    from openai import OpenAI, AuthenticationError, RateLimitError, APIError
     try:
-        from openai import OpenAI, AuthenticationError, RateLimitError, APIError
         client = OpenAI(api_key=api_key)
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -407,6 +535,480 @@ def _call_openai_explainer(api_key: str, system_msg: str, user_msg: str) -> tupl
         return None, "Unexpected error contacting OpenAI. Try again."
 
 
+def _call_openai_llm(
+    api_key: str,
+    system_msg: str,
+    user_msg: str,
+    max_tokens: int = 300,
+    temperature: float = 0.4,
+    json_mode: bool = False,
+) -> tuple:
+    """Flexible LLM helper used by the three agentic AI features.
+
+    Returns (text, None) on success or (None, error_msg) on failure.
+    Set json_mode=True to request response_format={"type": "json_object"}.
+    """
+    from openai import OpenAI, AuthenticationError, RateLimitError, APIError
+    try:
+        client = OpenAI(api_key=api_key)
+        kwargs: dict = dict(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        resp = client.chat.completions.create(**kwargs)
+        text = resp.choices[0].message.content
+        if not text:
+            return None, "OpenAI returned an empty response. Try again."
+        return text.strip(), None
+    except AuthenticationError:
+        return None, "OpenAI API key is invalid. Check `.streamlit/secrets.toml`."
+    except RateLimitError:
+        return None, "OpenAI rate limit reached. Wait a moment and try again."
+    except APIError as e:
+        return None, f"OpenAI service error ({type(e).__name__}). Try again shortly."
+    except Exception:
+        return None, "Unexpected error contacting OpenAI. Try again."
+
+
+# ── Reflexion Analyst helpers (ra_) ─────────────────────────────────────────
+
+def _ra_build_driver_data_block(
+    driver: str,
+    df_ext: pd.DataFrame,
+    ext_norm_means: pd.DataFrame,
+) -> str:
+    """Build a structured plain-text data block for LLM prompts."""
+    drv_df = df_ext[df_ext["driver"] == driver]
+    raw: pd.Series = drv_df[
+        ["mean_speed", "max_speed", "min_speed", "throttle_mean", "throttle_std",
+         "throttle_pickup_pct", "brake_mean", "brake_events", "trail_brake_score",
+         "gear_changes", "coasting_pct"]
+    ].mean()
+    try:
+        norm = ext_norm_means.loc[driver]
+        archetype, emoji = classify_archetype(norm.to_dict())
+    except KeyError:
+        archetype, emoji = "Unknown", "?"
+
+    lines = [
+        f"DRIVER: {driver}",
+        "--- Normalised radar profile (0 = lowest on grid, 1 = highest) ---",
+    ]
+    for feat in EXTENDED_RADAR_FEATURES:
+        label = FEATURE_LABELS.get(feat, feat)
+        try:
+            val = float(cast(float, ext_norm_means.loc[driver, feat]))
+        except Exception:
+            val = float("nan")
+        lines.append(f"  {label:<22} {val:.3f}")
+    lines += [
+        "--- Raw averages (real engineering units) ---",
+        f"  Mean Speed:         {raw.get('mean_speed', float('nan')):.1f} km/h",
+        f"  Max Speed:          {raw.get('max_speed', float('nan')):.1f} km/h",
+        f"  Min Speed:          {raw.get('min_speed', float('nan')):.1f} km/h",
+        f"  Throttle Input:     {raw.get('throttle_mean', float('nan')):.1f} %",
+        f"  Throttle Variation: {raw.get('throttle_std', float('nan')):.2f}",
+        f"  Full Throttle %:    {raw.get('throttle_pickup_pct', float('nan')):.4f} (fraction of lap)",
+        f"  Brake Pressure:     {raw.get('brake_mean', float('nan')):.3f}",
+        f"  Brake Events/lap:   {raw.get('brake_events', float('nan')):.1f}",
+        f"  Trail Brake Score:  {raw.get('trail_brake_score', float('nan')):.4f}",
+        f"  Gear Changes/lap:   {raw.get('gear_changes', float('nan')):.1f}",
+        f"  Coasting Fraction:  {raw.get('coasting_pct', float('nan')):.4f}",
+        f"--- Rule-engine archetype ---",
+        f"  {emoji} {archetype}",
+    ]
+    return "\n".join(lines)
+
+
+def _ra_parse_critique(raw_text: str) -> tuple:
+    """Parse critic JSON response. Returns (critique_dict, None) or (None, error)."""
+    try:
+        data = json.loads(raw_text)
+    except (json.JSONDecodeError, TypeError):
+        return None, "Critic returned non-JSON response."
+    if not isinstance(data, dict):
+        return None, "Critic response was not a JSON object."
+    try:
+        confidence = max(1, min(10, int(data.get("confidence", 10))))
+    except (TypeError, ValueError):
+        return None, "Critic 'confidence' field missing or invalid."
+    factual_errors = data.get("factual_errors", [])
+    improvements = data.get("suggested_improvements", [])
+    return {
+        "confidence": confidence,
+        "factual_errors": [str(e) for e in (factual_errors if isinstance(factual_errors, list) else [])[:5]],
+        "suggested_improvements": [str(s) for s in (improvements if isinstance(improvements, list) else [])[:3]],
+    }, None
+
+
+_RA_ANALYST_SYSTEM = (
+    "You are a professional F1 telemetry analyst. You will receive normalised radar data "
+    "(0 = lowest on the grid, 1 = highest) and real-unit averages for a single driver. "
+    "Write a driving style narrative in 4-6 sentences of fluent, confident prose suitable "
+    "for a motorsport audience.\n\n"
+    "Rules:\n"
+    "- Cite at least 3 specific numbers from the data (use the real-unit averages for readability).\n"
+    "- Anchor every claim to the provided numbers — do not speculate beyond the data.\n"
+    "- Structure: open with the defining characteristic, develop with 2-3 supporting traits, "
+    "close with a tactical implication.\n"
+    "- No bullet points, headers, or markdown. Plain prose only.\n"
+    "- Do not repeat the driver's name more than once."
+)
+
+_RA_CRITIC_SYSTEM = (
+    "You are a strict F1 data auditor. Evaluate a driving style narrative against the telemetry "
+    "data it was based on. Respond ONLY with valid JSON — no prose, no markdown, no code fences.\n\n"
+    "JSON schema (return exactly these keys):\n"
+    '{"confidence": <integer 1-10>, "factual_errors": [<string>, ...], '
+    '"suggested_improvements": [<string>, ...]}\n\n'
+    "Scoring guide for 'confidence': 10=all claims accurate; 7-9=minor omissions; "
+    "4-6=at least one claim contradicts data; 1-3=multiple factual errors.\n"
+    "'factual_errors': list each inaccurate claim with the correct number. Empty list if none.\n"
+    "'suggested_improvements': 1-3 concrete ways to strengthen or correct the narrative."
+)
+
+
+def _ra_run_reflexion(
+    driver: str,
+    data_block: str,
+    api_key: str,
+) -> tuple:
+    """Orchestrate the Reflexion self-critique loop.
+
+    Returns ({iterations, final_narrative}, None) or (None, error_msg).
+    Each iteration: {round_num, narrative, critique (dict | None)}.
+    """
+    _CONFIDENCE_THRESHOLD = 7
+
+    def analyst_call(user_msg: str) -> tuple:
+        return _call_openai_llm(api_key, _RA_ANALYST_SYSTEM, user_msg,
+                                max_tokens=400, temperature=0.4)
+
+    def critic_call(narrative: str) -> tuple:
+        user_msg = (
+            f"Evaluate this narrative against the telemetry data below.\n\n"
+            f"NARRATIVE:\n{narrative}\n\n"
+            f"TELEMETRY DATA:\n{data_block}\n\n"
+            "Respond with a JSON object only."
+        )
+        return _call_openai_llm(api_key, _RA_CRITIC_SYSTEM, user_msg,
+                                max_tokens=300, temperature=0.0)
+
+    iterations: list[dict] = []
+
+    # Round 1 — Analyst
+    user_r1 = (
+        f"Analyse the driving style of {driver} based on the following telemetry data:\n\n"
+        f"{data_block}\n\nWrite a 4-6 sentence driving style narrative."
+    )
+    narrative_1, err = analyst_call(user_r1)
+    if err:
+        return None, err
+    iter1: dict = {"round_num": 1, "narrative": narrative_1, "critique": None}
+
+    # Critique 1
+    raw_critique_1, _ = critic_call(narrative_1)
+    critique_1, parse_err = _ra_parse_critique(raw_critique_1 or "")
+    if parse_err or critique_1 is None:
+        # Critic failed — accept narrative as-is
+        iter1["critique"] = {"confidence": 10, "factual_errors": [], "suggested_improvements": [],
+                             "parse_note": "Critic response could not be parsed — narrative accepted."}
+        return {"iterations": [iter1], "final_narrative": narrative_1}, None
+    iter1["critique"] = critique_1
+    iterations.append(iter1)
+
+    if critique_1["confidence"] >= _CONFIDENCE_THRESHOLD:
+        return {"iterations": iterations, "final_narrative": narrative_1}, None
+
+    # Round 2 — Revision
+    errors_str = "\n".join(f"  - {e}" for e in critique_1["factual_errors"]) or "  (none)"
+    improve_str = "\n".join(f"  - {s}" for s in critique_1["suggested_improvements"]) or "  (none)"
+    user_r2 = (
+        f"Your previous narrative has been reviewed by a critic. Revise it to address the issues below.\n\n"
+        f"Original narrative:\n{narrative_1}\n\n"
+        f"Critic feedback:\n"
+        f"  Confidence score: {critique_1['confidence']}/10\n"
+        f"  Factual errors:\n{errors_str}\n"
+        f"  Suggested improvements:\n{improve_str}\n\n"
+        f"Current telemetry data:\n{data_block}\n\n"
+        "Write an improved 4-6 sentence narrative. Do not mention the critique process."
+    )
+    narrative_2, err2 = analyst_call(user_r2)
+    if err2:
+        # Return what we have with round 1 only
+        return {"iterations": iterations, "final_narrative": narrative_1}, None
+    iter2: dict = {"round_num": 2, "narrative": narrative_2, "critique": None}
+
+    # Critique 2
+    raw_critique_2, _ = critic_call(narrative_2)
+    critique_2, _ = _ra_parse_critique(raw_critique_2 or "")
+    iter2["critique"] = critique_2 or {"confidence": 10, "factual_errors": [], "suggested_improvements": []}
+    iterations.append(iter2)
+
+    return {"iterations": iterations, "final_narrative": narrative_2}, None
+
+
+# ── RAG DNA Matching helpers (rag_) ─────────────────────────────────────────
+
+def _rag_cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
+    """Cosine similarity in [0, 1]. Returns 0.0 if either vector is near-zero."""
+    norm_a = np.linalg.norm(vec_a)
+    norm_b = np.linalg.norm(vec_b)
+    if norm_a < 1e-9 or norm_b < 1e-9:
+        return 0.0
+    return float(np.dot(vec_a, vec_b) / (norm_a * norm_b))
+
+
+def _rag_retrieve_top_k(
+    driver_vector: np.ndarray,
+    profiles: dict,
+    k: int = 2,
+) -> list[dict]:
+    """Return top-k historical profiles sorted by cosine similarity descending."""
+    scores = []
+    for name, profile in profiles.items():
+        ref_vec = np.array(profile["vector"], dtype=float)
+        sim = _rag_cosine_similarity(driver_vector, ref_vec)
+        scores.append({
+            "name": name,
+            "similarity": sim,
+            "description": profile["description"],
+            "era": profile["era"],
+            "vector": ref_vec,
+        })
+    scores.sort(key=lambda x: x["similarity"], reverse=True)
+    return scores[:k]
+
+
+_RAG_SYSTEM = (
+    "You are an F1 driving style analyst. You will be given a current driver's 12-dimensional "
+    "radar profile and the two most stylistically similar historical F1 drivers, retrieved by "
+    "cosine similarity over normalised telemetry dimensions.\n\n"
+    "Write 4-6 sentences explaining WHY this driver's style resembles these two legends. "
+    "Be specific: reference at least 2 dimension values from the data.\n\n"
+    "Rules: No bullet points, headers, or markdown. Plain prose only. "
+    "Do not speculate beyond the provided numbers."
+)
+
+
+def _rag_run_dna_match(
+    driver: str,
+    driver_vector: np.ndarray,
+    api_key: str,
+) -> tuple:
+    """Retrieve top-2 historical matches and call LLM to narrate the comparison.
+
+    Returns ({driver, matches, narrative}, None) or (None, error_msg).
+    """
+    matches = _rag_retrieve_top_k(driver_vector, _RAG_HISTORICAL_PROFILES, k=2)
+
+    def _fmt_vector(vec: np.ndarray) -> str:
+        return "  ".join(
+            f"{FEATURE_LABELS.get(f, f)}: {vec[i]:.3f}"
+            for i, f in enumerate(EXTENDED_RADAR_FEATURES)
+        )
+
+    user_msg = (
+        f"CURRENT DRIVER: {driver}\n"
+        f"Radar vector (12 normalised dimensions, 0=lowest on grid, 1=highest):\n"
+        f"  {_fmt_vector(driver_vector)}\n\n"
+    )
+    for idx, match in enumerate(matches, 1):
+        user_msg += (
+            f"MOST SIMILAR HISTORICAL DRIVER #{idx}: {match['name']} ({match['era']})\n"
+            f"  Cosine Similarity: {match['similarity']:.4f}\n"
+            f"  Known style: {match['description']}\n"
+            f"  Reference radar: {_fmt_vector(match['vector'])}\n\n"
+        )
+    user_msg += (
+        f"Explain in 4-6 sentences why {driver}'s driving style is most similar to "
+        f"{matches[0]['name']} and {matches[1]['name']}. Reference the specific dimensions "
+        "that drove the similarity."
+    )
+
+    narrative, err = _call_openai_llm(api_key, _RAG_SYSTEM, user_msg,
+                                      max_tokens=350, temperature=0.4)
+    if err:
+        return None, err
+    return {"driver": driver, "matches": matches, "narrative": narrative}, None
+
+
+# ── Structured Report Card helpers (rc_) ────────────────────────────────────
+
+def _rc_validate_report(data: dict) -> tuple:
+    """Validate a parsed report card dict against _RC_SCHEMA.
+
+    Returns (True, "") on success or (False, reason) on failure.
+    Mutates data in-place to normalise types (int coercion, list trimming, HTML strip).
+    """
+    for key, (expected_type, lo, hi) in _RC_SCHEMA.items():
+        if key not in data:
+            return False, f"Missing required key: '{key}'"
+        val = data[key]
+
+        if expected_type == int:
+            try:
+                int_val = int(val)
+            except (TypeError, ValueError):
+                return False, f"Key '{key}' must be integer, got {type(val).__name__}"
+            if lo is not None and not (lo <= int_val <= hi):
+                return False, f"Key '{key}' value {int_val} outside range [{lo}, {hi}]"
+            data[key] = int_val
+
+        elif expected_type == list:
+            if not isinstance(val, list):
+                return False, f"Key '{key}' must be a list, got {type(val).__name__}"
+            if lo is not None and len(val) < lo:
+                return False, f"Key '{key}' has {len(val)} items, minimum is {lo}"
+            if hi is not None and len(val) > hi:
+                data[key] = val[:hi]
+            for i, item in enumerate(data[key]):
+                if not isinstance(item, str):
+                    return False, f"Key '{key}[{i}]' must be a string"
+                data[key][i] = item.replace("<", "").replace(">", "")
+
+        elif expected_type == str:
+            if not isinstance(val, str):
+                return False, f"Key '{key}' must be a string, got {type(val).__name__}"
+            data[key] = val.replace("<", "").replace(">", "")
+
+    return True, ""
+
+
+_RC_SYSTEM = (
+    "You are a senior F1 telemetry engineer producing a driver DNA report card. "
+    "You will receive normalised radar dimensions (0=lowest on grid, 1=highest) and "
+    "raw engineering averages for a single driver.\n\n"
+    "You MUST respond with a single valid JSON object that matches EXACTLY this schema "
+    "— no prose before or after, no markdown code fences:\n"
+    '{"headline": "<One sentence with a specific number>", '
+    '"strengths": ["<str with data ref>", "<str>", "<str>"], '
+    '"weaknesses": ["<str with data ref>", "<str>"], '
+    '"race_craft_rating": <int 1-10>, '
+    '"raw_pace_rating": <int 1-10>, '
+    '"consistency_rating": <int 1-10>, '
+    '"tactical_tips": ["<actionable tip>", "<actionable tip>"], '
+    '"style_tags": ["<tag>", "<tag>", "<tag>"]}\n\n'
+    "Constraints:\n"
+    "- headline: exactly 1 sentence, must include at least one number from the data.\n"
+    "- strengths: exactly 3 strings, each referencing a specific metric value.\n"
+    "- weaknesses: exactly 2 strings, each referencing a specific metric value.\n"
+    "- race_craft_rating: base on trail braking, brake precision, and steering consistency.\n"
+    "- raw_pace_rating: base on mean speed, max speed, and full throttle percentage.\n"
+    "- consistency_rating: base on lap-to-lap variability metrics provided.\n"
+    "- tactical_tips: exactly 2 actionable, data-grounded strings.\n"
+    "- style_tags: 3-5 short tag strings (e.g. 'Late Braker', 'Smooth Operator', 'High Entry Speed').\n"
+    "- All string values must be safe for direct display — no HTML or markdown."
+)
+
+
+def _rc_build_user_prompt(driver: str, df_ext: pd.DataFrame, ext_norm_means: pd.DataFrame) -> str:
+    """Build the user prompt for the report card LLM call."""
+    drv_df = df_ext[df_ext["driver"] == driver]
+    try:
+        norm = cast(pd.Series, ext_norm_means.loc[driver])
+    except KeyError:
+        norm = pd.Series({f: float("nan") for f in EXTENDED_RADAR_FEATURES})
+    raw: pd.Series = drv_df[EXTENDED_RADAR_FEATURES].mean()
+    variability: pd.Series = drv_df[RADAR_FEATURES].std(ddof=0)
+
+    def nv(feat: str) -> str:
+        try:
+            return f"{float(norm.get(feat, float('nan'))):.3f}"
+        except Exception:
+            return "n/a"
+
+    def rv(feat: str) -> str:
+        try:
+            return f"{float(raw.get(feat, float('nan'))):.3f}"
+        except Exception:
+            return "n/a"
+
+    try:
+        archetype, emoji = classify_archetype(norm.to_dict())
+    except Exception:
+        archetype, emoji = "Unknown", "?"
+
+    lines = [
+        f"Generate a DNA Report Card for driver: {driver}\n",
+        "NORMALISED RADAR (0 = lowest on grid, 1 = highest):",
+    ]
+    for feat in EXTENDED_RADAR_FEATURES:
+        lines.append(f"  {FEATURE_LABELS.get(feat, feat):<22} {nv(feat)}")
+    lines += [
+        "\nRAW AVERAGES:",
+        f"  Mean Speed: {rv('mean_speed')} km/h  |  Max Speed: {rv('max_speed')} km/h",
+        f"  Throttle Input: {rv('throttle_mean')} %  |  Throttle Variation: {rv('throttle_std')}",
+        f"  Full Throttle (fraction): {rv('throttle_pickup_pct')}",
+        f"  Brake Pressure: {rv('brake_mean')}  |  Brake Frequency: {rv('brake_events')} /lap",
+        f"  Trail Brake Score: {rv('trail_brake_score')}",
+        f"  Gear Changes/lap: {rv('gear_changes')}",
+        f"  Coasting Fraction: {rv('coasting_pct')}",
+        "\nLAP-TO-LAP VARIABILITY (std dev across laps — higher = less consistent):",
+    ]
+    for feat in RADAR_FEATURES:
+        try:
+            std_val = f"{float(variability.get(feat, float('nan'))):.3f}"
+        except Exception:
+            std_val = "n/a"
+        lines.append(f"  {FEATURE_LABELS.get(feat, feat):<22} {std_val}")
+    lines.append(f"\nRule-engine archetype: {emoji} {archetype}")
+    lines.append("\nRespond with the JSON object only.")
+    return "\n".join(lines)
+
+
+def _rc_run_report(
+    driver: str,
+    df_ext: pd.DataFrame,
+    ext_norm_means: pd.DataFrame,
+    api_key: str,
+) -> tuple:
+    """Call JSON-mode LLM, validate, retry once on failure.
+
+    Returns (validated_report_dict, None) or (None, error_msg).
+    """
+    user_msg = _rc_build_user_prompt(driver, df_ext, ext_norm_means)
+
+    # Attempt 1
+    raw_json, err = _call_openai_llm(api_key, _RC_SYSTEM, user_msg,
+                                     max_tokens=500, temperature=0.4, json_mode=True)
+    if err:
+        return None, err
+    try:
+        data = json.loads(raw_json)
+    except (json.JSONDecodeError, TypeError):
+        data = {}
+    valid, reason = _rc_validate_report(data)
+    if valid:
+        return data, None
+
+    # Attempt 2 — inject correction
+    correction_msg = (
+        user_msg
+        + f"\n\nYour previous response failed schema validation: {reason}\n"
+        "Fix the issue and respond with the corrected JSON object only."
+    )
+    raw_json2, err2 = _call_openai_llm(api_key, _RC_SYSTEM, correction_msg,
+                                       max_tokens=500, temperature=0.4, json_mode=True)
+    if err2:
+        return None, err2
+    try:
+        data2 = json.loads(raw_json2)
+    except (json.JSONDecodeError, TypeError):
+        return None, f"JSON parsing failed on retry. Original error: {reason}"
+    valid2, reason2 = _rc_validate_report(data2)
+    if valid2:
+        return data2, None
+    return None, f"Report validation failed after retry: {reason2}"
+
+
 def _call_openai_chat(api_key: str, messages: list, tools: list) -> tuple:
     """Call GPT-4o-mini with optional tool definitions for the chat agent.
 
@@ -415,8 +1017,8 @@ def _call_openai_chat(api_key: str, messages: list, tools: list) -> tuple:
       ("tool_calls", tool_calls_list, None)  — LLM wants to invoke tools
       (None,         None,            error) — API failure
     """
+    from openai import OpenAI, AuthenticationError, RateLimitError, APIError
     try:
-        from openai import OpenAI, AuthenticationError, RateLimitError, APIError
         client = OpenAI(api_key=api_key)
         if tools:
             resp = client.chat.completions.create(
@@ -838,9 +1440,20 @@ def _render_chat_panel(analyser, driver_map: dict, session_cache_key) -> None:
         with st.chat_message(msg["role"]):
             st.text(msg["content"])
 
-    user_input = st.chat_input("Ask a question about the race...", key="ca_input")
+    # Use an inline form so the input stays inside the tab (st.chat_input floats
+    # to the bottom of the entire page and bleeds into other tabs)
+    with st.form("ca_chat_form", clear_on_submit=True):
+        _col_input, _col_btn = st.columns([8, 1])
+        with _col_input:
+            user_input = st.text_input(
+                "Ask a question about the race…",
+                label_visibility="collapsed",
+                placeholder="Ask a question about the race…",
+            )
+        with _col_btn:
+            _submitted = st.form_submit_button("Send")
 
-    if user_input:
+    if _submitted and user_input:
         # Guardrail 0 — sanitize input
         user_input, input_err = _ca_sanitize_input(user_input)
         if input_err:
@@ -1043,6 +1656,277 @@ with tab1:
         ext_norm_df["driver"] = df_ext["driver"].values
         ext_driver_means = ext_norm_df.groupby("driver")[EXTENDED_RADAR_FEATURES].mean()
 
+        # ============================================================
+        # AGENTIC AI FEATURES
+        # ============================================================
+        _api_key = _get_openai_api_key()
+
+        # ── Feature A: Reflexion Loop — Driver Style Analyst ────────
+        st.divider()
+        st.markdown("## AI Driver Style Analyst")
+        st.caption(
+            "**Reflexion pattern** (Shinn et al. 2023): an Analyst LLM generates a driving "
+            "style narrative → a Critic LLM evaluates it and returns a confidence score + "
+            "critique in JSON → if confidence < 7/10 the Analyst revises using the critique "
+            "as context. Max 2 rounds."
+        )
+
+        ra_driver = st.selectbox(
+            "Analyse a single driver",
+            options=selected,
+            key="ra_driver_select",
+        )
+        st.caption("Select one of the drivers currently shown in the radar above.")
+
+        if _api_key is None:
+            st.info("Add an OpenAI API key to `.streamlit/secrets.toml` to enable this feature.")
+        else:
+            _elapsed_ra = time.time() - st.session_state["ra_last_analyse_ts"]
+            _cooldown_ra = max(0.0, _RA_RATE_LIMIT_SECS - _elapsed_ra)
+            _btn_label_ra = (
+                f"Analyse Driving Style (wait {_cooldown_ra:.0f}s)"
+                if _cooldown_ra > 0
+                else "Analyse Driving Style"
+            )
+            if st.button(_btn_label_ra, key="ra_analyse_btn", disabled=_cooldown_ra > 0):
+                st.session_state["ra_last_analyse_ts"] = time.time()
+                st.session_state["ra_result"] = None
+                st.session_state["ra_analysed_driver"] = ra_driver
+                if ra_driver is not None:
+                    try:
+                        _data_block = _ra_build_driver_data_block(ra_driver, df_ext, ext_driver_means)
+                        with st.spinner("Running Reflexion loop — Analyst → Critic → (optional) Revision…"):
+                            _ra_result, _ra_err = _ra_run_reflexion(ra_driver, _data_block, _api_key)
+                        if _ra_err:
+                            st.error(f"Reflexion error: {_ra_err}")
+                        else:
+                            st.session_state["ra_result"] = _ra_result
+                    except Exception as _ra_exc:
+                        st.error(f"Unexpected error: {_ra_exc}")
+
+            # Render cached result
+            if (
+                st.session_state["ra_result"] is not None
+                and st.session_state["ra_analysed_driver"] == ra_driver
+            ):
+                _ra_res = st.session_state["ra_result"]
+                for _iter in _ra_res["iterations"]:
+                    _rn = _iter["round_num"]
+                    _label = (
+                        f"Round {_rn} — Initial Draft"
+                        if _rn == 1
+                        else f"Round {_rn} — Revised Narrative"
+                    )
+                    _is_last = _rn == _ra_res["iterations"][-1]["round_num"]
+                    with st.expander(_label, expanded=_is_last):
+                        st.write(_iter["narrative"])
+                        if _iter.get("critique"):
+                            _crit = _iter["critique"]
+                            _conf = _crit.get("confidence", 10)
+                            _c1, _c2 = st.columns([1, 3])
+                            _c1.metric("Critic Confidence", f"{_conf}/10")
+                            if _conf < 7:
+                                _c2.warning("Confidence below 7/10 — Analyst will revise.")
+                            else:
+                                _c2.success("Confidence meets threshold — narrative accepted.")
+                            if _crit.get("factual_errors"):
+                                st.markdown("**Factual errors flagged:**")
+                                for _fe in _crit["factual_errors"]:
+                                    st.markdown(f"- {_fe}")
+                            if _crit.get("suggested_improvements"):
+                                st.markdown("**Suggested improvements:**")
+                                for _si in _crit["suggested_improvements"]:
+                                    st.markdown(f"- {_si}")
+                            if _crit.get("parse_note"):
+                                st.caption(_crit["parse_note"])
+                st.success(_ra_res["final_narrative"])
+
+        # ── Feature B: RAG DNA Matching ──────────────────────────────
+        st.divider()
+        st.markdown("## Historical Driver DNA Matching")
+        st.caption(
+            "**RAG pattern**: the driver's 12-dimensional normalised radar vector is compared to "
+            "10 legendary F1 drivers by cosine similarity. The top-2 most stylistically similar "
+            "historical profiles are retrieved and used to augment the LLM explanation."
+        )
+
+        rag_driver = st.selectbox(
+            "Match a driver to F1 legends",
+            options=selected,
+            key="rag_driver_select",
+        )
+        st.caption("Select one of the drivers currently shown in the radar above.")
+
+        if _api_key is None:
+            st.info("Add an OpenAI API key to `.streamlit/secrets.toml` to enable this feature.")
+        else:
+            _elapsed_rag = time.time() - st.session_state["rag_last_match_ts"]
+            _cooldown_rag = max(0.0, _RAG_RATE_LIMIT_SECS - _elapsed_rag)
+            _btn_label_rag = (
+                f"Find DNA Match (wait {_cooldown_rag:.0f}s)"
+                if _cooldown_rag > 0
+                else "Find DNA Match"
+            )
+            if st.button(_btn_label_rag, key="rag_match_btn", disabled=_cooldown_rag > 0):
+                st.session_state["rag_last_match_ts"] = time.time()
+                st.session_state["rag_result"] = None
+                st.session_state["rag_analysed_driver"] = rag_driver
+                if rag_driver is not None:
+                    try:
+                        _drv_series = cast(pd.Series, ext_driver_means.loc[rag_driver])
+                        _drv_vec = np.array(_drv_series, dtype=float)
+                        with st.spinner("Computing cosine similarity and generating narrative…"):
+                            _rag_result, _rag_err = _rag_run_dna_match(rag_driver, _drv_vec, _api_key)
+                        if _rag_err:
+                            st.error(f"DNA match error: {_rag_err}")
+                        else:
+                            st.session_state["rag_result"] = _rag_result
+                    except KeyError:
+                        st.warning(f"Extended features unavailable for {rag_driver}.")
+                    except Exception as _rag_exc:
+                        st.error(f"Unexpected error: {_rag_exc}")
+
+            # Render cached result
+            if (
+                st.session_state["rag_result"] is not None
+                and st.session_state["rag_analysed_driver"] == rag_driver
+            ):
+                _rag_res = st.session_state["rag_result"]
+                # Full similarity bar chart (all 10 historical drivers)
+                try:
+                    _drv_vec_render = ext_driver_means.loc[rag_driver].to_numpy(dtype=float)
+                    _all_scores = _rag_retrieve_top_k(_drv_vec_render, _RAG_HISTORICAL_PROFILES, k=10)
+                    _top2_names = {m["name"] for m in _rag_res["matches"]}
+                    _bar_colors = [
+                        "#f1c40f" if s["name"] in _top2_names else "#555555"
+                        for s in reversed(_all_scores)
+                    ]
+                    _fig_sim = go.Figure(go.Bar(
+                        x=[s["similarity"] for s in reversed(_all_scores)],
+                        y=[s["name"] for s in reversed(_all_scores)],
+                        orientation="h",
+                        marker_color=_bar_colors,
+                        hovertemplate="%{y}<br>Similarity: %{x:.4f}<extra></extra>",
+                    ))
+                    _fig_sim.update_layout(
+                        title=f"Cosine Similarity to Historical F1 Drivers — {rag_driver}",
+                        xaxis=dict(range=[0.80, 1.0], title="Cosine Similarity"),
+                        yaxis_title="",
+                        height=380,
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                    )
+                    st.plotly_chart(_fig_sim, width="stretch", key="tab1_rag_similarity_bar")
+                except Exception:
+                    pass
+
+                # Top-2 match cards
+                _match_cols = st.columns(2)
+                for _ci, _match in enumerate(_rag_res["matches"]):
+                    with _match_cols[_ci]:
+                        st.metric(
+                            label=f"#{_ci + 1} DNA Match",
+                            value=_match["name"],
+                            delta=f"Similarity: {_match['similarity']:.1%}",
+                        )
+                        st.caption(f"Era: {_match['era']}")
+                        st.write(_match["description"])
+
+                st.markdown("#### Why the DNA aligns")
+                st.info(_rag_res["narrative"])
+
+        # ── Feature C: Structured Output Report Card ─────────────────
+        st.divider()
+        st.markdown("## Driver DNA Report Card")
+        st.caption(
+            "**Structured output pattern**: GPT-4o-mini is called in JSON mode "
+            "(`response_format={\"type\": \"json_object\"}`). The schema is enforced via "
+            "prompt engineering and validated in Python. If validation fails, the prompt "
+            "is retried once with the specific error injected."
+        )
+
+        rc_driver = st.selectbox(
+            "Generate a report card for",
+            options=selected,
+            key="rc_driver_select",
+        )
+        st.caption("Select one of the drivers currently shown in the radar above.")
+
+        if _api_key is None:
+            st.info("Add an OpenAI API key to `.streamlit/secrets.toml` to enable this feature.")
+        else:
+            _elapsed_rc = time.time() - st.session_state["rc_last_report_ts"]
+            _cooldown_rc = max(0.0, _RC_RATE_LIMIT_SECS - _elapsed_rc)
+            _btn_label_rc = (
+                f"Generate DNA Report (wait {_cooldown_rc:.0f}s)"
+                if _cooldown_rc > 0
+                else "Generate DNA Report"
+            )
+            if st.button(_btn_label_rc, key="rc_report_btn", disabled=_cooldown_rc > 0):
+                st.session_state["rc_last_report_ts"] = time.time()
+                st.session_state["rc_result"] = None
+                st.session_state["rc_analysed_driver"] = rc_driver
+                if rc_driver is not None:
+                    with st.spinner("Generating structured report card (JSON mode)…"):
+                        _rc_result, _rc_err = _rc_run_report(rc_driver, df_ext, ext_driver_means, _api_key)
+                    if _rc_err:
+                        st.error(f"Report card error: {_rc_err}")
+                    else:
+                        st.session_state["rc_result"] = _rc_result
+
+            # Render cached result
+            if (
+                st.session_state["rc_result"] is not None
+                and st.session_state["rc_analysed_driver"] == rc_driver
+            ):
+                _report = st.session_state["rc_result"]
+
+                # Headline
+                st.markdown(f"### {_report['headline']}")
+
+                # Style tags (pill badges)
+                _tag_html = " ".join(
+                    f'<span style="background:#2d2d50;border:1px solid #555;border-radius:12px;'
+                    f'padding:3px 10px;font-size:0.85em;color:#ccc;margin:2px">{tag}</span>'
+                    for tag in _report.get("style_tags", [])
+                )
+                st.markdown(_tag_html, unsafe_allow_html=True)
+                st.markdown("")
+
+                # Rating bars
+                _r1, _r2, _r3 = st.columns(3)
+                for _rcol, (_rlabel, _rkey) in zip(
+                    [_r1, _r2, _r3],
+                    [("Race Craft", "race_craft_rating"),
+                     ("Raw Pace",   "raw_pace_rating"),
+                     ("Consistency","consistency_rating")],
+                ):
+                    _rval = _report.get(_rkey, 0)
+                    _rcol.metric(_rlabel, f"{_rval}/10")
+                    _rcol.progress(_rval / 10)
+
+                st.divider()
+
+                # Strengths & Weaknesses
+                _sw1, _sw2 = st.columns(2)
+                with _sw1:
+                    st.markdown("**Strengths**")
+                    for _s in _report.get("strengths", []):
+                        st.markdown(f"- {_s}")
+                with _sw2:
+                    st.markdown("**Weaknesses**")
+                    for _w in _report.get("weaknesses", []):
+                        st.markdown(f"- {_w}")
+
+                st.divider()
+
+                # Tactical tips
+                st.markdown("**Tactical Tips**")
+                for _tip in _report.get("tactical_tips", []):
+                    st.info(_tip)
+
+        st.divider()
+
         arch_cols = st.columns(len(selected))
         for col_idx, drv in enumerate(selected):
             norm_vals = ext_driver_means.loc[drv].to_dict()
@@ -1172,6 +2056,83 @@ with tab1:
 with tab2:
     st.subheader("Can the model identify the driver?")
 
+    # ── AI Explanation (top of tab — shown once a prediction exists) ─
+    _RATE_LIMIT_SECS = 10
+
+    if st.session_state.get("md_prediction_ready"):
+        api_key = _get_openai_api_key()
+
+        if api_key is None:
+            st.warning(
+                "OpenAI API key not configured. To enable AI explanations:\n\n"
+                "1. Open `.streamlit/secrets.toml`\n"
+                "2. Replace the placeholder with your real key:\n"
+                "```toml\n[openai]\napi_key = \"sk-proj-...\"\n```\n"
+                "3. Restart the app."
+            )
+        else:
+            elapsed = time.time() - st.session_state.get("md_last_explain_ts", 0.0)
+            cooldown = max(0.0, _RATE_LIMIT_SECS - elapsed)
+            btn_label = (
+                f"✨ Ask AI to Explain (wait {cooldown:.0f}s)"
+                if cooldown > 0
+                else "✨ Ask AI to Explain"
+            )
+
+            if st.button(btn_label, key="explain_btn", disabled=cooldown > 0):
+                _pred_driver    = st.session_state["_md_pred_driver"]
+                _confidence     = st.session_state["_md_confidence"]
+                _X_input        = st.session_state["_md_X_input"]
+                _pred_class_idx = st.session_state["_md_pred_class_idx"]
+
+                lap_features = {
+                    feat: float(_X_input[0, i])
+                    for i, feat in enumerate(FEATURE_COLS)
+                }
+
+                valid, reason = _validate_feature_values(lap_features)
+                if not valid:
+                    st.error(f"Input validation failed: {reason}")
+                else:
+                    try:
+                        safe_driver = _sanitize_driver_name(_pred_driver, list(le.classes_))
+                    except ValueError as exc:
+                        st.error(str(exc))
+                        safe_driver = None
+
+                    if safe_driver is not None:
+                        with st.spinner("Asking the AI to explain this prediction..."):
+                            shap_vals = compute_shap_for_prediction(
+                                shap_explainer, _X_input, _pred_class_idx
+                            )
+                            shap_dict = {
+                                feat: float(shap_vals[i])
+                                for i, feat in enumerate(FEATURE_COLS)
+                            }
+                            percentile_dict = {
+                                feat: float(
+                                    (df[feat].dropna() <= lap_features[feat]).mean() * 100
+                                )
+                                for feat in FEATURE_COLS
+                            }
+                            system_msg, user_msg = _build_explain_prompt(
+                                safe_driver, _confidence,
+                                lap_features, shap_dict, percentile_dict,
+                            )
+                            explanation, err = _call_openai_explainer(
+                                api_key, system_msg, user_msg
+                            )
+                            if err:
+                                st.error(err)
+                            else:
+                                st.session_state["md_explanation"] = explanation
+                        st.session_state["md_last_explain_ts"] = time.time()
+
+    if st.session_state.get("md_explanation"):
+        st.info(st.session_state["md_explanation"])
+
+    st.divider()
+
     _meta = get_dataset_meta()
     if _meta:
         _col1, _col2, _col3 = st.columns(3)
@@ -1244,89 +2205,6 @@ with tab2:
         st.session_state["_md_X_input"] = X_input
         st.session_state["_md_pred_class_idx"] = pred_class_idx
 
-    # ── Explain button — only visible after a prediction has been made ──────
-    _RATE_LIMIT_SECS = 10
-
-    if st.session_state.get("md_prediction_ready"):
-        api_key = _get_openai_api_key()
-
-        if api_key is None:
-            st.warning(
-                "OpenAI API key not configured. To enable AI explanations:\n\n"
-                "1. Open `.streamlit/secrets.toml`\n"
-                "2. Replace the placeholder with your real key:\n"
-                "```toml\n[openai]\napi_key = \"sk-proj-...\"\n```\n"
-                "3. Restart the app."
-            )
-        else:
-            elapsed = time.time() - st.session_state.get("md_last_explain_ts", 0.0)
-            cooldown = max(0.0, _RATE_LIMIT_SECS - elapsed)
-            btn_label = (
-                f"✨ Ask AI to Explain (wait {cooldown:.0f}s)"
-                if cooldown > 0
-                else "✨ Ask AI to Explain"
-            )
-
-            if st.button(btn_label, key="explain_btn", disabled=cooldown > 0):
-                _pred_driver    = st.session_state["_md_pred_driver"]
-                _confidence     = st.session_state["_md_confidence"]
-                _X_input        = st.session_state["_md_X_input"]
-                _pred_class_idx = st.session_state["_md_pred_class_idx"]
-
-                lap_features = {
-                    feat: float(_X_input[0, i])
-                    for i, feat in enumerate(FEATURE_COLS)
-                }
-
-                # Guardrail 1 — validate feature values are finite and in-bounds
-                valid, reason = _validate_feature_values(lap_features)
-                if not valid:
-                    st.error(f"Input validation failed: {reason}")
-                else:
-                    # Guardrail 2 — sanitize driver name before prompt interpolation
-                    try:
-                        safe_driver = _sanitize_driver_name(_pred_driver, list(le.classes_))
-                    except ValueError as exc:
-                        st.error(str(exc))
-                        safe_driver = None
-
-                    if safe_driver is not None:
-                        with st.spinner("Asking the AI to explain this prediction..."):
-                            # Compute SHAP values for this single sample
-                            shap_vals = compute_shap_for_prediction(
-                                shap_explainer, _X_input, _pred_class_idx
-                            )
-                            shap_dict = {
-                                feat: float(shap_vals[i])
-                                for i, feat in enumerate(FEATURE_COLS)
-                            }
-
-                            # Percentile rank of this lap vs the full dataset
-                            percentile_dict = {
-                                feat: float(
-                                    (df[feat].dropna() <= lap_features[feat]).mean() * 100
-                                )
-                                for feat in FEATURE_COLS
-                            }
-
-                            system_msg, user_msg = _build_explain_prompt(
-                                safe_driver, _confidence,
-                                lap_features, shap_dict, percentile_dict,
-                            )
-                            explanation, err = _call_openai_explainer(
-                                api_key, system_msg, user_msg
-                            )
-
-                            if err:
-                                st.error(err)
-                            else:
-                                st.session_state["md_explanation"] = explanation
-
-                        st.session_state["md_last_explain_ts"] = time.time()
-
-    # Display cached explanation — persists across reruns without re-calling the API
-    if st.session_state.get("md_explanation"):
-        st.info(st.session_state["md_explanation"])
 
 # ================================================================
 # TAB 4 — Race Pace Dashboard
@@ -1553,8 +2431,8 @@ def _build_track_map_fig(
     # Grey background track (full circuit, behind the coloured segments)
     fig.add_trace(go.Scatter(
         x=x_fine, y=y_fine,
-        mode="lines",
-        line=dict(color="rgba(120,120,120,0.25)", width=10),
+        mode="markers",
+        marker=dict(color="rgba(120,120,120,0.25)", size=8, symbol="circle"),
         showlegend=False,
         hoverinfo="skip",
     ))
@@ -1574,8 +2452,8 @@ def _build_track_map_fig(
         label = acronym_a if w == "a" else acronym_b
         fig.add_trace(go.Scatter(
             x=seg_x, y=seg_y,
-            mode="lines",
-            line=dict(color=col, width=5),
+            mode="markers",
+            marker=dict(color=col, size=7, symbol="circle"),
             name=label,
             showlegend=not legend_added[w],
             legendgroup=w,
@@ -2271,6 +3149,12 @@ with tab3:
             _analyser = st.session_state["rp_hist_analyser"]
             _dmap = st.session_state["rp_hist_driver_map"]
             _all_drvs = sorted(_analyser._clean["driver_number"].dropna().unique().tolist())
+
+            # ── Race Intelligence Chat Agent (top of dashboard) ──────
+            _hist_cache_key = st.session_state.get("rp_hist_session_key")
+            if _hist_cache_key is not None:
+                _render_chat_panel(_analyser, _dmap, session_cache_key=_hist_cache_key)
+
             # ---- Fastest Lap Telemetry Comparison ------------------
             if st.session_state.get("show_telemetry", True):
                 st.markdown("### Fastest Lap Telemetry Comparison")
@@ -2398,10 +3282,6 @@ with tab3:
                 team_colour_map=st.session_state.get("rp_hist_team_colour_map"),
             )
 
-            # ── Race Intelligence Chat Agent ─────────────────────────
-            _hist_cache_key = st.session_state.get("rp_hist_session_key")
-            if _hist_cache_key is not None:
-                _render_chat_panel(_analyser, _dmap, session_cache_key=_hist_cache_key)
 
     else:
         # ---- LIVE MODE ----
@@ -2470,7 +3350,10 @@ with tab3:
                     analyser = RaceAnalyser(laps, stints, position)
                     _live_dmap = st.session_state["rp_live_driver_map"]
                     _all_drvs = sorted(analyser._clean["driver_number"].dropna().unique().tolist())
-    
+
+                    # ── Race Intelligence Chat Agent (top of dashboard) ─
+                    _render_chat_panel(analyser, _live_dmap, session_cache_key="live")
+
                     # ---- Fastest Lap Telemetry Comparison (live) -------
                     if st.session_state.get("show_telemetry", True):
                         st.markdown("### Fastest Lap Telemetry Comparison")
@@ -2596,8 +3479,6 @@ with tab3:
                             selected_drivers=_selected or _all_drvs,
                             team_colour_map=st.session_state.get("rp_live_team_colour_map"),
                         )
-                    # ── Race Intelligence Chat Agent ──────────────────
-                    _render_chat_panel(analyser, _live_dmap, session_cache_key="live")
             except Exception as exc:
                 st.warning(f"Live refresh failed: {exc}")
     
