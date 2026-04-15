@@ -32,6 +32,7 @@ from race_engine import RaceAnalyser
 DATASET_PATH = DATA_DIR / "dataset.parquet"
 CIRCUITS_PATH = DATA_DIR / "circuits.json"
 ACCURACY_PATH = MODELS_DIR / "accuracy.txt"
+METRICS_PATH  = MODELS_DIR / "metrics.json"
 DATASET_META_PATH = DATA_DIR / "dataset_meta.json"
 N_POINTS = 200
 TRACE_COLS = {"Speed": "speed_trace", "Throttle": "throttle_trace", "Brake": "brake_trace"}
@@ -162,6 +163,309 @@ _RAG_HISTORICAL_PROFILES: dict = {
     },
 }
 
+# ── Real-world driver context for Report Card calibration ────────────────────
+# Keys must match 3-letter driver codes used in the dataset (df["driver"].unique()).
+# When a driver is found here, _rc_build_user_prompt appends this block so the LLM
+# can reconcile telemetry statistics with the driver's actual career standing.
+_RC_DRIVER_CONTEXT: dict[str, dict] = {
+    "LEC": {
+        "full_name": "Charles Leclerc",
+        "team": "Ferrari",
+        "championships": 0,
+        "wins": 8,
+        "poles": 25,
+        "career_seasons": "2018–present",
+        "known_strengths": [
+            "Elite one-lap qualifying pace — consistently extracts maximum from the car",
+            "Exceptional trail braking and late-apex entry — one of the best on sector-1 type circuits",
+            "High-risk, high-reward racecraft — renowned for aggressive wheel-to-wheel overtaking",
+        ],
+        "known_weaknesses": [
+            "Race management under tyre pressure occasionally inconsistent",
+            "Pushes beyond grip limits, which can lead to errors when chasing performance",
+        ],
+        "context_note": (
+            "Leclerc is regarded as one of the fastest drivers on the current grid. "
+            "His telemetry often shows high variance because he exploits the limit aggressively; "
+            "this should be interpreted as attacking style, not inconsistency."
+        ),
+    },
+    "VER": {
+        "full_name": "Max Verstappen",
+        "team": "Red Bull Racing",
+        "championships": 4,
+        "wins": 63,
+        "poles": 40,
+        "career_seasons": "2015–present",
+        "known_strengths": [
+            "Dominant race pace and tyre management over long stints",
+            "Fearless overtaking and exceptional wet-weather performance",
+            "Exceptional car-setup intuition and racecraft under pressure",
+        ],
+        "known_weaknesses": [
+            "Historically aggressive wheel-to-wheel, leading to early-career penalties",
+        ],
+        "context_note": (
+            "Verstappen is the reigning four-time world champion and widely regarded as the best "
+            "driver of his generation. High telemetry variability reflects offensive driving, not poor consistency."
+        ),
+    },
+    "HAM": {
+        "full_name": "Lewis Hamilton",
+        "team": "Ferrari (from 2025)",
+        "championships": 7,
+        "wins": 104,
+        "poles": 104,
+        "career_seasons": "2007–present",
+        "known_strengths": [
+            "Supreme tyre conservation — can manage degradation better than almost any driver",
+            "Exceptional racecraft and strategic awareness over grand prix distance",
+            "Consistent qualifying and race pace across all circuit types",
+        ],
+        "known_weaknesses": [
+            "Recent seasons showed reduced peak pace relative to his dominant years",
+        ],
+        "context_note": (
+            "Hamilton holds the all-time records for wins and poles. "
+            "His smooth telemetry profile reflects deliberate tyre management, not lack of aggression."
+        ),
+    },
+    "NOR": {
+        "full_name": "Lando Norris",
+        "team": "McLaren",
+        "championships": 0,
+        "wins": 4,
+        "poles": 8,
+        "career_seasons": "2019–present",
+        "known_strengths": [
+            "Strong one-lap qualifying pace — regularly beats teammates and top-four rivals",
+            "Excellent tyre management and racecraft over grand prix distance",
+            "Aggressive but controlled braking style with strong trail-braking technique",
+        ],
+        "known_weaknesses": [
+            "Historically found it difficult to convert pace into wins under pressure, though significantly improved in 2024",
+        ],
+        "context_note": (
+            "Norris is considered among the top three drivers on the current grid. "
+            "His 2024 season showed consistent podium-level pace across the full calendar."
+        ),
+    },
+    "SAI": {
+        "full_name": "Carlos Sainz",
+        "team": "Williams (from 2025)",
+        "championships": 0,
+        "wins": 4,
+        "poles": 6,
+        "career_seasons": "2015–present",
+        "known_strengths": [
+            "Extremely consistent race-day performer — rarely makes unforced errors",
+            "Strong tyre management and strategic racecraft over long stints",
+            "Smooth, calculated driving style with exceptional repeatability",
+        ],
+        "known_weaknesses": [
+            "One-lap qualifying pace occasionally a fraction below the absolute elite",
+        ],
+        "context_note": (
+            "Sainz is regarded as one of the most complete and consistent drivers on the grid. "
+            "Low telemetry variability is a genuine strength for him, reflecting precision driving."
+        ),
+    },
+    "RUS": {
+        "full_name": "George Russell",
+        "team": "Mercedes",
+        "championships": 0,
+        "wins": 3,
+        "poles": 4,
+        "career_seasons": "2019–present",
+        "known_strengths": [
+            "Exceptional qualifying pace and one-lap speed — frequently outqualifies faster cars",
+            "Strong tyre management, particularly in difficult conditions",
+            "Clinical racecraft and composed race management",
+        ],
+        "known_weaknesses": [
+            "Race pace occasionally slightly below absolute elite when the car is not at peak",
+        ],
+        "context_note": (
+            "Russell is widely regarded as a top-tier talent and Mercedes' long-term leader. "
+            "His structured, precise driving style means low telemetry variability is a positive trait."
+        ),
+    },
+    "PIA": {
+        "full_name": "Oscar Piastri",
+        "team": "McLaren",
+        "championships": 0,
+        "wins": 3,
+        "poles": 2,
+        "career_seasons": "2023–present",
+        "known_strengths": [
+            "Exceptionally smooth and precise driving style — outstanding natural tyre management",
+            "Strong race pace that frequently exceeds qualifying position",
+            "Composed racecraft under pressure despite limited F1 experience",
+        ],
+        "known_weaknesses": [
+            "Still accumulating experience in wheel-to-wheel battles at the front of the grid",
+        ],
+        "context_note": (
+            "Piastri is considered one of the most naturally talented drivers of his generation. "
+            "His smooth telemetry profile is a hallmark of his style, not a weakness."
+        ),
+    },
+    "ALO": {
+        "full_name": "Fernando Alonso",
+        "team": "Aston Martin",
+        "championships": 2,
+        "wins": 32,
+        "poles": 22,
+        "career_seasons": "2001–present",
+        "known_strengths": [
+            "Legendary racecraft and strategic intelligence — widely regarded as the smartest race driver ever",
+            "Consistent top-10 delivery from sub-par machinery across multiple decades",
+            "Exceptional adaptability and tyre conservation",
+        ],
+        "known_weaknesses": [
+            "One-lap pace has diminished slightly with age compared to his dominant years",
+        ],
+        "context_note": (
+            "Alonso is a two-time world champion widely considered among the greatest drivers of all time. "
+            "His telemetry variability often reflects calculated risk-taking, not inconsistency."
+        ),
+    },
+    "PER": {
+        "full_name": "Sergio Perez",
+        "team": "Red Bull Racing",
+        "championships": 0,
+        "wins": 13,
+        "poles": 3,
+        "career_seasons": "2011–present",
+        "known_strengths": [
+            "Elite tyre management — one of the best in the field at extending stints",
+            "Excellent race pace over long runs with minimal degradation",
+            "Strong undercut and overcut execution from the pitwall perspective",
+        ],
+        "known_weaknesses": [
+            "One-lap qualifying pace significantly below elite teammates",
+            "Inconsistent in changeable or wet conditions",
+        ],
+        "context_note": (
+            "Perez is a race-pace specialist whose value lies in tyre management and strategy, not raw speed. "
+            "His relatively smooth telemetry reflects deliberate tyre preservation, a genuine strength."
+        ),
+    },
+    "STR": {
+        "full_name": "Lance Stroll",
+        "team": "Aston Martin",
+        "championships": 0,
+        "wins": 0,
+        "poles": 1,
+        "career_seasons": "2017–present",
+        "known_strengths": [
+            "Strong wet-weather pace — performed well above expectations in rain",
+            "Good racecraft over long stints with tyre management",
+        ],
+        "known_weaknesses": [
+            "Qualifying pace and one-lap speed consistently below top-10 benchmark",
+            "Error-prone in high-pressure situations",
+        ],
+        "context_note": (
+            "Stroll is a midfield driver. His ratings should reflect solid but not elite standing."
+        ),
+    },
+    "GAS": {
+        "full_name": "Pierre Gasly",
+        "team": "Alpine",
+        "championships": 0,
+        "wins": 1,
+        "poles": 0,
+        "career_seasons": "2017–present",
+        "known_strengths": [
+            "Strong race pace in clean air — comfortable top-10 performer",
+            "Aggressive overtaking and good tactical awareness",
+        ],
+        "known_weaknesses": [
+            "One-lap pace inconsistent at the sharp end of the grid",
+        ],
+        "context_note": (
+            "Gasly is a reliable midfield points scorer with occasional top-5 pace."
+        ),
+    },
+    "OCO": {
+        "full_name": "Esteban Ocon",
+        "team": "Haas (from 2025)",
+        "championships": 0,
+        "wins": 1,
+        "poles": 0,
+        "career_seasons": "2016–present",
+        "known_strengths": [
+            "Consistent midfield scoring — reliable in clean conditions",
+            "Good tyre management and racecraft over long stints",
+        ],
+        "known_weaknesses": [
+            "Qualifying pace below top-10 benchmark in competitive seasons",
+            "Occasional clashes with teammates reducing overall race performance",
+        ],
+        "context_note": (
+            "Ocon is a solid midfield driver. Ratings should reflect mid-grid calibre."
+        ),
+    },
+    "ALB": {
+        "full_name": "Alexander Albon",
+        "team": "Williams",
+        "championships": 0,
+        "wins": 0,
+        "poles": 0,
+        "career_seasons": "2019–present",
+        "known_strengths": [
+            "Excellent car development feedback — consistently outperforms machinery",
+            "Strong racecraft and tyre management relative to the Williams package",
+        ],
+        "known_weaknesses": [
+            "One-lap pace typically below top-10 benchmark",
+        ],
+        "context_note": (
+            "Albon is highly regarded for his feedback and racecraft relative to his car's performance level."
+        ),
+    },
+    "TSU": {
+        "full_name": "Yuki Tsunoda",
+        "team": "Red Bull Racing (from 2025)",
+        "championships": 0,
+        "wins": 0,
+        "poles": 0,
+        "career_seasons": "2021–present",
+        "known_strengths": [
+            "Aggressive one-lap pace — capable of strong qualifying results",
+            "Fast learner who has improved significantly season over season",
+        ],
+        "known_weaknesses": [
+            "Racecraft and consistency under pressure still developing",
+            "Prone to errors in high-pressure wheel-to-wheel situations",
+        ],
+        "context_note": (
+            "Tsunoda is a developing talent who has shown flashes of strong pace. "
+            "Mid-grid ratings are appropriate."
+        ),
+    },
+    "HUL": {
+        "full_name": "Nico Hülkenberg",
+        "team": "Sauber",
+        "championships": 0,
+        "wins": 0,
+        "poles": 1,
+        "career_seasons": "2010–present",
+        "known_strengths": [
+            "Consistent qualifying pace — often qualifies well above car's race potential",
+            "Strong racecraft and technical feedback to engineers",
+        ],
+        "known_weaknesses": [
+            "Never won an F1 race despite 200+ starts",
+            "Race pace sometimes below qualifying form",
+        ],
+        "context_note": (
+            "Hülkenberg is a reliable, experienced midfield competitor. Mid-grid ratings are appropriate."
+        ),
+    },
+}
+
 # ── Structured Report Card Schema ────────────────────────────────────────────
 # (type, min_constraint, max_constraint) — None means unconstrained
 _RC_SCHEMA: dict = {
@@ -228,6 +532,13 @@ STATE_DEFAULTS: dict = {
     "rc_last_report_ts":   0.0,      # float — rate limit timestamp
     "rc_result":           None,     # dict | None — validated report card
     "rc_analysed_driver":  None,     # str | None
+    # Global — AI response verbosity toggle
+    "ai_response_mode":    "Concise",  # "Concise" | "Detailed"
+    # Global — custom tab navigation
+    "active_tab":          "Driver Radar",  # one of the three tab names
+    # Tab 1 — unified AI panel
+    "radar_ai_feature":    "Driver Style Analyst",
+    "radar_ai_driver":     None,
 }
 
 st.set_page_config(page_title="Driver DNA Fingerprinter", layout="wide")
@@ -236,6 +547,16 @@ for _key, _val in STATE_DEFAULTS.items():
     if _key not in st.session_state:
         st.session_state[_key] = _val
 
+
+@st.cache_data
+def get_model_metrics() -> dict:
+    """Load the detailed metrics.json written by model.py. Returns {} if not yet generated."""
+    if not METRICS_PATH.exists():
+        return {}
+    with open(METRICS_PATH) as f:
+        return json.load(f)
+
+
 # --- Sidebar ---
 with st.sidebar:
     st.title("🧬 Driver DNA + 🏁 Race Pace")
@@ -243,7 +564,13 @@ with st.sidebar:
     # -- Driver DNA section --
     st.subheader("Driver DNA")
     st.markdown("Identify F1 drivers from telemetry alone using XGBoost.")
-    if ACCURACY_PATH.exists():
+    _metrics = get_model_metrics()
+    if _metrics:
+        _mcol1, _mcol2 = st.columns(2)
+        _mcol1.metric("CV Accuracy", f"{_metrics['cv_mean']:.1%}", f"±{_metrics['cv_std']:.1%}")
+        _mcol2.metric("Train Accuracy", f"{_metrics['train_accuracy']:.1%}")
+        st.caption(f"{_metrics.get('n_drivers', '?')} drivers · {_metrics.get('n_samples', '?')} laps")
+    elif ACCURACY_PATH.exists():
         acc = float(ACCURACY_PATH.read_text().strip())
         st.metric("Model CV Accuracy", f"{acc:.1%}")
     else:
@@ -322,6 +649,20 @@ with st.sidebar:
             st.markdown(f"{_fail} Missing libraries: {', '.join(_missing_libs)}")
         else:
             st.markdown(f"{_ok} All required libraries importable")
+
+    # -- AI Response Mode toggle --
+    st.divider()
+    st.markdown("#### AI Response Mode")
+    st.session_state["ai_response_mode"] = st.sidebar.radio(
+        "Response depth",
+        options=["Concise", "Detailed"],
+        index=0 if st.session_state.get("ai_response_mode", "Concise") == "Concise" else 1,
+        key="ai_mode_radio",
+        help=(
+            "Concise: 3-6 sentence focused answers, lower token cost. "
+            "Detailed: multi-paragraph rich analysis, ~50% more tokens per call."
+        ),
+    )
 
 # --- Load resources ---
 @st.cache_resource
@@ -478,10 +819,11 @@ def _build_explain_prompt(
     feature_dict: dict,
     shap_dict: dict,
     percentile_dict: dict,
+    verbose: bool = False,
 ) -> tuple:
     """Build (system_msg, user_msg) for GPT-4o-mini. All interpolated values are
     pre-validated floats or a sanitized driver name — no raw user text enters the prompt.
-    Total prompt stays under ~500 tokens."""
+    Pass verbose=True to use the Detailed-mode system prompt."""
 
     ranked = sorted(shap_dict.items(), key=lambda x: abs(x[1]), reverse=True)
     lines = [
@@ -489,7 +831,7 @@ def _build_explain_prompt(
         f"(p{percentile_dict[f]:.0f}, SHAP: {'+'if shap_dict[f] >= 0 else ''}{shap_dict[f]:.4f})"
         for f, _ in ranked
     ]
-    system_msg = (
+    system_msg = _EXPLAIN_SYSTEM_VERBOSE if verbose else (
         "You are an F1 telemetry analyst assistant embedded in a machine learning dashboard. "
         "Explain ML model predictions in clear, engaging prose for a motorsport audience. "
         "Focus on the top 2-3 features by SHAP magnitude. Be concise (3-5 sentences). "
@@ -500,8 +842,8 @@ def _build_explain_prompt(
         f"with {confidence:.1%} confidence.\n\n"
         "Feature values (percentile rank vs all drivers, SHAP contribution toward this prediction):\n"
         + "\n".join(lines)
-        + "\n\nExplain in 3-5 plain prose sentences WHY the model made this prediction, "
-        "citing the 2-3 features with the largest |SHAP| values and their actual numbers."
+        + "\n\nExplain WHY the model made this prediction, "
+        "citing the features with the largest |SHAP| values and their actual numbers."
     )
     return system_msg, user_msg
 
@@ -679,17 +1021,21 @@ def _ra_run_reflexion(
     driver: str,
     data_block: str,
     api_key: str,
+    verbose: bool = False,
 ) -> tuple:
     """Orchestrate the Reflexion self-critique loop.
 
     Returns ({iterations, final_narrative}, None) or (None, error_msg).
     Each iteration: {round_num, narrative, critique (dict | None)}.
+    Pass verbose=True for the Detailed-mode analyst prompt and higher token budget.
     """
     _CONFIDENCE_THRESHOLD = 7
+    _analyst_system = _RA_ANALYST_SYSTEM_VERBOSE if verbose else _RA_ANALYST_SYSTEM
+    _analyst_tokens = 650 if verbose else 400
 
     def analyst_call(user_msg: str) -> tuple:
-        return _call_openai_llm(api_key, _RA_ANALYST_SYSTEM, user_msg,
-                                max_tokens=400, temperature=0.4)
+        return _call_openai_llm(api_key, _analyst_system, user_msg,
+                                max_tokens=_analyst_tokens, temperature=0.4)
 
     def critic_call(narrative: str) -> tuple:
         user_msg = (
@@ -802,10 +1148,12 @@ def _rag_run_dna_match(
     driver: str,
     driver_vector: np.ndarray,
     api_key: str,
+    verbose: bool = False,
 ) -> tuple:
     """Retrieve top-2 historical matches and call LLM to narrate the comparison.
 
     Returns ({driver, matches, narrative}, None) or (None, error_msg).
+    Pass verbose=True for the Detailed-mode system prompt and higher token budget.
     """
     matches = _rag_retrieve_top_k(driver_vector, _RAG_HISTORICAL_PROFILES, k=2)
 
@@ -833,8 +1181,10 @@ def _rag_run_dna_match(
         "that drove the similarity."
     )
 
-    narrative, err = _call_openai_llm(api_key, _RAG_SYSTEM, user_msg,
-                                      max_tokens=350, temperature=0.4)
+    _rag_sys = _RAG_SYSTEM_VERBOSE if verbose else _RAG_SYSTEM
+    _rag_tokens = 600 if verbose else 350
+    narrative, err = _call_openai_llm(api_key, _rag_sys, user_msg,
+                                      max_tokens=_rag_tokens, temperature=0.4)
     if err:
         return None, err
     return {"driver": driver, "matches": matches, "narrative": narrative}, None
@@ -960,6 +1310,34 @@ def _rc_build_user_prompt(driver: str, df_ext: pd.DataFrame, ext_norm_means: pd.
             std_val = "n/a"
         lines.append(f"  {FEATURE_LABELS.get(feat, feat):<22} {std_val}")
     lines.append(f"\nRule-engine archetype: {emoji} {archetype}")
+
+    # Real-world context injection — calibrate ratings against known ground truth
+    _ctx = _RC_DRIVER_CONTEXT.get(driver)
+    if _ctx:
+        lines += [
+            "\nREAL-WORLD DRIVER CONTEXT (use this to calibrate ratings against known ground truth):",
+            f"  Full name:        {_ctx['full_name']}",
+            f"  Team:             {_ctx['team']}",
+            f"  Championships:    {_ctx['championships']}",
+            f"  Career wins:      {_ctx['wins']}",
+            f"  Career poles:     {_ctx['poles']}",
+            f"  Active seasons:   {_ctx['career_seasons']}",
+            "  Known strengths:",
+        ]
+        for _s in _ctx["known_strengths"]:
+            lines.append(f"    - {_s}")
+        lines.append("  Known weaknesses:")
+        for _w in _ctx["known_weaknesses"]:
+            lines.append(f"    - {_w}")
+        lines.append(f"  Analyst note: {_ctx['context_note']}")
+        lines.append(
+            "\nIMPORTANT: The telemetry above is a snapshot from a limited number of captured "
+            "sessions, normalised only relative to drivers in this dataset — it is not a complete "
+            "career picture. Use the real-world context above to calibrate race_craft_rating, "
+            "raw_pace_rating, and consistency_rating so they reflect the driver's true standing on "
+            "the current grid. A driver with 25 poles cannot score 3/10 for Raw Pace."
+        )
+
     lines.append("\nRespond with the JSON object only.")
     return "\n".join(lines)
 
@@ -969,16 +1347,20 @@ def _rc_run_report(
     df_ext: pd.DataFrame,
     ext_norm_means: pd.DataFrame,
     api_key: str,
+    verbose: bool = False,
 ) -> tuple:
     """Call JSON-mode LLM, validate, retry once on failure.
 
     Returns (validated_report_dict, None) or (None, error_msg).
+    Pass verbose=True for the Detailed-mode system prompt and higher token budget.
     """
     user_msg = _rc_build_user_prompt(driver, df_ext, ext_norm_means)
+    _rc_sys = _RC_SYSTEM_VERBOSE if verbose else _RC_SYSTEM
+    _rc_tokens = 700 if verbose else 500
 
     # Attempt 1
-    raw_json, err = _call_openai_llm(api_key, _RC_SYSTEM, user_msg,
-                                     max_tokens=500, temperature=0.4, json_mode=True)
+    raw_json, err = _call_openai_llm(api_key, _rc_sys, user_msg,
+                                     max_tokens=_rc_tokens, temperature=0.4, json_mode=True)
     if err:
         return None, err
     try:
@@ -995,8 +1377,8 @@ def _rc_run_report(
         + f"\n\nYour previous response failed schema validation: {reason}\n"
         "Fix the issue and respond with the corrected JSON object only."
     )
-    raw_json2, err2 = _call_openai_llm(api_key, _RC_SYSTEM, correction_msg,
-                                       max_tokens=500, temperature=0.4, json_mode=True)
+    raw_json2, err2 = _call_openai_llm(api_key, _rc_sys, correction_msg,
+                                       max_tokens=_rc_tokens, temperature=0.4, json_mode=True)
     if err2:
         return None, err2
     try:
@@ -1009,7 +1391,7 @@ def _rc_run_report(
     return None, f"Report validation failed after retry: {reason2}"
 
 
-def _call_openai_chat(api_key: str, messages: list, tools: list) -> tuple:
+def _call_openai_chat(api_key: str, messages: list, tools: list, max_tokens: int = 500) -> tuple:
     """Call GPT-4o-mini with optional tool definitions for the chat agent.
 
     Returns one of three shapes:
@@ -1026,14 +1408,14 @@ def _call_openai_chat(api_key: str, messages: list, tools: list) -> tuple:
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
-                max_tokens=500,
+                max_tokens=max_tokens,
                 temperature=0.4,
             )
         else:
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
-                max_tokens=500,
+                max_tokens=max_tokens,
                 temperature=0.4,
             )
         choice = resp.choices[0]
@@ -1095,6 +1477,88 @@ _CA_SYSTEM_PROMPT: str = (
     "- If data is insufficient, say so clearly.\n"
     "- No markdown, bullet points, or headers — plain prose only.\n"
     "- Do not speculate beyond the available data."
+)
+
+# ── Verbose (Detailed mode) prompt constants ─────────────────────────────────
+
+_EXPLAIN_SYSTEM_VERBOSE: str = (
+    "You are an expert F1 telemetry analyst and machine-learning interpreter. "
+    "Explain this model prediction in 2-3 paragraphs:\n"
+    "1. The headline: what the prediction and confidence score mean in practice.\n"
+    "2. Feature-by-feature breakdown of the top 3-4 SHAP contributors — cite each value, "
+    "its percentile rank, and what it reveals about this driver's technique.\n"
+    "3. Closing observation: what this fingerprints about the driver's signature style "
+    "and whether any other driver was a close call.\n"
+    "Use vivid motorsport language (trail braking, throttle pickup, traction management). "
+    "Bold key numbers with **number**. Write in paragraphs, no bullet points or headers."
+)
+
+_RA_ANALYST_SYSTEM_VERBOSE: str = (
+    "You are a senior F1 race engineer presenting a driver style dossier to team management. "
+    "Write a multi-paragraph analysis (8-12 sentences across 2-3 paragraphs):\n"
+    "1. Opening: the driver's defining philosophy — what kind of racing driver are they at their core?\n"
+    "2. Technical deep-dive: cite at least 5 specific numbers; explain what each reveals and draw "
+    "connections between related dimensions (e.g. how coasting % relates to throttle pickup, "
+    "how trail braking score relates to corner speed).\n"
+    "3. Tactical: preferred track types, where this driver gains or loses time versus the grid, "
+    "and what a race engineer would prioritise improving.\n"
+    "Write in the style of a real F1 engineer's notebook — precise, observational, no bullet points."
+)
+
+_RAG_SYSTEM_VERBOSE: str = (
+    "You are an F1 historian and data analyst comparing a modern driver's telemetry fingerprint "
+    "to legendary F1 drivers. Write a rich 3-paragraph comparison:\n"
+    "1. Primary match: which specific dimensions align most strongly with the top legend — cite "
+    "exact values from both drivers and explain what they mean in concrete racing terms.\n"
+    "2. Secondary match and nuance: what the second legend adds to the picture; note any dimensions "
+    "where the modern driver diverges from both legends and what that implies about their unique style.\n"
+    "3. Synthesis: what track types and conditions suit this driver, what their inherent limitations "
+    "are, and how their style would have fared racing against their matched legends in period cars.\n"
+    "Be specific with numbers. Write as a genuine motorsport historical analysis — no bullet points."
+)
+
+_RC_SYSTEM_VERBOSE: str = (
+    "You are a senior F1 data engineer producing a detailed driver DNA report card for team "
+    "management. Your report must be technically precise AND narratively rich.\n\n"
+    "Respond ONLY with a JSON object (no prose, no code fences) matching exactly this schema:\n"
+    '{"headline": "<1-2 sentences with 2+ specific numbers capturing this driver\'s essence>", '
+    '"strengths": ["<strength citing 2+ metrics with engineering context>", '
+    '"<strength citing 2+ metrics>", "<strength citing 2+ metrics>"], '
+    '"weaknesses": ["<root-cause analysis referencing specific values>", '
+    '"<root-cause analysis referencing specific values>"], '
+    '"race_craft_rating": <int 1-10>, "raw_pace_rating": <int 1-10>, '
+    '"consistency_rating": <int 1-10>, '
+    '"tactical_tips": ["<engineer-grade actionable recommendation with data reference>", '
+    '"<engineer-grade actionable recommendation>"], '
+    '"style_tags": ["<tag>", "<tag>", "<tag>", "<tag>"]}\n\n'
+    "Constraints: headline 1-2 sentences with ≥2 numbers; strengths exactly 3, each citing ≥2 "
+    "metric values; weaknesses exactly 2 with root-cause reasoning; tactical_tips exactly 2 "
+    "detailed engineer-grade recommendations; style_tags exactly 4 short descriptors. "
+    "No HTML or markdown in string values."
+)
+
+_CA_SYSTEM_VERBOSE: str = (
+    "You are Race Intelligence, an expert F1 race strategist embedded in a live telemetry "
+    "dashboard. Think and communicate like a race engineer who has seen everything.\n\n"
+    "Your tools:\n"
+    "  get_rolling_pace        — recent lap pace trend per driver\n"
+    "  get_gap_to_leader       — cumulative time gap from each driver to the leader\n"
+    "  detect_strategy_events  — undercut and overcut detections\n"
+    "  project_finishing_order — projected final race order\n"
+    "  get_tyre_degradation    — degradation rate per driver/compound/stint\n"
+    "  get_pace_summary        — aggregate mean, median, fastest lap per driver\n\n"
+    "Rules:\n"
+    "- Always call at least one tool before answering pace, strategy, or position questions.\n"
+    "- Provide a thorough analysis (6-10 sentences): lead with the direct answer, explain the "
+    "data evidence in detail, draw inferences about strategy or performance trends, and close "
+    "with a forward-looking observation — what to watch for on the next 5 laps.\n"
+    "- Cite specific numbers: lap times in full (e.g. 1:23.456), gaps in seconds, degradation "
+    "rates, stint lengths, and position changes.\n"
+    "- Explain the *implication* of the data — not just what it shows but what it means for "
+    "strategy, tyre management, or the race outcome.\n"
+    "- Bold key numbers and driver acronyms using **text**.\n"
+    "- If data is insufficient, explain exactly what you would need to give a fuller answer.\n"
+    "- Draw reasoned inferences from patterns in the data, but never fabricate numbers."
 )
 
 # -- Tool definitions (OpenAI function-calling schema) -----------------------
@@ -1367,18 +1831,22 @@ def _ca_maybe_clear_history(session_cache_key) -> None:
 
 # -- Orchestration -----------------------------------------------------------
 
-def _ca_run_chat_turn(user_message: str, analyser, driver_map: dict, api_key: str) -> tuple:
+def _ca_run_chat_turn(user_message: str, analyser, driver_map: dict, api_key: str, verbose: bool = False) -> tuple:
     """Run one chat turn with the tool-calling loop.
-    Returns (answer_text, None) on success or (None, error_string) on failure."""
+    Returns (answer_text, None) on success or (None, error_string) on failure.
+    Pass verbose=True for the Detailed-mode system prompt and higher token budget.
+    """
     MAX_TOOL_ROUNDS = 3
+    _ca_sys = _CA_SYSTEM_VERBOSE if verbose else _CA_SYSTEM_PROMPT
+    _ca_tokens = 700 if verbose else 500
 
-    messages: list[dict] = [{"role": "system", "content": _CA_SYSTEM_PROMPT}]
+    messages: list[dict] = [{"role": "system", "content": _ca_sys}]
     for m in st.session_state["ca_messages"]:
         messages.append({"role": m["role"], "content": m["content"]})
     messages.append({"role": "user", "content": user_message})
 
     for _ in range(MAX_TOOL_ROUNDS):
-        kind, payload, err = _call_openai_chat(api_key, messages, _CA_TOOLS)
+        kind, payload, err = _call_openai_chat(api_key, messages, _CA_TOOLS, max_tokens=_ca_tokens)
         if err:
             return None, err
         if kind == "text":
@@ -1418,7 +1886,7 @@ def _ca_run_chat_turn(user_message: str, analyser, driver_map: dict, api_key: st
         "role": "user",
         "content": "Summarise what you found in the tool results above.",
     })
-    kind, payload, err = _call_openai_chat(api_key, messages, [])
+    kind, payload, err = _call_openai_chat(api_key, messages, [], max_tokens=_ca_tokens)
     if err:
         return None, err
     if kind == "text":
@@ -1432,8 +1900,11 @@ def _render_chat_panel(analyser, driver_map: dict, session_cache_key) -> None:
     _ca_maybe_clear_history(session_cache_key)
     api_key = _get_openai_api_key()
 
+    _chat_verbose = st.session_state.get("ai_response_mode", "Concise") == "Detailed"
+
     st.divider()
     st.markdown("#### 🤖 Race Intelligence — Ask me anything about this race")
+    st.caption(f"Response mode: **{st.session_state.get('ai_response_mode', 'Concise')}** · Change in the sidebar.")
 
     # Render existing message history
     for msg in st.session_state["ca_messages"]:
@@ -1481,7 +1952,7 @@ def _render_chat_panel(analyser, driver_map: dict, session_cache_key) -> None:
 
         with st.chat_message("assistant"):
             with st.spinner("Analysing race data..."):
-                answer, error = _ca_run_chat_turn(user_input, analyser, driver_map, api_key)
+                answer, error = _ca_run_chat_turn(user_input, analyser, driver_map, api_key, verbose=_chat_verbose)
             if error:
                 st.error(error)
                 st.session_state["ca_messages"].pop()   # remove failed user message
@@ -1584,12 +2055,59 @@ def _build_throttle_map_fig(df: pd.DataFrame, selected: list[str], color_map: di
     return fig
 
 
-tab1, tab2, tab3 = st.tabs(["Driver Radar", "Mystery Driver", "Race Dashboard"])
+# ── Custom pill-style tab navigation ────────────────────────────────────────
+_TABS = [
+    ("🎯  Driver Radar",   "Driver Radar"),
+    ("🕵️  Mystery Driver", "Mystery Driver"),
+    ("🏁  Race Dashboard", "Race Dashboard"),
+]
+
+st.markdown("""
+<style>
+div[data-testid="stHorizontalBlock"] > div:has(> div > button.tab-pill) {
+    gap: 0 !important;
+}
+button.tab-pill {
+    all: unset;
+    cursor: pointer;
+    padding: 10px 26px;
+    border-radius: 30px;
+    font-size: 0.93rem;
+    font-weight: 500;
+    transition: background 0.2s, color 0.2s, box-shadow 0.2s;
+    white-space: nowrap;
+    letter-spacing: 0.01em;
+}
+</style>
+""", unsafe_allow_html=True)
+
+_tab_cols = st.columns(len(_TABS))
+for _col, (_label, _key) in zip(_tab_cols, _TABS):
+    _is_active = st.session_state.get("active_tab", "Driver Radar") == _key
+    with _col:
+        _btn_style = (
+            "background:#5865f2; color:#fff; box-shadow:0 2px 10px rgba(88,101,242,0.45);"
+            if _is_active
+            else "background:rgba(255,255,255,0.06); color:#aaa;"
+        )
+        if st.button(
+            _label,
+            key=f"tab_nav_{_key}",
+            use_container_width=True,
+            type="primary" if _is_active else "secondary",
+        ):
+            st.session_state["active_tab"] = _key
+            st.rerun()
+
+st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+st.divider()
+
+_active_tab = st.session_state.get("active_tab", "Driver Radar")
 
 # ================================================================
 # TAB 1 — Driver Radar
 # ================================================================
-with tab1:
+if _active_tab == "Driver Radar":
     st.subheader("Driver Style Fingerprint")
 
     selected = st.multiselect(
@@ -1660,270 +2178,318 @@ with tab1:
         # AGENTIC AI FEATURES
         # ============================================================
         _api_key = _get_openai_api_key()
+        _verbose = st.session_state.get("ai_response_mode", "Concise") == "Detailed"
 
-        # ── Feature A: Reflexion Loop — Driver Style Analyst ────────
+        # ── Unified AI Feature Panel ─────────────────────────────────
         st.divider()
-        st.markdown("## AI Driver Style Analyst")
-        st.caption(
-            "**Reflexion pattern** (Shinn et al. 2023): an Analyst LLM generates a driving "
-            "style narrative → a Critic LLM evaluates it and returns a confidence score + "
-            "critique in JSON → if confidence < 7/10 the Analyst revises using the critique "
-            "as context. Max 2 rounds."
+        st.markdown("## AI Analysis")
+
+        _ai_feature = st.selectbox(
+            "Select AI feature",
+            options=["Driver Style Analyst", "Historical DNA Matching", "Driver DNA Report Card"],
+            key="radar_ai_feature",
         )
 
-        ra_driver = st.selectbox(
-            "Analyse a single driver",
+        _ai_driver = st.selectbox(
+            "Select driver to analyse",
             options=selected,
-            key="ra_driver_select",
+            key="radar_ai_driver",
         )
-        st.caption("Select one of the drivers currently shown in the radar above.")
 
-        if _api_key is None:
-            st.info("Add an OpenAI API key to `.streamlit/secrets.toml` to enable this feature.")
-        else:
-            _elapsed_ra = time.time() - st.session_state["ra_last_analyse_ts"]
-            _cooldown_ra = max(0.0, _RA_RATE_LIMIT_SECS - _elapsed_ra)
-            _btn_label_ra = (
-                f"Analyse Driving Style (wait {_cooldown_ra:.0f}s)"
-                if _cooldown_ra > 0
-                else "Analyse Driving Style"
+        if _ai_feature == "Driver Style Analyst":
+            st.caption(
+                "**Reflexion pattern** (Shinn et al. 2023): an Analyst LLM generates a driving "
+                "style narrative → a Critic LLM evaluates it and returns a confidence score + "
+                "critique in JSON → if confidence < 7/10 the Analyst revises using the critique "
+                "as context. Max 2 rounds."
             )
-            if st.button(_btn_label_ra, key="ra_analyse_btn", disabled=_cooldown_ra > 0):
-                st.session_state["ra_last_analyse_ts"] = time.time()
-                st.session_state["ra_result"] = None
-                st.session_state["ra_analysed_driver"] = ra_driver
-                if ra_driver is not None:
-                    try:
-                        _data_block = _ra_build_driver_data_block(ra_driver, df_ext, ext_driver_means)
-                        with st.spinner("Running Reflexion loop — Analyst → Critic → (optional) Revision…"):
-                            _ra_result, _ra_err = _ra_run_reflexion(ra_driver, _data_block, _api_key)
-                        if _ra_err:
-                            st.error(f"Reflexion error: {_ra_err}")
-                        else:
-                            st.session_state["ra_result"] = _ra_result
-                    except Exception as _ra_exc:
-                        st.error(f"Unexpected error: {_ra_exc}")
-
-            # Render cached result
-            if (
-                st.session_state["ra_result"] is not None
-                and st.session_state["ra_analysed_driver"] == ra_driver
-            ):
-                _ra_res = st.session_state["ra_result"]
-                for _iter in _ra_res["iterations"]:
-                    _rn = _iter["round_num"]
-                    _label = (
-                        f"Round {_rn} — Initial Draft"
-                        if _rn == 1
-                        else f"Round {_rn} — Revised Narrative"
-                    )
-                    _is_last = _rn == _ra_res["iterations"][-1]["round_num"]
-                    with st.expander(_label, expanded=_is_last):
-                        st.write(_iter["narrative"])
-                        if _iter.get("critique"):
-                            _crit = _iter["critique"]
-                            _conf = _crit.get("confidence", 10)
-                            _c1, _c2 = st.columns([1, 3])
-                            _c1.metric("Critic Confidence", f"{_conf}/10")
-                            if _conf < 7:
-                                _c2.warning("Confidence below 7/10 — Analyst will revise.")
-                            else:
-                                _c2.success("Confidence meets threshold — narrative accepted.")
-                            if _crit.get("factual_errors"):
-                                st.markdown("**Factual errors flagged:**")
-                                for _fe in _crit["factual_errors"]:
-                                    st.markdown(f"- {_fe}")
-                            if _crit.get("suggested_improvements"):
-                                st.markdown("**Suggested improvements:**")
-                                for _si in _crit["suggested_improvements"]:
-                                    st.markdown(f"- {_si}")
-                            if _crit.get("parse_note"):
-                                st.caption(_crit["parse_note"])
-                st.success(_ra_res["final_narrative"])
-
-        # ── Feature B: RAG DNA Matching ──────────────────────────────
-        st.divider()
-        st.markdown("## Historical Driver DNA Matching")
-        st.caption(
-            "**RAG pattern**: the driver's 12-dimensional normalised radar vector is compared to "
-            "10 legendary F1 drivers by cosine similarity. The top-2 most stylistically similar "
-            "historical profiles are retrieved and used to augment the LLM explanation."
-        )
-
-        rag_driver = st.selectbox(
-            "Match a driver to F1 legends",
-            options=selected,
-            key="rag_driver_select",
-        )
-        st.caption("Select one of the drivers currently shown in the radar above.")
-
-        if _api_key is None:
-            st.info("Add an OpenAI API key to `.streamlit/secrets.toml` to enable this feature.")
-        else:
-            _elapsed_rag = time.time() - st.session_state["rag_last_match_ts"]
-            _cooldown_rag = max(0.0, _RAG_RATE_LIMIT_SECS - _elapsed_rag)
-            _btn_label_rag = (
-                f"Find DNA Match (wait {_cooldown_rag:.0f}s)"
-                if _cooldown_rag > 0
-                else "Find DNA Match"
-            )
-            if st.button(_btn_label_rag, key="rag_match_btn", disabled=_cooldown_rag > 0):
-                st.session_state["rag_last_match_ts"] = time.time()
-                st.session_state["rag_result"] = None
-                st.session_state["rag_analysed_driver"] = rag_driver
-                if rag_driver is not None:
-                    try:
-                        _drv_series = cast(pd.Series, ext_driver_means.loc[rag_driver])
-                        _drv_vec = np.array(_drv_series, dtype=float)
-                        with st.spinner("Computing cosine similarity and generating narrative…"):
-                            _rag_result, _rag_err = _rag_run_dna_match(rag_driver, _drv_vec, _api_key)
-                        if _rag_err:
-                            st.error(f"DNA match error: {_rag_err}")
-                        else:
-                            st.session_state["rag_result"] = _rag_result
-                    except KeyError:
-                        st.warning(f"Extended features unavailable for {rag_driver}.")
-                    except Exception as _rag_exc:
-                        st.error(f"Unexpected error: {_rag_exc}")
-
-            # Render cached result
-            if (
-                st.session_state["rag_result"] is not None
-                and st.session_state["rag_analysed_driver"] == rag_driver
-            ):
-                _rag_res = st.session_state["rag_result"]
-                # Full similarity bar chart (all 10 historical drivers)
-                try:
-                    _drv_vec_render = ext_driver_means.loc[rag_driver].to_numpy(dtype=float)
-                    _all_scores = _rag_retrieve_top_k(_drv_vec_render, _RAG_HISTORICAL_PROFILES, k=10)
-                    _top2_names = {m["name"] for m in _rag_res["matches"]}
-                    _bar_colors = [
-                        "#f1c40f" if s["name"] in _top2_names else "#555555"
-                        for s in reversed(_all_scores)
-                    ]
-                    _fig_sim = go.Figure(go.Bar(
-                        x=[s["similarity"] for s in reversed(_all_scores)],
-                        y=[s["name"] for s in reversed(_all_scores)],
-                        orientation="h",
-                        marker_color=_bar_colors,
-                        hovertemplate="%{y}<br>Similarity: %{x:.4f}<extra></extra>",
-                    ))
-                    _fig_sim.update_layout(
-                        title=f"Cosine Similarity to Historical F1 Drivers — {rag_driver}",
-                        xaxis=dict(range=[0.80, 1.0], title="Cosine Similarity"),
-                        yaxis_title="",
-                        height=380,
-                        plot_bgcolor="rgba(0,0,0,0)",
-                        paper_bgcolor="rgba(0,0,0,0)",
-                    )
-                    st.plotly_chart(_fig_sim, width="stretch", key="tab1_rag_similarity_bar")
-                except Exception:
-                    pass
-
-                # Top-2 match cards
-                _match_cols = st.columns(2)
-                for _ci, _match in enumerate(_rag_res["matches"]):
-                    with _match_cols[_ci]:
-                        st.metric(
-                            label=f"#{_ci + 1} DNA Match",
-                            value=_match["name"],
-                            delta=f"Similarity: {_match['similarity']:.1%}",
-                        )
-                        st.caption(f"Era: {_match['era']}")
-                        st.write(_match["description"])
-
-                st.markdown("#### Why the DNA aligns")
-                st.info(_rag_res["narrative"])
-
-        # ── Feature C: Structured Output Report Card ─────────────────
-        st.divider()
-        st.markdown("## Driver DNA Report Card")
-        st.caption(
-            "**Structured output pattern**: GPT-4o-mini is called in JSON mode "
-            "(`response_format={\"type\": \"json_object\"}`). The schema is enforced via "
-            "prompt engineering and validated in Python. If validation fails, the prompt "
-            "is retried once with the specific error injected."
-        )
-
-        rc_driver = st.selectbox(
-            "Generate a report card for",
-            options=selected,
-            key="rc_driver_select",
-        )
-        st.caption("Select one of the drivers currently shown in the radar above.")
-
-        if _api_key is None:
-            st.info("Add an OpenAI API key to `.streamlit/secrets.toml` to enable this feature.")
-        else:
-            _elapsed_rc = time.time() - st.session_state["rc_last_report_ts"]
-            _cooldown_rc = max(0.0, _RC_RATE_LIMIT_SECS - _elapsed_rc)
-            _btn_label_rc = (
-                f"Generate DNA Report (wait {_cooldown_rc:.0f}s)"
-                if _cooldown_rc > 0
-                else "Generate DNA Report"
-            )
-            if st.button(_btn_label_rc, key="rc_report_btn", disabled=_cooldown_rc > 0):
-                st.session_state["rc_last_report_ts"] = time.time()
-                st.session_state["rc_result"] = None
-                st.session_state["rc_analysed_driver"] = rc_driver
-                if rc_driver is not None:
-                    with st.spinner("Generating structured report card (JSON mode)…"):
-                        _rc_result, _rc_err = _rc_run_report(rc_driver, df_ext, ext_driver_means, _api_key)
-                    if _rc_err:
-                        st.error(f"Report card error: {_rc_err}")
-                    else:
-                        st.session_state["rc_result"] = _rc_result
-
-            # Render cached result
-            if (
-                st.session_state["rc_result"] is not None
-                and st.session_state["rc_analysed_driver"] == rc_driver
-            ):
-                _report = st.session_state["rc_result"]
-
-                # Headline
-                st.markdown(f"### {_report['headline']}")
-
-                # Style tags (pill badges)
-                _tag_html = " ".join(
-                    f'<span style="background:#2d2d50;border:1px solid #555;border-radius:12px;'
-                    f'padding:3px 10px;font-size:0.85em;color:#ccc;margin:2px">{tag}</span>'
-                    for tag in _report.get("style_tags", [])
+            if _api_key is None:
+                st.info("Add an OpenAI API key to `.streamlit/secrets.toml` to enable this feature.")
+            else:
+                _elapsed_ra = time.time() - st.session_state["ra_last_analyse_ts"]
+                _cooldown_ra = max(0.0, _RA_RATE_LIMIT_SECS - _elapsed_ra)
+                _btn_label_ra = (
+                    f"Analyse Driving Style (wait {_cooldown_ra:.0f}s)"
+                    if _cooldown_ra > 0
+                    else "Analyse Driving Style"
                 )
-                st.markdown(_tag_html, unsafe_allow_html=True)
-                st.markdown("")
+                if st.button(_btn_label_ra, key="ra_analyse_btn", disabled=_cooldown_ra > 0):
+                    st.session_state["ra_last_analyse_ts"] = time.time()
+                    st.session_state["ra_result"] = None
+                    st.session_state["ra_analysed_driver"] = _ai_driver
+                    if _ai_driver is not None:
+                        try:
+                            _data_block = _ra_build_driver_data_block(_ai_driver, df_ext, ext_driver_means)
+                            with st.spinner("Running Reflexion loop — Analyst → Critic → (optional) Revision…"):
+                                _ra_result, _ra_err = _ra_run_reflexion(_ai_driver, _data_block, _api_key, verbose=_verbose)
+                            if _ra_err:
+                                st.error(f"Reflexion error: {_ra_err}")
+                            else:
+                                st.session_state["ra_result"] = _ra_result
+                        except Exception as _ra_exc:
+                            st.error(f"Unexpected error: {_ra_exc}")
 
-                # Rating bars
-                _r1, _r2, _r3 = st.columns(3)
-                for _rcol, (_rlabel, _rkey) in zip(
-                    [_r1, _r2, _r3],
-                    [("Race Craft", "race_craft_rating"),
-                     ("Raw Pace",   "raw_pace_rating"),
-                     ("Consistency","consistency_rating")],
+                if (
+                    st.session_state["ra_result"] is not None
+                    and st.session_state["ra_analysed_driver"] == _ai_driver
                 ):
-                    _rval = _report.get(_rkey, 0)
-                    _rcol.metric(_rlabel, f"{_rval}/10")
-                    _rcol.progress(_rval / 10)
+                    _ra_res = st.session_state["ra_result"]
+                    for _iter in _ra_res["iterations"]:
+                        _rn = _iter["round_num"]
+                        _label = (
+                            f"Round {_rn} — Initial Draft"
+                            if _rn == 1
+                            else f"Round {_rn} — Revised Narrative"
+                        )
+                        _is_last = _rn == _ra_res["iterations"][-1]["round_num"]
+                        with st.expander(_label, expanded=_is_last):
+                            st.write(_iter["narrative"])
+                            if _iter.get("critique"):
+                                _crit = _iter["critique"]
+                                _conf = _crit.get("confidence", 10)
+                                _c1, _c2 = st.columns([1, 3])
+                                _c1.metric("Critic Confidence", f"{_conf}/10")
+                                if _conf < 7:
+                                    _c2.warning("Confidence below 7/10 — Analyst will revise.")
+                                else:
+                                    _c2.success("Confidence meets threshold — narrative accepted.")
+                                if _crit.get("factual_errors"):
+                                    st.markdown("**Factual errors flagged:**")
+                                    for _fe in _crit["factual_errors"]:
+                                        st.markdown(f"- {_fe}")
+                                if _crit.get("suggested_improvements"):
+                                    st.markdown("**Suggested improvements:**")
+                                    for _si in _crit["suggested_improvements"]:
+                                        st.markdown(f"- {_si}")
+                                if _crit.get("parse_note"):
+                                    st.caption(_crit["parse_note"])
+                    st.success(_ra_res["final_narrative"])
 
-                st.divider()
+        elif _ai_feature == "Historical DNA Matching":
+            st.caption(
+                "**RAG pattern**: the driver's 12-dimensional normalised radar vector is compared to "
+                "10 legendary F1 drivers by cosine similarity. The top-2 most stylistically similar "
+                "historical profiles are retrieved and used to augment the LLM explanation."
+            )
+            if _api_key is None:
+                st.info("Add an OpenAI API key to `.streamlit/secrets.toml` to enable this feature.")
+            else:
+                _elapsed_rag = time.time() - st.session_state["rag_last_match_ts"]
+                _cooldown_rag = max(0.0, _RAG_RATE_LIMIT_SECS - _elapsed_rag)
+                _btn_label_rag = (
+                    f"Find DNA Match (wait {_cooldown_rag:.0f}s)"
+                    if _cooldown_rag > 0
+                    else "Find DNA Match"
+                )
+                if st.button(_btn_label_rag, key="rag_match_btn", disabled=_cooldown_rag > 0):
+                    st.session_state["rag_last_match_ts"] = time.time()
+                    st.session_state["rag_result"] = None
+                    st.session_state["rag_analysed_driver"] = _ai_driver
+                    if _ai_driver is not None:
+                        try:
+                            _drv_series = cast(pd.Series, ext_driver_means.loc[_ai_driver])
+                            _drv_vec = np.array(_drv_series, dtype=float)
+                            with st.spinner("Computing cosine similarity and generating narrative…"):
+                                _rag_result, _rag_err = _rag_run_dna_match(_ai_driver, _drv_vec, _api_key, verbose=_verbose)
+                            if _rag_err:
+                                st.error(f"DNA match error: {_rag_err}")
+                            else:
+                                st.session_state["rag_result"] = _rag_result
+                        except KeyError:
+                            st.warning(f"Extended features unavailable for {_ai_driver}.")
+                        except Exception as _rag_exc:
+                            st.error(f"Unexpected error: {_rag_exc}")
 
-                # Strengths & Weaknesses
-                _sw1, _sw2 = st.columns(2)
-                with _sw1:
-                    st.markdown("**Strengths**")
+                if (
+                    st.session_state["rag_result"] is not None
+                    and st.session_state["rag_analysed_driver"] == _ai_driver
+                ):
+                    _rag_res = st.session_state["rag_result"]
+                    try:
+                        _drv_vec_render = cast(pd.Series, ext_driver_means.loc[_ai_driver]).to_numpy(dtype=float)
+                        _all_scores = _rag_retrieve_top_k(_drv_vec_render, _RAG_HISTORICAL_PROFILES, k=10)
+                        _top2_names = {m["name"] for m in _rag_res["matches"]}
+                        _bar_colors = [
+                            "#f1c40f" if s["name"] in _top2_names else "#555555"
+                            for s in reversed(_all_scores)
+                        ]
+                        _fig_sim = go.Figure(go.Bar(
+                            x=[s["similarity"] for s in reversed(_all_scores)],
+                            y=[s["name"] for s in reversed(_all_scores)],
+                            orientation="h",
+                            marker_color=_bar_colors,
+                            hovertemplate="%{y}<br>Similarity: %{x:.4f}<extra></extra>",
+                        ))
+                        _fig_sim.update_layout(
+                            title=f"Cosine Similarity to Historical F1 Drivers — {_ai_driver}",
+                            xaxis=dict(range=[0.80, 1.0], title="Cosine Similarity"),
+                            yaxis_title="",
+                            height=380,
+                            plot_bgcolor="rgba(0,0,0,0)",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                        )
+                        st.plotly_chart(_fig_sim, width="stretch", key="tab1_rag_similarity_bar")
+                    except Exception:
+                        pass
+
+                    _match_cols = st.columns(2)
+                    for _ci, _match in enumerate(_rag_res["matches"]):
+                        with _match_cols[_ci]:
+                            st.metric(
+                                label=f"#{_ci + 1} DNA Match",
+                                value=_match["name"],
+                                delta=f"Similarity: {_match['similarity']:.1%}",
+                            )
+                            st.caption(f"Era: {_match['era']}")
+                            st.write(_match["description"])
+
+                    st.markdown("#### Why the DNA aligns")
+                    st.info(_rag_res["narrative"])
+
+        elif _ai_feature == "Driver DNA Report Card":
+            st.caption(
+                "**Structured output pattern**: GPT-4o-mini is called in JSON mode "
+                "(`response_format={\"type\": \"json_object\"}`). The schema is enforced via "
+                "prompt engineering and validated in Python. If validation fails, the prompt "
+                "is retried once with the specific error injected."
+            )
+            if _api_key is None:
+                st.info("Add an OpenAI API key to `.streamlit/secrets.toml` to enable this feature.")
+            else:
+                _elapsed_rc = time.time() - st.session_state["rc_last_report_ts"]
+                _cooldown_rc = max(0.0, _RC_RATE_LIMIT_SECS - _elapsed_rc)
+                _btn_label_rc = (
+                    f"Generate DNA Report (wait {_cooldown_rc:.0f}s)"
+                    if _cooldown_rc > 0
+                    else "Generate DNA Report"
+                )
+                if st.button(_btn_label_rc, key="rc_report_btn", disabled=_cooldown_rc > 0):
+                    st.session_state["rc_last_report_ts"] = time.time()
+                    st.session_state["rc_result"] = None
+                    st.session_state["rc_analysed_driver"] = _ai_driver
+                    if _ai_driver is not None:
+                        with st.spinner("Generating structured report card (JSON mode)…"):
+                            _rc_result, _rc_err = _rc_run_report(_ai_driver, df_ext, ext_driver_means, _api_key, verbose=_verbose)
+                        if _rc_err:
+                            st.error(f"Report card error: {_rc_err}")
+                        else:
+                            st.session_state["rc_result"] = _rc_result
+
+                if (
+                    st.session_state["rc_result"] is not None
+                    and st.session_state["rc_analysed_driver"] == _ai_driver
+                ):
+                    _report = st.session_state["rc_result"]
+
+                    # ── Headline ──────────────────────────────────────
+                    st.markdown(f"### {_report['headline']}")
+
+                    # ── Style tags ────────────────────────────────────
+                    _tag_html = " ".join(
+                        f'<span style="background:#2d2d50;border:1px solid #555;border-radius:12px;'
+                        f'padding:3px 10px;font-size:0.85em;color:#ccc;margin:2px">{tag}</span>'
+                        for tag in _report.get("style_tags", [])
+                    )
+                    st.markdown(_tag_html, unsafe_allow_html=True)
+                    st.markdown("")
+
+                    # ── Overall score ─────────────────────────────────
+                    _rc_val  = _report.get("race_craft_rating", 0)
+                    _rp_val  = _report.get("raw_pace_rating", 0)
+                    _con_val = _report.get("consistency_rating", 0)
+                    _overall = round((_rc_val + _rp_val + _con_val) / 3, 1)
+
+                    def _rating_tier(v: int) -> tuple[str, str]:
+                        """Return (tier label, hex colour) for a 1-10 rating."""
+                        if v >= 9:  return "Elite",         "#00e676"
+                        if v >= 7:  return "Strong",        "#69f0ae"
+                        if v >= 5:  return "Good",          "#ffd740"
+                        if v >= 3:  return "Average",       "#ff9100"
+                        return              "Below Average", "#ff5252"
+
+                    def _rating_bar_html(label: str, value: int, tooltip: str) -> str:
+                        tier, color = _rating_tier(value)
+                        pct = value * 10
+                        return (
+                            f'<div style="margin-bottom:14px">'
+                            f'  <div style="display:flex;justify-content:space-between;margin-bottom:4px">'
+                            f'    <span style="font-weight:600;font-size:0.95em">{label}</span>'
+                            f'    <span style="color:{color};font-weight:700;font-size:1.05em">'
+                            f'      {value}/10 &nbsp;<span style="font-size:0.8em;color:#aaa">({tier})</span>'
+                            f'    </span>'
+                            f'  </div>'
+                            f'  <div style="background:#2a2a3a;border-radius:6px;height:10px;width:100%">'
+                            f'    <div style="background:{color};width:{pct}%;height:10px;border-radius:6px;'
+                            f'               transition:width 0.4s ease"></div>'
+                            f'  </div>'
+                            f'  <div style="font-size:0.78em;color:#888;margin-top:3px">{tooltip}</div>'
+                            f'</div>'
+                        )
+
+                    _overall_tier, _overall_color = _rating_tier(round(_overall))
+                    st.markdown(
+                        f'<div style="background:#1a1a2e;border:1px solid #333;border-radius:10px;'
+                        f'padding:16px 20px;margin-bottom:18px">'
+                        f'  <div style="font-size:0.8em;color:#888;margin-bottom:4px;text-transform:uppercase;'
+                        f'             letter-spacing:0.08em">Overall Driver Rating</div>'
+                        f'  <div style="font-size:2.2em;font-weight:800;color:{_overall_color}">'
+                        f'    {_overall}<span style="font-size:0.5em;color:#aaa">/10</span>'
+                        f'    &nbsp;<span style="font-size:0.45em;color:{_overall_color}">{_overall_tier}</span>'
+                        f'  </div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    # ── Rating bars ───────────────────────────────────
+                    st.markdown(
+                        _rating_bar_html(
+                            "Race Craft", _rc_val,
+                            "Based on trail braking precision, brake timing, and steering control under load",
+                        )
+                        + _rating_bar_html(
+                            "Raw Pace", _rp_val,
+                            "Based on mean speed, max speed, and full-throttle fraction across all laps",
+                        )
+                        + _rating_bar_html(
+                            "Consistency", _con_val,
+                            "Based on lap-to-lap variability in speed, throttle, braking, and steering",
+                        ),
+                        unsafe_allow_html=True,
+                    )
+
+                    st.divider()
+
+                    # ── Strengths ─────────────────────────────────────
+                    st.markdown("#### Strengths")
                     for _s in _report.get("strengths", []):
-                        st.markdown(f"- {_s}")
-                with _sw2:
-                    st.markdown("**Weaknesses**")
+                        st.markdown(
+                            f'<div style="background:rgba(0,200,100,0.07);border-left:3px solid #00c864;'
+                            f'border-radius:6px;padding:10px 14px;margin-bottom:8px;font-size:0.93em">'
+                            f'✅ &nbsp;{_s}</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                    # ── Weaknesses ────────────────────────────────────
+                    st.markdown("#### Weaknesses")
                     for _w in _report.get("weaknesses", []):
-                        st.markdown(f"- {_w}")
+                        st.markdown(
+                            f'<div style="background:rgba(255,150,0,0.07);border-left:3px solid #ff9100;'
+                            f'border-radius:6px;padding:10px 14px;margin-bottom:8px;font-size:0.93em">'
+                            f'⚠️ &nbsp;{_w}</div>',
+                            unsafe_allow_html=True,
+                        )
 
-                st.divider()
+                    st.divider()
 
-                # Tactical tips
-                st.markdown("**Tactical Tips**")
-                for _tip in _report.get("tactical_tips", []):
-                    st.info(_tip)
+                    # ── Tactical Tips ─────────────────────────────────
+                    st.markdown("#### Tactical Tips")
+                    for _ti, _tip in enumerate(_report.get("tactical_tips", []), 1):
+                        st.markdown(
+                            f'<div style="background:rgba(30,120,255,0.07);border-left:3px solid #1e78ff;'
+                            f'border-radius:6px;padding:10px 14px;margin-bottom:8px;font-size:0.93em">'
+                            f'<span style="font-weight:700;color:#1e78ff">Tip {_ti}:</span> &nbsp;{_tip}</div>',
+                            unsafe_allow_html=True,
+                        )
 
         st.divider()
 
@@ -2053,7 +2619,7 @@ with tab1:
 # ================================================================
 # TAB 2 — Mystery Driver
 # ================================================================
-with tab2:
+if _active_tab == "Mystery Driver":
     st.subheader("Can the model identify the driver?")
 
     # ── AI Explanation (top of tab — shown once a prediction exists) ─
@@ -2115,12 +2681,15 @@ with tab2:
                                 )
                                 for feat in FEATURE_COLS
                             }
+                            _md_verbose = st.session_state.get("ai_response_mode", "Concise") == "Detailed"
+                            _md_max_tokens = 500 if _md_verbose else 300
                             system_msg, user_msg = _build_explain_prompt(
                                 safe_driver, _confidence,
                                 lap_features, shap_dict, percentile_dict,
+                                verbose=_md_verbose,
                             )
-                            explanation, err = _call_openai_explainer(
-                                api_key, system_msg, user_msg
+                            explanation, err = _call_openai_llm(
+                                api_key, system_msg, user_msg, max_tokens=_md_max_tokens
                             )
                             if err:
                                 st.error(err)
@@ -2204,6 +2773,56 @@ with tab2:
         st.session_state["_md_confidence"] = float(proba.max())
         st.session_state["_md_X_input"] = X_input
         st.session_state["_md_pred_class_idx"] = pred_class_idx
+
+    # ── Model Accuracy Panel ──────────────────────────────────────────────────
+    _mets = get_model_metrics()
+    if _mets:
+        st.divider()
+        st.markdown("### Model Accuracy")
+
+        # Top-line metrics
+        _a1, _a2, _a3, _a4 = st.columns(4)
+        _a1.metric("CV Accuracy", f"{_mets['cv_mean']:.1%}", f"±{_mets['cv_std']:.1%}")
+        _a2.metric("Train Accuracy", f"{_mets['train_accuracy']:.1%}")
+        _a3.metric("Drivers", str(_mets.get("n_drivers", "—")))
+        _a4.metric("Laps", str(_mets.get("n_samples", "—")))
+
+        # Per-fold CV breakdown
+        _fold_scores = _mets.get("fold_scores", [])
+        if _fold_scores:
+            with st.expander("Per-fold CV scores", expanded=False):
+                _fcols = st.columns(len(_fold_scores))
+                for _fi, (_fc, _fs) in enumerate(zip(_fcols, _fold_scores), 1):
+                    _delta_color = "normal" if _fs >= _mets["cv_mean"] else "inverse"
+                    _fc.metric(f"Fold {_fi}", f"{_fs:.1%}",
+                               f"{(_fs - _mets['cv_mean'])*100:+.1f}pp")
+
+        # Per-driver accuracy table
+        _per = _mets.get("per_driver", {})
+        if _per:
+            st.markdown("#### Per-Driver Metrics")
+            st.caption("Evaluated on the full training set. Precision, recall, and F1 per driver.")
+            _rows = []
+            for _drv, _dm in sorted(_per.items()):
+                _rows.append({
+                    "Driver":     _drv,
+                    "Precision":  f"{_dm['precision']:.1%}",
+                    "Recall":     f"{_dm['recall']:.1%}",
+                    "F1 Score":   f"{_dm['f1_score']:.1%}",
+                    "Laps (support)": _dm["support"],
+                })
+            _met_df = pd.DataFrame(_rows).set_index("Driver")
+
+            # Colour-code rows: green ≥ 0.90, amber ≥ 0.70, red < 0.70
+            def _colour_f1(val: str) -> str:
+                v = float(val.strip("%")) / 100
+                if v >= 0.90:
+                    return "background-color: rgba(50,200,80,0.15); color:#7fffaa"
+                if v >= 0.70:
+                    return "background-color: rgba(255,180,0,0.15); color:#ffd966"
+                return "background-color: rgba(220,50,50,0.15); color:#ff9999"
+
+            st.write(_met_df.style.map(_colour_f1, subset=["F1 Score"]))  # type: ignore[call-overload]
 
 
 # ================================================================
@@ -3025,7 +3644,7 @@ def _render_charts(
 
 # ---- Tab 3 content -----------------------------------------------
 
-with tab3:
+if _active_tab == "Race Dashboard":
     st.subheader("Race Dashboard")
 
     # ---- Race Analysis ---------------------------------------------

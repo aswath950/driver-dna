@@ -15,26 +15,34 @@ Driver DNA is a full-stack AI/ML platform built on Formula 1 telemetry data. It 
 | **Data Engineering** | FastF1, pandas, NumPy, Apache Parquet, time-series resampling, 200-point distance-normalised feature extraction |
 | **Visualisation** | Streamlit, Plotly (radar/spider charts, heatmaps, bar charts, line overlays, scatter track maps, horizontal similarity bars) |
 | **APIs** | OpenF1 REST API (live + historical), OpenAI Chat Completions API |
-| **MLOps** | joblib model serialisation, SHAP feature importance, confusion matrix evaluation, cross-validation scoring |
+| **MLOps** | joblib model serialisation, SHAP feature importance, confusion matrix evaluation, cross-validation scoring, per-driver precision/recall/F1 metrics |
 | **Security** | Prompt injection prevention, input sanitisation, API key management (`st.secrets`), tool name allowlisting, argument clamping, rate limiting, LLM response sanitisation, JSON schema validation |
 
 ---
 
 ## Dashboard Overview
 
-The dashboard has three tabs. Each is independently functional.
+The dashboard has three tabs navigated via a custom pill-style navigation bar. Each tab is independently functional.
 
 | Tab | Name | What it does |
 |---|---|---|
 | 1 | **Driver Radar** | Driving style fingerprint visualisation + three agentic AI analysis features |
-| 2 | **Mystery Driver** | ML-based driver identification from a single lap + SHAP explainer + XAI narration |
+| 2 | **Mystery Driver** | ML-based driver identification from a single lap + SHAP explainer + XAI narration + model accuracy panel |
 | 3 | **Race Dashboard** | Live and historical race analytics + conversational AI race analyst |
+
+### Sidebar Controls
+
+The sidebar provides global controls available across all tabs:
+
+- **Model accuracy** — CV accuracy (±std dev), train accuracy, driver count, and lap count, loaded from `models/metrics.json`
+- **AI Response Mode toggle** — switch between **Concise** (3–6 sentence focused answers, lower token cost) and **Detailed** (multi-paragraph rich analysis, ~50% more tokens per call) across all five AI features simultaneously
+- **API key status** — live check for OpenAI key and required library imports
 
 ---
 
 ## Tab 1 — Driver Radar
 
-A full driving style analysis suite. Select 2–4 drivers to compare across six visualisation layers and three AI features.
+A full driving style analysis suite. Select 2–4 drivers to compare across six visualisation layers and three AI features. The AI features are displayed at the top of the tab for immediate access.
 
 ### Visualisation 1 — Driver Style Radar
 
@@ -90,7 +98,7 @@ Three distinct Agentic AI patterns, each architecturally different from the othe
 
 ```
 Analyst LLM
-  → generates a 4–6 sentence driving style narrative from radar data
+  → generates a driving style narrative from radar data
       ↓
 Critic LLM
   → evaluates the narrative against the raw data
@@ -108,6 +116,8 @@ Final narrative accepted
 The dashboard renders each round transparently in collapsible expanders — showing the critic's confidence score, any flagged factual errors, and the revision side by side. The user can see the self-improvement process live.
 
 The Critic is called with `temperature=0.0` (deterministic JSON) while the Analyst uses `temperature=0.4`. Parse failure on the Critic response gracefully accepts the existing narrative rather than failing.
+
+**Token budget:** Concise mode — 400 tokens (analyst). Detailed mode — 650 tokens (analyst); Critic unchanged at 300 tokens in both modes.
 
 **This pattern is used in production by:** Reflexion-based code-generation agents, automated essay revision systems, LLM-based test-case refinement pipelines.
 
@@ -134,6 +144,8 @@ The knowledge base is a curated dictionary of 10 F1 legends — Schumacher, Senn
 
 A horizontal bar chart shows all 10 similarity scores (x-axis zoomed to 0.80–1.0 to surface fine-grained ranking differences), with the top-2 matches highlighted in gold. The LLM narration is anchored exclusively to the retrieved data — no speculation.
 
+**Token budget:** Concise — 350 tokens. Detailed — 600 tokens.
+
 **This pattern is used in production by:** Enterprise knowledge base Q&A systems, document retrieval pipelines, AI assistants that ground responses in proprietary data.
 
 ---
@@ -157,17 +169,23 @@ Python validation layer checks every key, type, length constraint, and value ran
 Rendered as a structured UI card
 ```
 
-The report card schema enforces: `headline` (1 sentence with a data reference), `strengths` (exactly 3, each with a metric value), `weaknesses` (exactly 2), `race_craft_rating` / `raw_pace_rating` / `consistency_rating` (integers 1–10), `tactical_tips` (exactly 2), `style_tags` (3–5 short labels).
+The report card schema enforces: `headline` (1–2 sentences with ≥2 data references), `strengths` (exactly 3, each citing ≥2 metrics), `weaknesses` (exactly 2 with root-cause diagnosis), `race_craft_rating` / `raw_pace_rating` / `consistency_rating` (integers 1–10), `tactical_tips` (exactly 2 engineer-grade recommendations), `style_tags` (exactly 4 short labels).
 
 The UI renders this as: a headline, pill-style tag badges, rating bars with `st.progress`, a strengths/weaknesses two-column layout, and `st.info` tip cards.
 
 This is the only place in the codebase that uses `response_format={"type": "json_object"}` — a distinct call pattern from every other LLM call in the project.
+
+**Token budget:** Concise — 500 tokens. Detailed — 700 tokens.
 
 **This pattern is used in production by:** Structured data extraction pipelines, AI-generated reports, form-filling agents, API response generation.
 
 ---
 
 ## Tab 2 — Mystery Driver
+
+### AI Explainer (top of tab)
+
+The XAI explainer is displayed at the top of the Mystery Driver tab. Once a driver has been predicted, the **✨ Ask AI to Explain** button is immediately available without scrolling.
 
 ### ML Prediction
 
@@ -182,11 +200,23 @@ After the model predicts, clicking **✨ Ask AI to Explain** triggers the explai
 1. **SHAP inference** — `shap.TreeExplainer` computes per-feature SHAP values for the predicted sample at runtime, identifying each feature's contribution to the predicted driver class
 2. **Percentile ranking** — each feature value is ranked against the full training dataset distribution
 3. **Structured prompt** — SHAP magnitudes, feature values, and percentile ranks are assembled into a validated prompt. No raw user text ever enters the prompt.
-4. **LLM narration** — `gpt-4o-mini` produces a plain-English explanation (3–5 sentences)
+4. **LLM narration** — `gpt-4o-mini` produces a plain-English explanation
 5. **Session cache** — the explanation is stored in `st.session_state` and cleared when the user picks a different lap
 
-**Example output:**
+**Token budget:** Concise — 300 tokens. Detailed — 500 tokens (with richer 2–3 paragraph system prompt covering feature-by-feature SHAP breakdown and driver technique fingerprinting).
+
+**Example output (Concise):**
 > *"The model identified this lap as Verstappen with 73% confidence. The key signals were unusually high brake_events at the 91st percentile and low steer_std at the 8th percentile — indicating aggressive, precisely timed braking with surgical steering control. max_speed at the 88th percentile further reinforced the high-speed commitment characteristic of his telemetry fingerprint."*
+
+### Model Accuracy Panel
+
+A dedicated section at the bottom of the Mystery Driver tab shows full model evaluation results loaded from `models/metrics.json`:
+
+- **Top-line metrics** — CV Accuracy (±std dev), Train Accuracy, driver count, lap count
+- **Per-fold CV scores** — collapsible expander showing each fold's accuracy with delta vs. the mean
+- **Per-driver metrics table** — precision, recall, F1 score, and support per driver, colour-coded by F1 (green ≥ 90%, amber ≥ 70%, red < 70%)
+
+These metrics are also summarised in the sidebar for quick reference.
 
 ---
 
@@ -194,35 +224,9 @@ After the model predicts, clicking **✨ Ask AI to Explain** triggers the explai
 
 Real-time and historical race analysis powered by the OpenF1 API. No API key required for the data.
 
-### Fastest Lap Telemetry Comparison
+### Race Intelligence Chat Agent — AI Feature 5 *(top of tab)*
 
-Five channels comparing two drivers over their fastest recorded lap, fetched live from OpenF1:
-
-| Channel | What it shows |
-|---|---|
-| **Time Delta** | Cumulative time gap through the lap. Shaded regions show where each driver is gaining. |
-| **Track Map** | Circuit outline coloured by faster driver per microsector (~999 segments). |
-| **Speed** | Overlaid speed traces (km/h) vs. distance |
-| **Throttle** | Overlaid throttle application (%) vs. distance |
-| **Brake** | Overlaid brake pressure (%) vs. distance |
-
-### 7 Race Analysis Charts
-
-| Chart | What it shows |
-|---|---|
-| **Rolling Race Pace** | 5-lap rolling-average lap time per driver. Pit-out and safety car laps filtered automatically. |
-| **Gap to Leader** | Cumulative time gap to the race leader per lap, shaded per driver. |
-| **Undercut / Overcut Alerts** | Triangle markers on the gap chart at the exact lap a pit strategy caused a position swap. |
-| **Projected Finishing Order** | Projected final gaps accounting for current pace, tyre degradation, and DNF flags. |
-| **Average Race Pace** | Bars per driver coloured by consistency (Viridis scale). Hover shows mean, median, std dev, fastest lap, lap count. |
-| **Race Pace Ranking** | Bars sorted fastest to slowest with ±std dev error bars. |
-| **Tyre Degradation by Compound** | Scatter of mean stint pace vs. degradation rate (s/lap) from per-stint linear regression. |
-
-**Live mode** — connects to the OpenF1 live feed during an active F1 race weekend. Auto-refreshes at 10s / 30s / 60s intervals.
-
-**Historical mode** — analyse any race from 2022 onwards from the OpenF1 archive.
-
-### Race Intelligence Chat Agent — AI Feature 5
+The chat panel appears at the top of the Race Dashboard tab so it's immediately accessible. The input is a tab-scoped inline form rather than a floating page-level bar.
 
 **Pattern: ReAct tool-calling agent (Reason + Act loop)**
 
@@ -255,6 +259,8 @@ Plain-prose answer rendered in chat UI
 | `get_tyre_degradation` | `analyser.tyre_degradation()` | Degradation rate per driver/compound |
 | `get_pace_summary` | `analyser.pace_summary()` | Mean, median, fastest lap per driver |
 
+**Token budget:** Concise — 500 tokens. Detailed — 700 tokens (6–10 sentences with citations, forward-looking close, bold key numbers).
+
 **Example questions:**
 > *"Who has the best pace over the last 10 laps?"*
 > *"Is Verstappen likely to undercut Norris? What does the gap look like?"*
@@ -273,9 +279,61 @@ Plain-prose answer rendered in chat UI
 | 5 | History poisoning via long LLM responses | Per-message 2000-char truncation |
 | 6 | Hardcoded API key | `_get_openai_api_key()` reads `st.secrets` / env var only |
 | 7 | Infinite agent loop | `MAX_TOOL_ROUNDS = 3` hard cap + forced synthesis fallback |
-| 8 | Context window / cost blowout | 20-message history cap + `max_tokens=500` |
+| 8 | Context window / cost blowout | 20-message history cap + `max_tokens` controlled by response mode |
 | 9 | API spam / cost abuse | 5-second per-session rate limiter |
 | 10 | Corrupt state on failed turn | User message popped from history on API error |
+
+### Fastest Lap Telemetry Comparison
+
+Five channels comparing two drivers over their fastest recorded lap, fetched live from OpenF1:
+
+| Channel | What it shows |
+|---|---|
+| **Time Delta** | Cumulative time gap through the lap. Shaded regions show where each driver is gaining. |
+| **Track Map** | Circuit outline with circle microsectors (~999 segments) coloured by faster driver. Includes braking zone overlays (hollow red rings), full-throttle overlays (hollow green rings), auto-detected corner labels (T1–T12), a start/finish marker, a lap time subtitle showing both drivers' times and the gap, and rich per-microsector hover showing speed, throttle, and brake for both drivers. |
+| **Speed** | Overlaid speed traces (km/h) vs. distance |
+| **Throttle** | Overlaid throttle application (%) vs. distance |
+| **Brake** | Overlaid brake pressure (%) vs. distance |
+
+### 7 Race Analysis Charts
+
+| Chart | What it shows |
+|---|---|
+| **Rolling Race Pace** | 5-lap rolling-average lap time per driver. Pit-out and safety car laps filtered automatically. |
+| **Gap to Leader** | Cumulative time gap to the race leader per lap, shaded per driver. |
+| **Undercut / Overcut Alerts** | Triangle markers on the gap chart at the exact lap a pit strategy caused a position swap. |
+| **Projected Finishing Order** | Projected final gaps accounting for current pace, tyre degradation, and DNF flags. |
+| **Average Race Pace** | Bars per driver coloured by consistency (Viridis scale). Hover shows mean, median, std dev, fastest lap, lap count. |
+| **Race Pace Ranking** | Bars sorted fastest to slowest with ±std dev error bars. |
+| **Tyre Degradation by Compound** | Scatter of mean stint pace vs. degradation rate (s/lap) from per-stint linear regression. |
+
+**Live mode** — connects to the OpenF1 live feed during an active F1 race weekend. Auto-refreshes at 10s / 30s / 60s intervals.
+
+**Historical mode** — analyse any race from 2022 onwards from the OpenF1 archive.
+
+---
+
+## AI Response Mode Toggle
+
+A sidebar radio button lets users switch all five AI features between two response depths simultaneously:
+
+| Mode | Behaviour | Token budget |
+|---|---|---|
+| **Concise** (default) | 3–6 sentence focused answers | Lower cost |
+| **Detailed** | Multi-paragraph rich analysis with bold numbers, data citations, forward-looking observations | ~50% more tokens per call |
+
+**Token budget by feature:**
+
+| Feature | Concise | Detailed |
+|---|---|---|
+| XAI Explainer | 300 | 500 |
+| Reflexion Analyst | 400 | 650 |
+| Reflexion Critic | 300 | 300 (unchanged) |
+| RAG DNA Match | 350 | 600 |
+| Report Card | 500 | 700 |
+| Race Chat | 500 | 700 |
+
+Switching modes does not change the data passed to the model — only the system prompt and token budget change. All existing session state and caching behaviour is preserved.
 
 ---
 
@@ -326,6 +384,13 @@ Three additional features are derived at runtime from the 200-point traces for t
 
 A gradient-boosted tree multi-class classifier trained with **5-fold stratified cross-validation**. Each F1 driver is one class. SHAP `TreeExplainer` generates both global feature importance (saved as `models/shap_importance.png` at training time) and local per-prediction explanations at inference time.
 
+After training, `evaluate_model` saves `models/metrics.json` with:
+- CV mean accuracy and standard deviation
+- Per-fold accuracy scores
+- Full-dataset train accuracy
+- Per-driver precision, recall, F1 score, and support (lap count)
+- Total sample and driver counts
+
 ### 4. Circuit geometry store (`src/generate_circuits.py`)
 
 A one-off script extracts XY circuit outlines for all 24 Grand Prix from FastF1 and writes them to `data/circuits.json` at **500 resampled distance points** per circuit. Resume-safe — skips circuits already written.
@@ -349,7 +414,7 @@ driver-dna/
 ├── src/
 │   ├── app.py                   # Streamlit dashboard — 3 tabs, 5 AI features, 13+ chart types
 │   ├── pipeline.py              # Data extraction, telemetry resampling, feature engineering
-│   ├── model.py                 # XGBoost training, CV evaluation, SHAP analysis
+│   ├── model.py                 # XGBoost training, CV evaluation, SHAP analysis, metrics.json
 │   ├── race_engine.py           # Pace analytics, gap tracking, undercut detection, projections
 │   ├── openf1.py                # OpenF1 REST API client (live + historical modes)
 │   └── generate_circuits.py     # One-off: generates data/circuits.json
@@ -360,7 +425,8 @@ driver-dna/
 ├── models/                      # Git-ignored — generated locally
 │   ├── driver_dna_clf.joblib    # Trained XGBoost classifier
 │   ├── label_encoder.joblib     # sklearn LabelEncoder
-│   ├── accuracy.txt             # Cross-validation accuracy
+│   ├── accuracy.txt             # Cross-validation accuracy (plain float)
+│   ├── metrics.json             # Detailed metrics: CV scores, train accuracy, per-driver F1
 │   ├── confusion_matrix.html    # Per-driver confusion matrix heatmap
 │   └── shap_importance.png      # Global SHAP feature importance chart
 ├── .streamlit/
@@ -422,11 +488,13 @@ python src/pipeline.py
 
 ### 5. Train the classifier
 
-Runs 5-fold stratified CV, saves the model, label encoder, accuracy, confusion matrix, and SHAP importance chart to `models/`:
+Runs 5-fold stratified CV, saves the model, label encoder, accuracy, confusion matrix, SHAP importance chart, and detailed `models/metrics.json` to `models/`:
 
 ```bash
 python src/model.py
 ```
+
+The terminal will print per-fold accuracy, mean CV accuracy ±std dev, full-dataset train accuracy, and a complete per-driver classification report.
 
 ### 6. Launch the dashboard
 
@@ -457,6 +525,9 @@ Wrong Python interpreter. In VS Code: `⇧⌘P` → **Python: Select Interpreter
 
 **Track Map or Throttle Map shows no data**
 `data/circuits.json` not yet generated. Run `python src/generate_circuits.py`.
+
+**Model accuracy panel shows nothing in Mystery Driver tab**
+`models/metrics.json` not yet generated. Re-run `python src/model.py`. If the panel still does not appear, `models/accuracy.txt` is used as a fallback in the sidebar.
 
 **AI features: "OpenAI rate limit reached"**
 The OpenAI API requires a paid account. Free-tier accounts have no API access — enable billing at `platform.openai.com/settings/billing`.
