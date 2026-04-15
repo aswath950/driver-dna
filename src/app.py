@@ -10,11 +10,13 @@ Expected columns from dataset.parquet:
   gear_changes, steer_std, speed_trace, throttle_trace, brake_trace
 """
 
+import hashlib
 import json
+import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import cast
 from pathlib import Path
 import numpy as np
@@ -34,6 +36,42 @@ CIRCUITS_PATH = DATA_DIR / "circuits.json"
 ACCURACY_PATH = MODELS_DIR / "accuracy.txt"
 METRICS_PATH  = MODELS_DIR / "metrics.json"
 DATASET_META_PATH = DATA_DIR / "dataset_meta.json"
+LLM_AUDIT_PATH = MODELS_DIR / "llm_audit.jsonl"
+
+# ── Structured logging ───────────────────────────────────────────────────────
+logging.basicConfig(format="%(message)s", level=logging.INFO)
+_logger = logging.getLogger("driver_dna")
+
+
+def _log_llm_call(
+    feature: str,
+    model: str,
+    latency_ms: float,
+    prompt_tokens: int,
+    completion_tokens: int,
+    success: bool,
+    error_type: str | None = None,
+) -> None:
+    """Append one JSON line to the LLM audit log (models/llm_audit.jsonl)."""
+    entry: dict = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "feature": feature,
+        "model": model,
+        "latency_ms": round(latency_ms),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "success": success,
+    }
+    if error_type:
+        entry["error_type"] = error_type
+    line = json.dumps(entry)
+    _logger.info(line)
+    try:
+        with open(LLM_AUDIT_PATH, "a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass  # never crash the dashboard due to logging
 N_POINTS = 200
 TRACE_COLS = {"Speed": "speed_trace", "Throttle": "throttle_trace", "Brake": "brake_trace"}
 # OpenF1 car_data column names for the same channels
@@ -848,35 +886,6 @@ def _build_explain_prompt(
     return system_msg, user_msg
 
 
-def _call_openai_explainer(api_key: str, system_msg: str, user_msg: str) -> tuple:
-    """Call GPT-4o-mini. Returns (text, None) on success or (None, error_msg) on failure.
-    Raw exceptions are never surfaced to the UI."""
-    from openai import OpenAI, AuthenticationError, RateLimitError, APIError
-    try:
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": user_msg},
-            ],
-            max_tokens=300,
-            temperature=0.4,
-        )
-        text = resp.choices[0].message.content
-        if not text:
-            return None, "OpenAI returned an empty response. Try again."
-        return text.strip(), None
-    except AuthenticationError:
-        return None, "OpenAI API key is invalid. Check `.streamlit/secrets.toml`."
-    except RateLimitError:
-        return None, "OpenAI rate limit reached. Wait a moment and try again."
-    except APIError as e:
-        return None, f"OpenAI service error ({type(e).__name__}). Try again shortly."
-    except Exception:
-        return None, "Unexpected error contacting OpenAI. Try again."
-
-
 def _call_openai_llm(
     api_key: str,
     system_msg: str,
@@ -884,17 +893,21 @@ def _call_openai_llm(
     max_tokens: int = 300,
     temperature: float = 0.4,
     json_mode: bool = False,
+    feature_name: str = "llm",
 ) -> tuple:
-    """Flexible LLM helper used by the three agentic AI features.
+    """Unified LLM helper for all agentic AI features.
 
     Returns (text, None) on success or (None, error_msg) on failure.
     Set json_mode=True to request response_format={"type": "json_object"}.
+    Every call is timed and appended to models/llm_audit.jsonl.
     """
     from openai import OpenAI, AuthenticationError, RateLimitError, APIError
+    _MODEL = "gpt-4o-mini"
+    t0 = time.perf_counter()
     try:
         client = OpenAI(api_key=api_key)
         kwargs: dict = dict(
-            model="gpt-4o-mini",
+            model=_MODEL,
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user",   "content": user_msg},
@@ -906,16 +919,30 @@ def _call_openai_llm(
             kwargs["response_format"] = {"type": "json_object"}
         resp = client.chat.completions.create(**kwargs)
         text = resp.choices[0].message.content
+        latency_ms = (time.perf_counter() - t0) * 1000
+        usage = resp.usage
+        _log_llm_call(
+            feature=feature_name,
+            model=_MODEL,
+            latency_ms=latency_ms,
+            prompt_tokens=usage.prompt_tokens if usage else 0,
+            completion_tokens=usage.completion_tokens if usage else 0,
+            success=True,
+        )
         if not text:
             return None, "OpenAI returned an empty response. Try again."
         return text.strip(), None
     except AuthenticationError:
+        _log_llm_call(feature_name, _MODEL, (time.perf_counter()-t0)*1000, 0, 0, False, "AuthenticationError")
         return None, "OpenAI API key is invalid. Check `.streamlit/secrets.toml`."
     except RateLimitError:
+        _log_llm_call(feature_name, _MODEL, (time.perf_counter()-t0)*1000, 0, 0, False, "RateLimitError")
         return None, "OpenAI rate limit reached. Wait a moment and try again."
     except APIError as e:
+        _log_llm_call(feature_name, _MODEL, (time.perf_counter()-t0)*1000, 0, 0, False, type(e).__name__)
         return None, f"OpenAI service error ({type(e).__name__}). Try again shortly."
     except Exception:
+        _log_llm_call(feature_name, _MODEL, (time.perf_counter()-t0)*1000, 0, 0, False, "UnexpectedError")
         return None, "Unexpected error contacting OpenAI. Try again."
 
 
@@ -1035,7 +1062,8 @@ def _ra_run_reflexion(
 
     def analyst_call(user_msg: str) -> tuple:
         return _call_openai_llm(api_key, _analyst_system, user_msg,
-                                max_tokens=_analyst_tokens, temperature=0.4)
+                                max_tokens=_analyst_tokens, temperature=0.4,
+                                feature_name="reflexion_analyst")
 
     def critic_call(narrative: str) -> tuple:
         user_msg = (
@@ -1045,7 +1073,8 @@ def _ra_run_reflexion(
             "Respond with a JSON object only."
         )
         return _call_openai_llm(api_key, _RA_CRITIC_SYSTEM, user_msg,
-                                max_tokens=300, temperature=0.0)
+                                max_tokens=300, temperature=0.0,
+                                feature_name="reflexion_critic")
 
     iterations: list[dict] = []
 
@@ -1184,7 +1213,8 @@ def _rag_run_dna_match(
     _rag_sys = _RAG_SYSTEM_VERBOSE if verbose else _RAG_SYSTEM
     _rag_tokens = 600 if verbose else 350
     narrative, err = _call_openai_llm(api_key, _rag_sys, user_msg,
-                                      max_tokens=_rag_tokens, temperature=0.4)
+                                      max_tokens=_rag_tokens, temperature=0.4,
+                                      feature_name="rag_dna_match")
     if err:
         return None, err
     return {"driver": driver, "matches": matches, "narrative": narrative}, None
@@ -1360,7 +1390,8 @@ def _rc_run_report(
 
     # Attempt 1
     raw_json, err = _call_openai_llm(api_key, _rc_sys, user_msg,
-                                     max_tokens=_rc_tokens, temperature=0.4, json_mode=True)
+                                     max_tokens=_rc_tokens, temperature=0.4, json_mode=True,
+                                     feature_name="report_card")
     if err:
         return None, err
     try:
@@ -1378,7 +1409,8 @@ def _rc_run_report(
         "Fix the issue and respond with the corrected JSON object only."
     )
     raw_json2, err2 = _call_openai_llm(api_key, _rc_sys, correction_msg,
-                                       max_tokens=_rc_tokens, temperature=0.4, json_mode=True)
+                                       max_tokens=_rc_tokens, temperature=0.4, json_mode=True,
+                                       feature_name="report_card_retry")
     if err2:
         return None, err2
     try:
@@ -1398,28 +1430,34 @@ def _call_openai_chat(api_key: str, messages: list, tools: list, max_tokens: int
       ("text",       final_text,      None)  — LLM produced a final answer
       ("tool_calls", tool_calls_list, None)  — LLM wants to invoke tools
       (None,         None,            error) — API failure
+    Every call is timed and appended to models/llm_audit.jsonl.
     """
     from openai import OpenAI, AuthenticationError, RateLimitError, APIError
+    _MODEL = "gpt-4o-mini"
+    t0 = time.perf_counter()
     try:
         client = OpenAI(api_key=api_key)
+        kwargs: dict = dict(
+            model=_MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.4,
+        )
         if tools:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                max_tokens=max_tokens,
-                temperature=0.4,
-            )
-        else:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=0.4,
-            )
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        resp = client.chat.completions.create(**kwargs)
         choice = resp.choices[0]
         msg = choice.message
+        usage = resp.usage
+        _log_llm_call(
+            feature="chat_agent",
+            model=_MODEL,
+            latency_ms=(time.perf_counter() - t0) * 1000,
+            prompt_tokens=usage.prompt_tokens if usage else 0,
+            completion_tokens=usage.completion_tokens if usage else 0,
+            success=True,
+        )
         if choice.finish_reason == "tool_calls" and msg.tool_calls:
             return "tool_calls", msg.tool_calls, None
         text = msg.content
@@ -1427,12 +1465,16 @@ def _call_openai_chat(api_key: str, messages: list, tools: list, max_tokens: int
             return None, None, "OpenAI returned an empty response. Try again."
         return "text", text.strip(), None
     except AuthenticationError:
+        _log_llm_call("chat_agent", _MODEL, (time.perf_counter()-t0)*1000, 0, 0, False, "AuthenticationError")
         return None, None, "OpenAI API key is invalid. Check `.streamlit/secrets.toml`."
     except RateLimitError:
+        _log_llm_call("chat_agent", _MODEL, (time.perf_counter()-t0)*1000, 0, 0, False, "RateLimitError")
         return None, None, "OpenAI rate limit reached. Wait a moment and try again."
     except APIError as e:
+        _log_llm_call("chat_agent", _MODEL, (time.perf_counter()-t0)*1000, 0, 0, False, type(e).__name__)
         return None, None, f"OpenAI service error ({type(e).__name__}). Try again shortly."
     except Exception:
+        _log_llm_call("chat_agent", _MODEL, (time.perf_counter()-t0)*1000, 0, 0, False, "UnexpectedError")
         return None, None, "Unexpected error contacting OpenAI. Try again."
 
 # ── End LLM Explainer helpers ───────────────────────────────────────────────
@@ -2689,7 +2731,8 @@ if _active_tab == "Mystery Driver":
                                 verbose=_md_verbose,
                             )
                             explanation, err = _call_openai_llm(
-                                api_key, system_msg, user_msg, max_tokens=_md_max_tokens
+                                api_key, system_msg, user_msg, max_tokens=_md_max_tokens,
+                                feature_name="xai_explainer",
                             )
                             if err:
                                 st.error(err)

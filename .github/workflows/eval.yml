@@ -1,0 +1,61 @@
+name: LLM Eval
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  eval:
+    name: LLM Evaluation (offline)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run offline evaluations
+        # RAG retrieval and audit-log cost report run without any API key.
+        # Live evaluations (Reflexion, Report Card) are skipped in CI.
+        run: python src/eval_llm.py
+
+      - name: Upload eval artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: llm-eval-results
+          path: models/eval_*.json
+
+      - name: Post eval summary to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'models/eval_rag.json';
+            if (!fs.existsSync(path)) return;
+            const rag = JSON.parse(fs.readFileSync(path));
+            const body = [
+              '## LLM Eval Results',
+              '',
+              '### RAG Retrieval Sanity',
+              `- Profiles evaluated: **${rag.n_profiles ?? '?'}**`,
+              `- Self-match rate: **${rag.self_match_rate != null ? (rag.self_match_rate * 100).toFixed(1) + '%' : '?'}**`,
+              `- Mean retrieval margin: **${rag.mean_retrieval_margin ?? '?'}**`,
+              '',
+              '_Live evaluations (Reflexion, Report Card) require an API key and run locally._',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
