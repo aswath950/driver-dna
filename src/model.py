@@ -30,6 +30,7 @@ if _expected_venv.exists() and not sys.prefix.startswith(str(_expected_venv)):
     )
     sys.exit(1)
 
+import json
 import pandas as pd
 import numpy as np
 import joblib
@@ -40,7 +41,7 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 from xgboost import XGBClassifier
 
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -122,14 +123,50 @@ def evaluate_model(
     class_names = list(label_encoder.classes_)
     y_pred = model.predict(X)
 
+    # --- Full-data (train) accuracy ---
+    train_accuracy = float(accuracy_score(y, y_pred))
+    print(f"Train accuracy (full dataset): {train_accuracy:.4f}")
+
     # --- CV accuracy → accuracy.txt ---
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     cv_scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy")
     cv_mean = float(cv_scores.mean())
+    cv_std = float(cv_scores.std())
     (MODELS_DIR / "accuracy.txt").write_text(f"{cv_mean:.3f}")
-    print(f"CV accuracy: {cv_mean:.3f} (saved to accuracy.txt)")
+    print(f"CV accuracy: {cv_mean:.4f} ± {cv_std:.4f} (saved to accuracy.txt)")
 
-    # --- Classification report ---
+    # --- Per-driver metrics from classification report ---
+    report_dict = classification_report(
+        y, y_pred, target_names=class_names, output_dict=True
+    )
+    per_driver = {
+        driver: {
+            "precision": round(report_dict[driver]["precision"], 4),
+            "recall":    round(report_dict[driver]["recall"], 4),
+            "f1_score":  round(report_dict[driver]["f1-score"], 4),
+            "support":   int(report_dict[driver]["support"]),
+        }
+        for driver in class_names
+        if driver in report_dict
+    }
+
+    # --- Save metrics.json ---
+    metrics = {
+        "cv_mean":       round(cv_mean, 4),
+        "cv_std":        round(cv_std, 4),
+        "fold_scores":   [round(float(s), 4) for s in cv_scores],
+        "train_accuracy": round(train_accuracy, 4),
+        "n_samples":     int(len(y)),
+        "n_drivers":     int(len(class_names)),
+        "drivers":       class_names,
+        "per_driver":    per_driver,
+    }
+    metrics_path = MODELS_DIR / "metrics.json"
+    with open(metrics_path, "w") as _f:
+        json.dump(metrics, _f, indent=2)
+    print(f"Saved detailed metrics → {metrics_path}")
+
+    # --- Classification report (human-readable) ---
     print(classification_report(y, y_pred, target_names=class_names))
 
     # --- Confusion matrix (plotly) ---
