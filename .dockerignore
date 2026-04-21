@@ -1,0 +1,41 @@
+# Python virtualenv
+.venv/
+venv/
+env/
+
+# FastF1 session cache (can be several GB)
+data/2024/
+data/2025/
+data/2026/
+data/fastf1_http_cache.sqlite
+
+# Runtime LLM audit log
+models/llm_audit.jsonl
+models/eval_*.json
+
+# Dev / build artefacts
+__pycache__/
+*.py[cod]
+*.so
+.eggs/
+dist/
+build/
+
+# Git / IDE / OS
+.git/
+.github/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/
+
+# Secrets — never bake into the image
+.streamlit/secrets.toml
+.env
+
+# Dev dependencies
+requirements-dev.txt
+
+# Test files
+tests/
