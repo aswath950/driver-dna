@@ -1,128 +1,29 @@
 """
-test_app_helpers.py — Tests for pure logic helpers from src/app.py
+test_app_helpers.py — Tests for pure logic helpers from src/llm_layer.py
 
-These functions are copied inline here to avoid triggering Streamlit's
-module-level st.set_page_config() call at import time. After the planned
-module split (llm_layer.py, features.py), this file will import directly
-from the new modules instead.
+Imports directly from the new llm_layer module — no Streamlit dependency,
+no inline copies needed.
 """
 
 import json
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-# ===========================================================================
-# Copied helpers — keep in sync with src/app.py until module split
-# ===========================================================================
-
-def _ra_parse_critique(raw_text: str) -> tuple:
-    try:
-        data = json.loads(raw_text)
-    except (json.JSONDecodeError, TypeError):
-        return None, "Critic returned non-JSON response."
-    if not isinstance(data, dict):
-        return None, "Critic response was not a JSON object."
-    try:
-        confidence = max(1, min(10, int(data.get("confidence", 10))))
-    except (TypeError, ValueError):
-        return None, "Critic 'confidence' field missing or invalid."
-    factual_errors = data.get("factual_errors", [])
-    improvements = data.get("suggested_improvements", [])
-    return {
-        "confidence": confidence,
-        "factual_errors": [str(e) for e in (factual_errors if isinstance(factual_errors, list) else [])[:5]],
-        "suggested_improvements": [str(s) for s in (improvements if isinstance(improvements, list) else [])[:3]],
-    }, None
-
-
-_RC_SCHEMA: dict = {
-    "headline":           (str,  None, None),
-    "strengths":          (list, 3,    3),
-    "weaknesses":         (list, 2,    2),
-    "race_craft_rating":  (int,  1,    10),
-    "raw_pace_rating":    (int,  1,    10),
-    "consistency_rating": (int,  1,    10),
-    "tactical_tips":      (list, 2,    2),
-    "style_tags":         (list, 3,    5),
-}
-
-
-def _rc_validate_report(data: dict) -> tuple:
-    for key, (expected_type, lo, hi) in _RC_SCHEMA.items():
-        if key not in data:
-            return False, f"Missing required key: '{key}'"
-        val = data[key]
-        if expected_type == int:
-            try:
-                int_val = int(val)
-            except (TypeError, ValueError):
-                return False, f"Key '{key}' must be integer, got {type(val).__name__}"
-            if lo is not None and not (lo <= int_val <= hi):
-                return False, f"Key '{key}' value {int_val} outside range [{lo}, {hi}]"
-            data[key] = int_val
-        elif expected_type == list:
-            if not isinstance(val, list):
-                return False, f"Key '{key}' must be a list, got {type(val).__name__}"
-            if lo is not None and len(val) < lo:
-                return False, f"Key '{key}' has {len(val)} items, minimum is {lo}"
-            if hi is not None and len(val) > hi:
-                data[key] = val[:hi]
-            for i, item in enumerate(data[key]):
-                if not isinstance(item, str):
-                    return False, f"Key '{key}[{i}]' must be a string"
-                data[key][i] = item.replace("<", "").replace(">", "")
-        elif expected_type == str:
-            if not isinstance(val, str):
-                return False, f"Key '{key}' must be a string, got {type(val).__name__}"
-            data[key] = val.replace("<", "").replace(">", "")
-    return True, ""
-
-
-_CA_MAX_INPUT_LEN = 500
-
-_CA_TOOL_ARG_SCHEMAS: dict[str, dict] = {
-    "get_rolling_pace":        {"window": (int, 2, 15), "top_n": (int, 1, 20)},
-    "detect_strategy_events":  {"lookahead": (int, 1, 10)},
-    "project_finishing_order": {"laps_remaining": (int, 1, 80)},
-}
-
-
-def _ca_sanitize_input(text: str) -> tuple:
-    text = text.strip()
-    if not text:
-        return "", "Please enter a question."
-    if len(text) > _CA_MAX_INPUT_LEN:
-        return "", f"Message too long ({len(text)} chars). Please keep it under {_CA_MAX_INPUT_LEN} characters."
-    cleaned = "".join(ch for ch in text if ch in ("\n", "\t") or ord(ch) >= 0x20)
-    if not cleaned:
-        return "", "Message contained only invalid characters."
-    return cleaned, None
-
-
-def _ca_validate_tool_args(tool_name: str, args: dict) -> tuple:
-    schema = _CA_TOOL_ARG_SCHEMAS.get(tool_name, {})
-    cleaned: dict = {}
-    for key, (typ, lo, hi) in schema.items():
-        raw = args.get(key)
-        if raw is None:
-            cleaned[key] = lo
-            continue
-        try:
-            val = typ(raw)
-        except (ValueError, TypeError):
-            return {}, f"Tool '{tool_name}': argument '{key}' must be {typ.__name__}, got {raw!r}"
-        cleaned[key] = max(lo, min(val, hi))
-    return cleaned, None
-
-
-def _rag_cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
-    norm_a = np.linalg.norm(vec_a)
-    norm_b = np.linalg.norm(vec_b)
-    if norm_a < 1e-9 or norm_b < 1e-9:
-        return 0.0
-    return float(np.dot(vec_a, vec_b) / (norm_a * norm_b))
+from llm_layer import (
+    _ra_parse_critique,
+    _rc_validate_report,
+    _ca_sanitize_input,
+    _ca_validate_tool_args,
+    _rag_cosine_similarity,
+    _RC_SCHEMA,
+    _CA_MAX_INPUT_LEN,
+    _CA_TOOL_ARG_SCHEMAS,
+)
 
 
 # ===========================================================================
