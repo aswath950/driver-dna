@@ -77,7 +77,6 @@ class RaceAnalyser:
             return pd.DataFrame(columns=["driver_number", "lap_number", "position"])
 
         # Merge lap timestamps so we can assign each position row to a lap
-        laps_ts = self._laps[["driver_number", "lap_number"]].drop_duplicates()
         # Fallback: build a position-per-lap by picking the last reported
         # position entry whose date <= lap completion.
         if "date" in pos.columns and "date" in self._laps.columns:
@@ -154,7 +153,7 @@ class RaceAnalyser:
         st = st.sort_values("stint_number")
         # Each stint after the first starts with a pit stop.
         pit_laps = st["lap_start"].iloc[1:].tolist() if len(st) > 1 else []
-        return [int(l) for l in pit_laps if pd.notna(l)]
+        return [int(lap) for lap in pit_laps if pd.notna(lap)]
 
     # ------------------------------------------------------------------
     # 1. Rolling pace

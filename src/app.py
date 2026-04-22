@@ -30,25 +30,25 @@ from model import load_model, FEATURE_COLS, DATA_DIR, MODELS_DIR
 from openf1 import OpenF1Client
 from race_engine import RaceAnalyser
 from features import (
-    N_POINTS, TRACE_COLS, OPENF1_TRACE_COLS, SPECIAL_CHANNELS,
+    N_POINTS, TRACE_COLS, SPECIAL_CHANNELS,
     RADAR_FEATURES, EXTENDED_RADAR_FEATURES, FEATURE_LABELS,
     compute_extended_features, compute_mean_trace, compute_sector_means,
     get_shap_explainer, compute_shap_for_prediction,
     _validate_feature_values, _sanitize_driver_name, classify_archetype,
 )
 from viz import (
-    RACE_PALETTE,
     _build_throttle_map_fig, _fetch_fastest_lap_openf1,
     _fetch_fastest_lap_all_openf1, _build_track_map_fig,
     _build_time_delta_fig, _driver_color_map, _resolve_pair_colours,
 )
 from llm_layer import (
-    _log_llm_call, _build_explain_prompt,
+    _build_explain_prompt,
     _call_openai_llm, _call_openai_chat,
-    _ra_build_driver_data_block, _ra_parse_critique, _ra_run_reflexion,
+    _ra_build_driver_data_block, _ra_run_reflexion,
+    _rag_retrieve_top_k, _RAG_HISTORICAL_PROFILES,
     _rag_run_dna_match,
     _rc_run_report,
-    _ca_sanitize_input, _ca_validate_tool_args, _ca_dispatch_tool,
+    _ca_sanitize_input, _ca_dispatch_tool,
     _CA_TOOLS, _CA_MAX_TOOLS_PER_ROUND,
     _CA_SYSTEM_PROMPT, _CA_SYSTEM_VERBOSE,
     _RA_RATE_LIMIT_SECS, _RAG_RATE_LIMIT_SECS, _RC_RATE_LIMIT_SECS,
@@ -866,11 +866,15 @@ if _active_tab == "Driver Radar":
 
                     def _rating_tier(v: int) -> tuple[str, str]:
                         """Return (tier label, hex colour) for a 1-10 rating."""
-                        if v >= 9:  return "Elite",         "#00e676"
-                        if v >= 7:  return "Strong",        "#69f0ae"
-                        if v >= 5:  return "Good",          "#ffd740"
-                        if v >= 3:  return "Average",       "#ff9100"
-                        return              "Below Average", "#ff5252"
+                        if v >= 9:
+                            return "Elite", "#00e676"
+                        if v >= 7:
+                            return "Strong", "#69f0ae"
+                        if v >= 5:
+                            return "Good", "#ffd740"
+                        if v >= 3:
+                            return "Average", "#ff9100"
+                        return "Below Average", "#ff5252"
 
                     def _rating_bar_html(label: str, value: int, tooltip: str) -> str:
                         tier, color = _rating_tier(value)
