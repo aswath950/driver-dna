@@ -30,9 +30,8 @@ if _expected_venv.exists() and not sys.prefix.startswith(str(_expected_venv)):
     )
     sys.exit(1)
 
-import fastf1
-import numpy as np
-import pandas as pd
+import fastf1  # noqa: E402
+import numpy as np  # noqa: E402
 
 CACHE_DIR = Path(__file__).parent.parent / "data"
 OUTPUT_PATH = CACHE_DIR / "circuits.json"

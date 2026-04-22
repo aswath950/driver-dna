@@ -6,7 +6,6 @@ these tests run fully offline with no real network access.
 """
 
 import requests
-import unittest.mock
 from unittest.mock import patch
 
 import pandas as pd

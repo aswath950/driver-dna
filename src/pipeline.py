@@ -28,9 +28,9 @@ if _expected_venv.exists() and not sys.prefix.startswith(str(_expected_venv)):
     )
     sys.exit(1)
 
-import fastf1
-import pandas as pd
-import numpy as np
+import fastf1  # noqa: E402
+import pandas as pd  # noqa: E402
+import numpy as np  # noqa: E402
 
 CACHE_DIR = Path(__file__).parent.parent / "data"
 DATASET_PATH = CACHE_DIR / "dataset.parquet"
