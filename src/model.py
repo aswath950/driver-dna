@@ -30,19 +30,19 @@ if _expected_venv.exists() and not sys.prefix.startswith(str(_expected_venv)):
     )
     sys.exit(1)
 
-import json
-import pandas as pd
-import numpy as np
-import joblib
-import shap
-import matplotlib
+import json  # noqa: E402
+import pandas as pd  # noqa: E402
+import numpy as np  # noqa: E402
+import joblib  # noqa: E402
+import shap  # noqa: E402
+import matplotlib  # noqa: E402
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import plotly.graph_objects as go
-from sklearn.model_selection import StratifiedKFold, cross_val_score
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-from xgboost import XGBClassifier
+import matplotlib.pyplot as plt  # noqa: E402
+import plotly.graph_objects as go  # noqa: E402
+from sklearn.model_selection import StratifiedKFold, cross_val_score  # noqa: E402
+from sklearn.preprocessing import LabelEncoder  # noqa: E402
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score  # noqa: E402
+from xgboost import XGBClassifier  # noqa: E402
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 MODELS_DIR = Path(__file__).parent.parent / "models"

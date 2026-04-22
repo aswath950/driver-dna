@@ -6,7 +6,6 @@ all driven by small synthetic DataFrames from conftest.py.
 """
 
 import pandas as pd
-import pytest
 
 from race_engine import (
     RaceAnalyser,

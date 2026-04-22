@@ -150,15 +150,15 @@ def eval_report_card_compliance(api_key: str, sample_drivers: list[str] | None =
     try:
         import pandas as pd
         import importlib.util
-        spec = importlib.util.spec_from_file_location("app", _SRC_DIR / "app.py")
+        importlib.util.spec_from_file_location("app", _SRC_DIR / "app.py")
     except ImportError as e:
         return {"status": "skipped", "reason": f"Missing dependency: {e}"}
 
     # Build a minimal synthetic DataFrame for testing
     try:
         import pandas as pd
-        from model import FEATURE_COLS, DATA_DIR as _DATA_DIR
-        df = pd.read_parquet(_DATA_DIR / "dataset.parquet")
+        from model import DATA_DIR as _DATA_DIR
+        pd.read_parquet(_DATA_DIR / "dataset.parquet")
     except Exception as e:
         return {"status": "skipped", "reason": f"Could not load dataset: {e}"}
 

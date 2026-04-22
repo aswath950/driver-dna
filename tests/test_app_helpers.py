@@ -10,7 +10,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -20,9 +19,6 @@ from llm_layer import (
     _ca_sanitize_input,
     _ca_validate_tool_args,
     _rag_cosine_similarity,
-    _RC_SCHEMA,
-    _CA_MAX_INPUT_LEN,
-    _CA_TOOL_ARG_SCHEMAS,
 )
 
 

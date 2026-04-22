@@ -928,7 +928,7 @@ def _ra_build_driver_data_block(
         f"  Trail Brake Score:  {raw.get('trail_brake_score', float('nan')):.4f}",
         f"  Gear Changes/lap:   {raw.get('gear_changes', float('nan')):.1f}",
         f"  Coasting Fraction:  {raw.get('coasting_pct', float('nan')):.4f}",
-        f"--- Rule-engine archetype ---",
+        "--- Rule-engine archetype ---",
         f"  {emoji} {archetype}",
     ]
     return "\n".join(lines)
@@ -1133,7 +1133,7 @@ def _rc_validate_report(data: dict) -> tuple:
             return False, f"Missing required key: '{key}'"
         val = data[key]
 
-        if expected_type == int:
+        if expected_type is int:
             try:
                 int_val = int(val)
             except (TypeError, ValueError):
@@ -1142,7 +1142,7 @@ def _rc_validate_report(data: dict) -> tuple:
                 return False, f"Key '{key}' value {int_val} outside range [{lo}, {hi}]"
             data[key] = int_val
 
-        elif expected_type == list:
+        elif expected_type is list:
             if not isinstance(val, list):
                 return False, f"Key '{key}' must be a list, got {type(val).__name__}"
             if lo is not None and len(val) < lo:
@@ -1154,7 +1154,7 @@ def _rc_validate_report(data: dict) -> tuple:
                     return False, f"Key '{key}[{i}]' must be a string"
                 data[key][i] = item.replace("<", "").replace(">", "")
 
-        elif expected_type == str:
+        elif expected_type is str:
             if not isinstance(val, str):
                 return False, f"Key '{key}' must be a string, got {type(val).__name__}"
             data[key] = val.replace("<", "").replace(">", "")
