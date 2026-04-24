@@ -2,7 +2,7 @@
 
 **Can a machine learning model identify an F1 driver purely from their telemetry — without ever seeing their name?**
 
-Driver DNA is a full-stack AI/ML platform built on Formula 1 telemetry data. It combines an XGBoost driver-identification model, a six-chart driving style analysis suite, an Explainable AI layer, a real-time race analytics engine, and **five distinct Agentic AI features** powered by GPT-4o-mini — all served through an interactive Streamlit dashboard across three tabs. The UI uses a neo-brutalist design system with F1's red/black/white palette and Space Grotesk typography.
+Driver DNA is a full-stack AI/ML platform built on Formula 1 telemetry data. It combines an XGBoost driver-identification model, a six-chart driving style analysis suite, an Explainable AI layer, a real-time race analytics engine, and **five distinct Agentic AI features** powered by GPT-4o-mini — all served through an interactive Streamlit dashboard across four tabs. A dedicated **Pipeline & Training tab** lets you download F1 telemetry datasets and retrain the classifier directly from the UI, with live progress logs and background threading. The UI uses a neo-brutalist design system with F1's red/black/white palette and Space Grotesk typography.
 
 ---
 
@@ -16,7 +16,7 @@ Driver DNA is a full-stack AI/ML platform built on Formula 1 telemetry data. It 
 | **Visualisation** | Streamlit, Plotly (radar/spider charts, heatmaps, bar charts, line overlays, scatter track maps, horizontal similarity bars) |
 | **APIs** | OpenF1 REST API (live + historical), OpenAI Chat Completions API |
 | **MLOps** | joblib model serialisation, SHAP feature importance, confusion matrix evaluation, cross-validation scoring, per-driver precision/recall/F1 metrics, JSONL audit logging, LLM cost dashboard |
-| **Testing & Quality** | pytest (77 tests, 3 test modules), pytest-cov (coverage XML), ruff (linting), mypy (type checking), GitHub Actions CI |
+| **Testing & Quality** | pytest (89 tests, 4 test modules), pytest-cov (coverage XML), ruff (linting), mypy (type checking), GitHub Actions CI |
 | **Deployment** | Docker (multi-stage build, python:3.13-slim), GitHub Container Registry (GHCR), Streamlit Community Cloud |
 | **Security** | Prompt injection prevention, input sanitisation, API key management via `st.secrets`, tool name allowlisting, argument clamping, rate limiting, LLM response sanitisation, JSON schema validation |
 
@@ -27,11 +27,12 @@ Driver DNA is a full-stack AI/ML platform built on Formula 1 telemetry data. It 
 The codebase is split into focused, independently testable modules with a one-directional dependency chain — no circular imports.
 
 ```
-app.py  (2 048 lines — UI, tabs, session state)
+app.py  (2 200+ lines — UI, tabs, session state, background threads)
   ├── from features import ...     feature engineering + Streamlit caching
   ├── from viz import ...          Plotly figure builders — no st. calls
   ├── from llm_layer import ...    LLM orchestration, prompts, tool functions
   ├── from model import ...        XGBoost training + evaluation
+  ├── from pipeline import ...     dataset download + feature extraction
   ├── from openf1 import ...       OpenF1 REST API client
   └── from race_engine import ...  pace analytics + strategy detection
 
@@ -51,7 +52,7 @@ viz.py  (577 lines)
 ```
 driver-dna/
 ├── src/
-│   ├── app.py               # Dashboard — 3 tabs, 5 AI features, 13+ chart types
+│   ├── app.py               # Dashboard — 4 tabs, 5 AI features, 13+ chart types
 │   ├── features.py          # Feature constants, engineering helpers, classify_archetype
 │   ├── viz.py               # Plotly figure builders (no Streamlit dependency)
 │   ├── llm_layer.py         # LLM orchestration: Reflexion, RAG, ReAct, structured output
@@ -62,9 +63,10 @@ driver-dna/
 │   ├── pipeline.py          # Data extraction, telemetry resampling, feature engineering
 │   └── generate_circuits.py # One-off: generates data/circuits.json
 ├── tests/
-│   ├── test_app_helpers.py  # 29 tests — LLM layer: parsing, validation, sanitisation, RAG
-│   ├── test_race_engine.py  # 30 tests — pace, gaps, undercuts, projections, degradation
-│   └── test_openf1.py       # 18 tests — OpenF1 client response parsing, edge cases
+│   ├── test_app_helpers.py   # 29 tests — LLM layer: parsing, validation, sanitisation, RAG
+│   ├── test_race_engine.py   # 30 tests — pace, gaps, undercuts, projections, degradation
+│   ├── test_openf1.py        # 18 tests — OpenF1 client response parsing, edge cases
+│   └── test_pipeline_tab.py  # 12 tests — pipeline download + model training session logic
 ├── .github/workflows/
 │   ├── ci.yml               # Lint (ruff) → type check (mypy) → pytest with coverage
 │   ├── docker.yml           # Build & push to GHCR on every push to main
@@ -90,13 +92,14 @@ driver-dna/
 
 ## Dashboard Overview
 
-Three tabs navigated via a boxy rectangular tab bar (neo-brutalist F1 design — red active state, dark inactive). Each tab is independently functional.
+Four tabs navigated via a boxy rectangular tab bar (neo-brutalist F1 design — red active state, dark inactive). Each tab is independently functional.
 
 | Tab | Name | What it does |
 |---|---|---|
 | 1 | **Driver Radar** | Driving style fingerprint visualisation + three agentic AI analysis features |
 | 2 | **Mystery Driver** | ML-based driver identification from a single lap + SHAP explainer + XAI narration + model accuracy panel |
 | 3 | **Race Dashboard** | Live and historical race analytics + conversational AI race analyst |
+| 4 | **⚙️ Pipeline** | Download F1 telemetry datasets and retrain the classifier — all from the UI, with live progress logs |
 
 ### Visual Design
 
@@ -365,9 +368,38 @@ Five channels comparing two drivers over their fastest recorded lap, fetched liv
 
 ---
 
+## Tab 4 — Pipeline & Training
+
+A self-contained data and model management tab. Everything previously requiring a terminal is now accessible from the dashboard, including live progress feedback for both long-running operations.
+
+### Download Dataset
+
+A form mirroring the inputs of `src/pipeline.py`:
+
+| Field | Description |
+|---|---|
+| **Year** | Season year (1950–2100) |
+| **Grand Prix name** | e.g. `Italian Grand Prix` |
+| **Session type** | `Q`, `R`, `FP1`, `FP2`, `FP3`, `S`, `SS` |
+| **Driver filter** | Optional — comma-separated 3-letter codes (e.g. `VER,HAM`). Leave blank for all drivers. |
+
+Clicking **Download Dataset** launches a background thread (via `threading.Thread`) that calls `extract_session_telemetry` → `save_dataset` → `save_meta`. The log panel updates every second while the thread is running. On success, the `get_data` and `get_dataset_meta` Streamlit caches are cleared automatically so the rest of the dashboard reflects the new data immediately.
+
+### Train Model
+
+Displays the current model's CV accuracy, train accuracy, driver count, and lap count loaded from `models/metrics.json`. Clicking **Train Model** launches a background thread that runs `load_and_prepare` → `train_model` (5-fold CV) → `evaluate_model` → `save_model`. The `get_model` Streamlit resource cache is cleared on completion, reloading the classifier for the Mystery Driver tab without a page refresh.
+
+A guard raises a clear error if the dataset contains fewer than 2 unique drivers — preventing a cryptic StratifiedKFold failure.
+
+### Implementation details
+
+Both operations use `threading.Thread(daemon=True)` — the same polling approach as the Live Race mode — with a 1-second auto-rerun loop (`time.sleep(1)` + `st.rerun()`) while any thread is active. Button guards (`disabled=True`) prevent double-launches. Errors are caught in a `finally` block, ensuring the `*_running` flag is always cleared regardless of outcome.
+
+---
+
 ## Agentic AI Patterns — Summary
 
-Five AI features across three tabs, each implementing a distinct real-world production pattern:
+Five AI features across tabs 1–3, each implementing a distinct real-world production pattern:
 
 | Feature | Tab | Pattern | Key technique |
 |---|---|---|---|
@@ -422,20 +454,21 @@ Extracts XY circuit outlines for all 24 Grand Prix from FastF1 at **500 resample
 
 ## Testing & Quality
 
-### Test suite — 77 tests across 3 modules
+### Test suite — 89 tests across 4 modules
 
 | Module | Tests | What it covers |
 |---|---|---|
 | `test_app_helpers.py` | 29 | LLM layer: JSON parsing, schema validation, input sanitisation, tool arg clamping, cosine similarity |
 | `test_race_engine.py` | 30 | Rolling pace, gap-to-leader, undercut detection, finishing order projection, tyre degradation, stint analysis |
 | `test_openf1.py` | 18 | OpenF1 API client: response parsing, error handling, live/historical edge cases |
+| `test_pipeline_tab.py` | 12 | Pipeline download session-state logic, model training session-state logic, error capture, finally-block cleanup, argument propagation, low-sample guard |
 
 ```bash
-pytest tests/ -v                                      # run all 77 tests
+pytest tests/ -v                                      # run all 89 tests
 pytest tests/ --cov=src --cov-report=term-missing     # with line coverage
 ```
 
-All business logic in `llm_layer.py`, `features.py`, and `race_engine.py` is imported directly — no inline copies, no Streamlit runtime required.
+All business logic in `llm_layer.py`, `features.py`, `race_engine.py`, and the pipeline tab wrappers is imported directly — no inline copies, no Streamlit runtime required.
 
 ### CI pipeline — `.github/workflows/ci.yml`
 
@@ -560,17 +593,23 @@ python src/generate_circuits.py
 
 Downloads session data, engineers features, and writes `data/dataset.parquet` and `data/dataset_meta.json`.
 
+**Option A — terminal:**
 ```bash
 python src/pipeline.py
 ```
+
+**Option B — dashboard:** Launch the app (step 6), open the **⚙️ Pipeline** tab, fill in the Year / Grand Prix / Session form, and click **Download Dataset**.
 
 ### 5. Train the classifier
 
 Runs 5-fold stratified CV and saves the model, label encoder, confusion matrix, SHAP importance chart, and `models/metrics.json`.
 
+**Option A — terminal:**
 ```bash
 python src/model.py
 ```
+
+**Option B — dashboard:** In the **⚙️ Pipeline** tab, click **Train Model**. Progress is shown live and the model cache is refreshed automatically on completion.
 
 ### 6. Launch the dashboard
 
@@ -612,7 +651,16 @@ The OpenAI API requires a paid account. Free-tier accounts have no API access �
 `.streamlit/secrets.toml` is missing or the placeholder key was not replaced. See Setup step 2.
 
 **Mystery Driver tab shows "—" for Grand Prix / Season / Session**
-`data/dataset_meta.json` was not generated. Re-run `python src/pipeline.py`.
+`data/dataset_meta.json` was not generated. Re-run `python src/pipeline.py` or use the **⚙️ Pipeline** tab to download a dataset.
+
+**Pipeline tab: "Download Dataset" button is greyed out**
+A download or training operation is already running in the background. Wait for the active operation to complete — the button re-enables automatically.
+
+**Pipeline tab: "Train Model" button is greyed out**
+Either a download or training thread is still active, or `data/dataset.parquet` does not yet exist. Download a dataset first.
+
+**Pipeline tab: "Need at least 2 drivers to train a classifier"**
+The downloaded dataset contains laps from only one driver. Re-download with a different session or remove the driver filter to include all drivers.
 
 **Driver Radar AI features: no buttons visible**
 The three agentic AI features only appear once 2–4 drivers are selected in the multiselect and an OpenAI API key is configured.
