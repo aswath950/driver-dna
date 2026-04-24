@@ -11,6 +11,7 @@ Column manifest for dataset.parquet:
 """
 
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 # Guard: must be run inside the project venv to avoid numpy/pandas conflicts
@@ -44,6 +45,7 @@ def extract_session_telemetry(
     grand_prix: str,
     session_type: str,
     drivers: list[str] | None = None,
+    progress_cb: Callable[[float, str], None] | None = None,
 ) -> pd.DataFrame:
     """
     Load a FastF1 session and extract engineered lap features for the given drivers.
@@ -54,6 +56,8 @@ def extract_session_telemetry(
         session_type: 'R', 'Q', 'S', 'SS', 'FP1', 'FP2', 'FP3'.
         drivers:      List of 3-letter driver codes, e.g. ['VER', 'HAM'].
                       Pass None (default) to extract all drivers in the session.
+        progress_cb:  Optional callback(fraction, message) fired at key steps.
+                      fraction is in [0, 1]; message is a human-readable status string.
 
     Returns:
         DataFrame with one row per valid lap. Columns:
@@ -68,9 +72,13 @@ def extract_session_telemetry(
         drivers = session.laps["Driver"].dropna().unique().tolist()
         print(f"  Found {len(drivers)} drivers: {', '.join(sorted(drivers))}")
 
+    n_drivers = len(drivers)
+    if progress_cb:
+        progress_cb(0.05, f"Session loaded — {n_drivers} drivers found")
+
     rows = []
 
-    for driver in drivers:
+    for i, driver in enumerate(drivers):
         driver_laps = session.laps.pick_drivers(driver)
         # Exclude in-laps, out-laps, and laps with deleted/missing lap times
         valid_laps = driver_laps.pick_quicklaps()
@@ -140,6 +148,10 @@ def extract_session_telemetry(
                 "y_trace": resampled["Y"].tolist(),
             }
             rows.append(row)
+
+        if progress_cb:
+            frac = 0.05 + 0.90 * (i + 1) / n_drivers
+            progress_cb(frac, f"Processed {driver} ({i + 1}/{n_drivers})")
 
     if not rows:
         return pd.DataFrame()

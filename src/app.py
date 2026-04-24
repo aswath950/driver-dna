@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime
 from typing import cast
@@ -26,7 +27,9 @@ import plotly.express as px
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from model import load_model, FEATURE_COLS, DATA_DIR, MODELS_DIR
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+from model import load_model, load_and_prepare, train_model, evaluate_model, save_model, FEATURE_COLS, DATA_DIR, MODELS_DIR
+from pipeline import extract_session_telemetry, save_dataset, save_meta, VALID_SESSION_TYPES
 from openf1 import OpenF1Client
 from race_engine import RaceAnalyser
 from features import (
@@ -124,6 +127,20 @@ STATE_DEFAULTS: dict = {
     # Tab 1 — unified AI panel
     "radar_ai_feature":    "Driver Style Analyst",
     "radar_ai_driver":     None,
+    # Tab 4 — Pipeline: dataset download
+    "pipe_running":  False,
+    "pipe_done":     False,
+    "pipe_error":    None,
+    "pipe_log":      [],
+    "pipe_progress": 0.0,
+    "pipe_status":   "",
+    # Tab 4 — Pipeline: model training
+    "train_running":  False,
+    "train_done":     False,
+    "train_error":    None,
+    "train_log":      [],
+    "train_progress": 0.0,
+    "train_status":   "",
 }
 
 st.set_page_config(page_title="Driver DNA Fingerprinter", layout="wide")
@@ -454,6 +471,62 @@ def _ca_run_chat_turn(user_message: str, analyser, driver_map: dict, api_key: st
 
 # -- Chat UI -----------------------------------------------------------------
 
+def _run_pipeline_download(year: int, gp: str, session_type: str, drivers: list[str] | None) -> None:
+    """Background thread: download F1 telemetry and save to dataset.parquet."""
+    ss = st.session_state
+
+    def _cb(frac: float, msg: str) -> None:
+        ss["pipe_progress"] = frac
+        ss["pipe_status"] = msg
+        ss["pipe_log"].append(msg)
+
+    try:
+        ss["pipe_log"] = []
+        ss["pipe_progress"] = 0.0
+        _cb(0.0, f"Connecting to FastF1 for {year} {gp} ({session_type})…")
+        df = extract_session_telemetry(year, gp, session_type, drivers, progress_cb=_cb)
+        _cb(0.97, "Saving dataset…")
+        save_dataset(df, DATA_DIR / "dataset.parquet")
+        save_meta(year, gp, session_type)
+        _cb(1.0, f"Done — {len(df)} laps saved to data/dataset.parquet")
+        ss["pipe_done"] = True
+    except Exception as exc:
+        ss["pipe_error"] = str(exc)
+    finally:
+        ss["pipe_running"] = False
+
+
+def _run_model_training() -> None:
+    """Background thread: train the XGBoost classifier on the current dataset."""
+    ss = st.session_state
+
+    def _cb(frac: float, msg: str) -> None:
+        ss["train_progress"] = frac
+        ss["train_status"] = msg
+        ss["train_log"].append(msg)
+
+    try:
+        ss["train_log"] = []
+        ss["train_progress"] = 0.0
+        _cb(0.0, "Loading dataset…")
+        X, y, le = load_and_prepare(DATA_DIR / "dataset.parquet")
+        n_drivers = len(set(y))
+        if n_drivers < 2:
+            raise ValueError(f"Need at least 2 drivers to train a classifier; found {n_drivers}.")
+        _cb(0.05, f"Loaded {len(X)} samples, {n_drivers} drivers. Starting 5-fold CV…")
+        clf, acc = train_model(X, y, progress_cb=lambda f, m: _cb(0.05 + f * 0.67, m))
+        _cb(0.75, "Evaluating — computing metrics and SHAP values…")
+        evaluate_model(clf, X, y, le)
+        _cb(0.97, "Saving model artifacts…")
+        save_model(clf, le)
+        _cb(1.0, "Done — model saved to models/")
+        ss["train_done"] = True
+    except Exception as exc:
+        ss["train_error"] = str(exc)
+    finally:
+        ss["train_running"] = False
+
+
 def _render_chat_panel(analyser, driver_map: dict, session_cache_key) -> None:
     """Render the Race Intelligence chat panel below the race analysis charts."""
     _ca_maybe_clear_history(session_cache_key)
@@ -549,6 +622,7 @@ _TABS = [
     ("🎯  Driver Radar",   "Driver Radar"),
     ("🕵️  Mystery Driver", "Mystery Driver"),
     ("🏁  Race Dashboard", "Race Dashboard"),
+    ("⚙️  Pipeline",       "Pipeline"),
 ]
 
 _tab_cols = st.columns(len(_TABS))
@@ -1130,7 +1204,7 @@ if _active_tab == "Mystery Driver":
                     st.error(f"Input validation failed: {reason}")
                 else:
                     try:
-                        safe_driver = _sanitize_driver_name(_pred_driver, list(le.classes_))
+                        safe_driver: str | None = _sanitize_driver_name(_pred_driver, list(le.classes_))
                     except ValueError as exc:
                         st.error(str(exc))
                         safe_driver = None
@@ -2063,3 +2137,136 @@ if _active_tab == "Race Dashboard":
             if st.session_state.get("rp_mode", "").startswith("📡"):
                 time.sleep(refresh_interval)
                 st.rerun()
+
+# ================================================================
+# TAB 4 — Pipeline & Training
+# ================================================================
+elif _active_tab == "Pipeline":
+    ss = st.session_state
+
+    st.subheader("⚙️ Pipeline & Training")
+
+    # ── Current dataset info card ────────────────────────────────────────────
+    _meta = get_dataset_meta()
+    if _meta:
+        _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+        _mc1.metric("Grand Prix", _meta.get("grand_prix", "—"))
+        _mc2.metric("Year", str(_meta.get("year", "—")))
+        _mc3.metric("Session", _meta.get("session_label", _meta.get("session_type", "—")))
+        if DATASET_PATH.exists():
+            _lap_count = len(pd.read_parquet(DATASET_PATH, columns=["driver"]))
+            _mc4.metric("Laps", str(_lap_count))
+    else:
+        st.info("No dataset found. Download one below to get started.")
+
+    st.divider()
+
+    # ── Section 1: Download Dataset ──────────────────────────────────────────
+    st.markdown("### 📥 Download Dataset")
+
+    _dl_col1, _dl_col2, _dl_col3 = st.columns(3)
+    with _dl_col1:
+        _pipe_year = st.number_input(
+            "Year", min_value=1950, max_value=2100,
+            value=2025, step=1, key="pipe_year",
+        )
+    with _dl_col2:
+        _pipe_gp = st.text_input("Grand Prix name", placeholder="e.g. Italian Grand Prix", key="pipe_gp")
+    with _dl_col3:
+        _pipe_session = st.selectbox(
+            "Session type", options=VALID_SESSION_TYPES,
+            index=VALID_SESSION_TYPES.index("R"), key="pipe_session",
+        )
+
+    _pipe_drivers_raw = st.text_input(
+        "Driver filter (optional — comma-separated codes, e.g. VER,HAM,NOR)",
+        placeholder="Leave blank for all drivers",
+        key="pipe_drivers",
+    )
+
+    _pipe_busy = ss.get("pipe_running", False) or ss.get("train_running", False)
+    if st.button("Download Dataset", disabled=_pipe_busy, type="primary", key="pipe_dl_btn"):
+        if not _pipe_gp.strip():
+            st.error("Grand Prix name cannot be empty.")
+        else:
+            _driver_list: list[str] | None = (
+                [d.strip().upper() for d in _pipe_drivers_raw.split(",") if d.strip()]
+                if _pipe_drivers_raw.strip() else None
+            )
+            ss["pipe_running"] = True
+            ss["pipe_done"] = False
+            ss["pipe_error"] = None
+            ss["pipe_log"] = []
+            ss["pipe_progress"] = 0.0
+            ss["pipe_status"] = ""
+            _dl_thread = threading.Thread(
+                target=_run_pipeline_download,
+                args=(int(_pipe_year), _pipe_gp.strip(), _pipe_session, _driver_list),
+                daemon=True,
+            )
+            add_script_run_ctx(_dl_thread, get_script_run_ctx())
+            _dl_thread.start()
+            st.rerun()
+
+    if ss.get("pipe_running"):
+        st.progress(ss.get("pipe_progress", 0.0))
+        st.caption(ss.get("pipe_status", "Starting…"))
+    if ss.get("pipe_log"):
+        with st.expander("Download log", expanded=bool(ss.get("pipe_running"))):
+            st.code("\n".join(ss["pipe_log"]), language=None)
+    if ss.get("pipe_done"):
+        st.success("Dataset downloaded successfully. Cache cleared — refresh the page to use the new data.")
+        get_data.clear()
+        get_dataset_meta.clear()
+        ss["pipe_done"] = False
+    if ss.get("pipe_error"):
+        st.error(f"Download failed: {ss['pipe_error']}")
+        ss["pipe_error"] = None
+
+    st.divider()
+
+    # ── Section 2: Train Model ───────────────────────────────────────────────
+    st.markdown("### 🧠 Train Model")
+
+    _mets = get_model_metrics()
+    if _mets:
+        _tm1, _tm2, _tm3 = st.columns(3)
+        _tm1.metric("CV Accuracy", f"{_mets['cv_mean']:.1%}", f"±{_mets['cv_std']:.1%}")
+        _tm2.metric("Train Accuracy", f"{_mets['train_accuracy']:.1%}")
+        _tm3.metric("Drivers / Laps", f"{_mets.get('n_drivers','?')} / {_mets.get('n_samples','?')}")
+        st.caption("Current model metrics — press Train to retrain on the active dataset.")
+    else:
+        st.caption("No trained model found. Download a dataset first, then train.")
+
+    _train_busy = ss.get("train_running", False) or ss.get("pipe_running", False)
+    if st.button("Train Model", disabled=_train_busy or not DATASET_PATH.exists(), type="primary", key="train_btn"):
+        ss["train_running"] = True
+        ss["train_done"] = False
+        ss["train_error"] = None
+        ss["train_log"] = []
+        ss["train_progress"] = 0.0
+        ss["train_status"] = ""
+        _train_thread = threading.Thread(target=_run_model_training, daemon=True)
+        add_script_run_ctx(_train_thread, get_script_run_ctx())
+        _train_thread.start()
+        st.rerun()
+
+    if ss.get("train_running"):
+        st.progress(ss.get("train_progress", 0.0))
+        st.caption(ss.get("train_status", "Starting…"))
+    if ss.get("train_log"):
+        with st.expander("Training log", expanded=bool(ss.get("train_running"))):
+            st.code("\n".join(ss["train_log"]), language=None)
+    if ss.get("train_done"):
+        st.success("Model trained and saved. Reloading model cache…")
+        get_model.clear()
+        ss["train_done"] = False
+        st.rerun()
+    if ss.get("train_error"):
+        st.error(f"Training failed: {ss['train_error']}")
+        ss["train_error"] = None
+
+    # Auto-rerun while any background operation is running
+    if ss.get("pipe_running") or ss.get("train_running"):
+        time.sleep(1)
+        st.rerun()
