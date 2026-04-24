@@ -13,6 +13,7 @@ Expected columns from dataset.parquet:
 """
 
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 # Guard: must be run inside the project venv to avoid numpy/pandas conflicts
@@ -79,11 +80,20 @@ def load_and_prepare(path: Path = DATASET_PATH):
     return X, y, le
 
 
-def train_model(X: np.ndarray, y: np.ndarray) -> tuple[XGBClassifier, float]:
+def train_model(
+    X: np.ndarray,
+    y: np.ndarray,
+    progress_cb: Callable[[float, str], None] | None = None,
+) -> tuple[XGBClassifier, float]:
     """
     Train an XGBoostClassifier with 5-fold stratified cross-validation.
     Prints per-fold accuracy and mean accuracy, then returns the model
     fit on the full dataset.
+
+    Args:
+        progress_cb: Optional callback(fraction, message) fired before and
+                     after each fold and at the final fit step.
+                     fraction is in [0, 1].
     """
     clf = XGBClassifier(
         n_estimators=300,
@@ -96,14 +106,35 @@ def train_model(X: np.ndarray, y: np.ndarray) -> tuple[XGBClassifier, float]:
     )
 
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    fold_scores = cross_val_score(clf, X, y, cv=cv, scoring="accuracy")
+    fold_scores: list[float] = []
 
-    for i, score in enumerate(fold_scores, 1):
-        print(f"  Fold {i}: {score:.4f}")
-    print(f"  Mean CV accuracy: {fold_scores.mean():.4f} ± {fold_scores.std():.4f}")
+    for i, (train_idx, val_idx) in enumerate(cv.split(X, y)):
+        if progress_cb:
+            # Scale folds to 0.0–0.90 so the final-fit callback (0.97) is always higher
+            progress_cb(i / 5 * 0.90, f"Training fold {i + 1}/5…")
+        fold_clf = XGBClassifier(
+            n_estimators=300,
+            max_depth=5,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            eval_metric="mlogloss",
+            random_state=42,
+        )
+        fold_clf.fit(X[train_idx], y[train_idx])
+        score = float(fold_clf.score(X[val_idx], y[val_idx]))
+        fold_scores.append(score)
+        print(f"  Fold {i + 1}: {score:.4f}")
+        if progress_cb:
+            progress_cb((i + 1) / 5 * 0.90, f"Fold {i + 1}/5 — accuracy: {score:.3f}")
 
+    fold_arr = np.array(fold_scores)
+    print(f"  Mean CV accuracy: {fold_arr.mean():.4f} ± {fold_arr.std():.4f}")
+
+    if progress_cb:
+        progress_cb(0.97, "Fitting final model on full dataset…")
     clf.fit(X, y)
-    return clf, float(fold_scores.mean())
+    return clf, float(fold_arr.mean())
 
 
 def evaluate_model(
