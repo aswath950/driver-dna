@@ -2185,28 +2185,50 @@ elif _active_tab == "Pipeline":
     )
 
     _pipe_busy = ss.get("pipe_running", False) or ss.get("train_running", False)
-    if st.button("Download Dataset", disabled=_pipe_busy, type="primary", key="pipe_dl_btn"):
-        if not _pipe_gp.strip():
-            st.error("Grand Prix name cannot be empty.")
-        else:
-            _driver_list: list[str] | None = (
-                [d.strip().upper() for d in _pipe_drivers_raw.split(",") if d.strip()]
-                if _pipe_drivers_raw.strip() else None
+    _btn_col1, _btn_col2 = st.columns([1, 1])
+    with _btn_col1:
+        if st.button("Download Dataset", disabled=_pipe_busy, type="primary", key="pipe_dl_btn"):
+            if not _pipe_gp.strip():
+                st.error("Grand Prix name cannot be empty.")
+            else:
+                _driver_list: list[str] | None = (
+                    [d.strip().upper() for d in _pipe_drivers_raw.split(",") if d.strip()]
+                    if _pipe_drivers_raw.strip() else None
+                )
+                ss["pipe_running"] = True
+                ss["pipe_done"] = False
+                ss["pipe_error"] = None
+                ss["pipe_log"] = []
+                ss["pipe_progress"] = 0.0
+                ss["pipe_status"] = ""
+                _dl_thread = threading.Thread(
+                    target=_run_pipeline_download,
+                    args=(int(_pipe_year), _pipe_gp.strip(), _pipe_session, _driver_list),
+                    daemon=True,
+                )
+                add_script_run_ctx(_dl_thread, get_script_run_ctx())
+                _dl_thread.start()
+                st.rerun()
+    with _btn_col2:
+        if DATASET_PATH.exists():
+            _export_df = get_data().drop(
+                columns=["speed_trace", "throttle_trace", "brake_trace", "x_trace", "y_trace"],
+                errors="ignore",
             )
-            ss["pipe_running"] = True
-            ss["pipe_done"] = False
-            ss["pipe_error"] = None
-            ss["pipe_log"] = []
-            ss["pipe_progress"] = 0.0
-            ss["pipe_status"] = ""
-            _dl_thread = threading.Thread(
-                target=_run_pipeline_download,
-                args=(int(_pipe_year), _pipe_gp.strip(), _pipe_session, _driver_list),
-                daemon=True,
+            _export_meta = get_dataset_meta()
+            _csv_filename = (
+                f"driver_dna"
+                f"_{_export_meta.get('year', '')}"
+                f"_{_export_meta.get('grand_prix', 'dataset').replace(' ', '_')}"
+                f"_{_export_meta.get('session_type', '')}.csv"
+            ).casefold()
+            st.download_button(
+                label="Export Dataset as CSV",
+                data=_export_df.to_csv(index=False),
+                file_name=_csv_filename,
+                mime="text/csv",
+                key="export_csv_btn",
             )
-            add_script_run_ctx(_dl_thread, get_script_run_ctx())
-            _dl_thread.start()
-            st.rerun()
 
     if ss.get("pipe_running"):
         st.progress(ss.get("pipe_progress", 0.0))
