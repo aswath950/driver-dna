@@ -16,7 +16,7 @@ Driver DNA is a full-stack AI/ML platform built on Formula 1 telemetry data. It 
 | **Visualisation** | Streamlit, Plotly (radar/spider charts, heatmaps, bar charts, line overlays, scatter track maps, horizontal similarity bars) |
 | **APIs** | OpenF1 REST API (live + historical), OpenAI Chat Completions API |
 | **MLOps** | joblib model serialisation, SHAP feature importance, confusion matrix evaluation, cross-validation scoring, per-driver precision/recall/F1 metrics, JSONL audit logging, LLM cost dashboard |
-| **Testing & Quality** | pytest (89 tests, 4 test modules), pytest-cov (coverage XML), ruff (linting), mypy (type checking), GitHub Actions CI |
+| **Testing & Quality** | pytest (100 tests, 4 test modules), pytest-cov (coverage XML), ruff (linting), mypy (type checking), GitHub Actions CI |
 | **Deployment** | Docker (multi-stage build, python:3.13-slim), GitHub Container Registry (GHCR), Streamlit Community Cloud |
 | **Security** | Prompt injection prevention, input sanitisation, API key management via `st.secrets`, tool name allowlisting, argument clamping, rate limiting, LLM response sanitisation, JSON schema validation |
 
@@ -66,7 +66,7 @@ driver-dna/
 │   ├── test_app_helpers.py   # 29 tests — LLM layer: parsing, validation, sanitisation, RAG
 │   ├── test_race_engine.py   # 30 tests — pace, gaps, undercuts, projections, degradation
 │   ├── test_openf1.py        # 18 tests — OpenF1 client response parsing, edge cases
-│   └── test_pipeline_tab.py  # 12 tests — pipeline download + model training session logic
+│   └── test_pipeline_tab.py  # 23 tests — pipeline download + model training session logic
 ├── .github/workflows/
 │   ├── ci.yml               # Lint (ruff) → type check (mypy) → pytest with coverage
 │   ├── docker.yml           # Build & push to GHCR on every push to main
@@ -84,7 +84,7 @@ driver-dna/
 │   └── llm_audit.jsonl      # Per-call LLM audit log (feature, tokens, latency, cost)
 ├── Dockerfile               # Multi-stage build — builder + lean runtime (python:3.13-slim)
 ├── requirements.txt
-├── requirements-dev.txt     # pytest, pytest-cov, ruff, mypy, types-requests
+├── requirements-dev.txt     # pytest, pytest-cov, responses, ruff, mypy, types-requests
 └── streamlit_app.py         # Streamlit Community Cloud entry point
 ```
 
@@ -454,17 +454,17 @@ Extracts XY circuit outlines for all 24 Grand Prix from FastF1 at **500 resample
 
 ## Testing & Quality
 
-### Test suite — 89 tests across 4 modules
+### Test suite — 100 tests across 4 modules
 
 | Module | Tests | What it covers |
 |---|---|---|
 | `test_app_helpers.py` | 29 | LLM layer: JSON parsing, schema validation, input sanitisation, tool arg clamping, cosine similarity |
 | `test_race_engine.py` | 30 | Rolling pace, gap-to-leader, undercut detection, finishing order projection, tyre degradation, stint analysis |
 | `test_openf1.py` | 18 | OpenF1 API client: response parsing, error handling, live/historical edge cases |
-| `test_pipeline_tab.py` | 12 | Pipeline download session-state logic, model training session-state logic, error capture, finally-block cleanup, argument propagation, low-sample guard |
+| `test_pipeline_tab.py` | 23 | Pipeline download session-state logic, model training session-state logic, error capture, finally-block cleanup, argument propagation, low-sample guard |
 
 ```bash
-pytest tests/ -v                                      # run all 89 tests
+pytest tests/ -v                                      # run all 100 tests
 pytest tests/ --cov=src --cov-report=term-missing     # with line coverage
 ```
 

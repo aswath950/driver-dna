@@ -49,6 +49,8 @@ DATA_DIR = Path(__file__).parent.parent / "data"
 MODELS_DIR = Path(__file__).parent.parent / "models"
 DATASET_PATH = DATA_DIR / "dataset.parquet"
 
+N_CV_SPLITS = 5
+
 FEATURE_COLS = [
     "lap_time_seconds",
     "mean_speed", "max_speed", "min_speed",
@@ -74,6 +76,10 @@ def load_and_prepare(path: Path = DATASET_PATH):
     # Scope the null check to scalar feature columns only — the list-type
     # trace columns (speed_trace etc.) would cause dropna() to misbehave.
     df = df.dropna(subset=FEATURE_COLS)
+    # Drop drivers with fewer laps than CV folds — a single-sample class breaks
+    # StratifiedKFold because it can't appear in both train and val splits.
+    lap_counts = df["driver"].value_counts()
+    df = df[df["driver"].isin(lap_counts[lap_counts >= N_CV_SPLITS].index)]
     le = LabelEncoder()
     y = np.asarray(le.fit_transform(df["driver"]))
     X = df[FEATURE_COLS].values
@@ -105,7 +111,7 @@ def train_model(
         random_state=42,
     )
 
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv = StratifiedKFold(n_splits=N_CV_SPLITS, shuffle=True, random_state=42)
     fold_scores: list[float] = []
 
     for i, (train_idx, val_idx) in enumerate(cv.split(X, y)):
@@ -159,7 +165,7 @@ def evaluate_model(
     print(f"Train accuracy (full dataset): {train_accuracy:.4f}")
 
     # --- CV accuracy → accuracy.txt ---
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv = StratifiedKFold(n_splits=N_CV_SPLITS, shuffle=True, random_state=42)
     cv_scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy")
     cv_mean = float(cv_scores.mean())
     cv_std = float(cv_scores.std())
