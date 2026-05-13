@@ -31,7 +31,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 from model import load_model, load_and_prepare, train_model, evaluate_model, save_model, FEATURE_COLS, DATA_DIR, MODELS_DIR
 from pipeline import extract_session_telemetry, save_dataset, save_meta, VALID_SESSION_TYPES
 from openf1 import OpenF1Client
-from race_engine import RaceAnalyser
+from race_engine import RaceAnalyser, _merge_stint_info
 from features import (
     N_POINTS, TRACE_COLS, SPECIAL_CHANNELS,
     RADAR_FEATURES, EXTENDED_RADAR_FEATURES, FEATURE_LABELS,
@@ -73,9 +73,17 @@ CHART_KEYS = {
     "Rolling Race Pace":     ("show_rolling_pace",    False),
     "Gap to Leader":         ("show_gap_to_leader",   False),
     "Projected Finish":      ("show_projected_order", False),
-    "Average Race Pace":     ("show_avg_pace",        False),
     "Race Pace Ranking":     ("show_pace_ranking",    True),
     "Tyre Degradation":      ("show_tyre_deg",        True),
+}
+
+COMPOUND_COLORS = {
+    "SOFT": "#e8002d",
+    "MEDIUM": "#ffd700",
+    "HARD": "#cccccc",
+    "INTERMEDIATE": "#39b54a",
+    "WET": "#0067ff",
+    "UNKNOWN": "#888888",
 }
 
 # --- Session state defaults for non-widget keys only ---------------
@@ -233,6 +241,41 @@ for _key, _val in STATE_DEFAULTS.items():
     if _key not in st.session_state:
         st.session_state[_key] = _val
 
+# ── Google Drive OAuth callback ───────────────────────────────────────────────
+# When Google redirects back after consent it appends ?code=XXX to the URL.
+# We detect it here (before any widget rendering) and exchange it for tokens.
+try:
+    _oauth_code = st.query_params.get("code")
+    if _oauth_code:
+        from drive_sync import exchange_code as _drive_exchange
+        if _drive_exchange(_oauth_code):
+            st.query_params.clear()
+            st.rerun()
+        else:
+            st.query_params.clear()
+except Exception as _e:
+    print(f"[app] OAuth callback error: {_e}", file=sys.stderr)
+
+# ── Drive startup restore (runs only when authenticated) ──────────────────────
+# Restores any missing artifacts from the user's Drive before the
+# dataset/model guards below can fire.  Times out after 30 s.
+try:
+    from drive_sync import is_authenticated as _drive_authenticated
+    if _drive_authenticated():
+        def _maybe_restore_from_drive() -> None:
+            try:
+                from drive_sync import restore_missing_artifacts
+                restore_missing_artifacts()
+            except Exception as _e:
+                print(f"[app] Drive restore skipped: {_e}", file=sys.stderr)
+
+        _restore_thread = threading.Thread(target=_maybe_restore_from_drive, daemon=True)
+        _restore_thread.start()
+        _restore_thread.join(timeout=30)
+except Exception as _e:
+    print(f"[app] Drive startup check failed: {_e}", file=sys.stderr)
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 @st.cache_data
 def get_model_metrics() -> dict:
@@ -283,6 +326,22 @@ with st.sidebar:
     else:
         st.caption("Select a mode in the Race Dashboard tab to get started.")
     st.info("**Race Dashboard** — fastest lap telemetry comparison, plus live or historical race analysis with rolling pace, gap charts, undercut detection, and projected finishing order.")
+
+    # -- Google Drive --
+    st.divider()
+    try:
+        from drive_sync import is_authenticated as _drive_auth, get_auth_url as _drive_url
+        if _drive_auth():
+            st.caption("☁️ Google Drive connected")
+        else:
+            _auth_url = _drive_url()
+            if _auth_url:
+                st.link_button("Connect Google Drive", _auth_url, use_container_width=True)
+                st.caption("Artifacts sync to your Drive after connecting.")
+            else:
+                st.caption("⚠️ Drive credentials not configured")
+    except Exception:
+        pass
 
     # -- Visible Charts expander --
     st.divider()
@@ -535,7 +594,7 @@ def _render_chat_panel(analyser, driver_map: dict, session_cache_key) -> None:
     _chat_verbose = st.session_state.get("ai_response_mode", "Concise") == "Detailed"
 
     st.divider()
-    st.markdown("#### 🤖 Race Intelligence — Ask me anything about this race")
+    st.markdown("#### 🤖 Race Intelligence(Beta) — Ask me anything about this race")
     st.caption(f"Response mode: **{st.session_state.get('ai_response_mode', 'Concise')}** · Change in the sidebar.")
 
     # Render existing message history
@@ -1557,44 +1616,6 @@ def _render_charts(
         else:
             container.info("Not enough data to project finishing order.")
 
-    # ---- Chart 5: Average Race Pace --------------------------------
-    if st.session_state.get("show_avg_pace", True):
-        container.markdown("### Average Race Pace")
-        pace_sum = results["pace_summary"]
-        if pace_sum.empty:
-            container.info("Not enough clean lap data for pace summary.")
-        else:
-            pace_sum = pace_sum.reset_index()
-            pace_sum = pace_sum[pace_sum["driver_number"].isin(active_drivers)]
-            pace_sum["label"] = pace_sum["driver_number"].apply(_label)
-            pace_sum = pace_sum.sort_values("median_pace", ascending=False)  # fastest at top
-            fig5 = go.Figure(go.Bar(
-                x=pace_sum["median_pace"],
-                y=pace_sum["label"],
-                orientation="h",
-                marker=dict(
-                    color=pace_sum["std_pace"],
-                    colorscale="Viridis",
-                    showscale=True,
-                    colorbar=dict(title="Pace Std Dev (s)"),
-                ),
-                customdata=pace_sum[["mean_pace", "std_pace", "fastest_lap", "lap_count"]].values,
-                hovertemplate=(
-                    "<b>%{y}</b><br>"
-                    "Median: %{x:.3f}s<br>"
-                    "Mean: %{customdata[0]:.3f}s<br>"
-                    "Std Dev: %{customdata[1]:.3f}s<br>"
-                    "Fastest lap: %{customdata[2]:.3f}s<br>"
-                    "Laps counted: %{customdata[3]}<extra></extra>"
-                ),
-            ))
-            fig5.update_layout(
-                xaxis_title="Median Lap Time (s)",
-                yaxis_title="Driver",
-                showlegend=False,
-            )
-            container.plotly_chart(fig5, width="stretch", key="tab4_avg_pace")
-
     # ---- Chart 6: Race Pace Ranking --------------------------------
     if st.session_state.get("show_pace_ranking", True):
         container.markdown("### Race Pace Ranking")
@@ -1625,7 +1646,69 @@ def _render_charts(
                 yaxis_title="Mean Lap Time (s)",
                 showlegend=False,
             )
-            container.plotly_chart(fig6, width="stretch", key="tab4_pace_ranking")
+            event = container.plotly_chart(
+                fig6, width="stretch", key="tab4_pace_ranking",
+                on_select="rerun", selection_mode="points",
+            )
+            if event.selection.points:
+                clicked_label = event.selection.points[0]["x"]
+                match = ranked[ranked["label"] == clicked_label]
+                if not match.empty:
+                    st.session_state["pace_ranking_selected"] = int(match.iloc[0]["driver_number"])
+
+            selected_drv = st.session_state.get("pace_ranking_selected")
+            if selected_drv is not None and selected_drv in ranked["driver_number"].values:
+                drv_row = pace_sum[pace_sum["driver_number"] == selected_drv].iloc[0]
+                container.markdown(f"#### {_label(selected_drv)} — Lap Detail")
+
+                c1, c2, c3, c4 = container.columns(4)
+                c1.metric("Mean Pace",   f"{drv_row['mean_pace']:.3f}s")
+                c2.metric("Fastest Lap", f"{drv_row['fastest_lap']:.3f}s")
+                c3.metric("Std Dev",     f"{drv_row['std_pace']:.3f}s")
+                c4.metric("Laps",        int(drv_row["lap_count"]))
+
+                # Start from ALL clean laps for this driver so no lap is dropped,
+                # then left-join stint info to attach compound where available.
+                drv_laps = (
+                    analyser._clean[analyser._clean["driver_number"] == selected_drv]
+                    .sort_values("lap_number")
+                    .copy()
+                )
+                stint_info = _merge_stint_info(analyser._clean, analyser._stints)
+                if not stint_info.empty:
+                    stint_cols = stint_info[stint_info["driver_number"] == selected_drv][
+                        ["lap_number", "compound", "stint_number"]
+                    ]
+                    drv_laps = drv_laps.merge(stint_cols, on="lap_number", how="left")
+                    drv_laps["compound"] = drv_laps["compound"].fillna("Unknown")
+
+                fig_detail = go.Figure()
+                field_median = float(pace_sum["median_pace"].median())
+
+                if "compound" in drv_laps.columns:
+                    for compound, grp in drv_laps.groupby("compound", sort=False):
+                        color = COMPOUND_COLORS.get(str(compound).upper(), "#888888")
+                        fig_detail.add_trace(go.Scatter(
+                            x=grp["lap_number"], y=grp["lap_duration"],
+                            mode="lines+markers", name=str(compound),
+                            line=dict(color=color), marker=dict(color=color, size=6),
+                            hovertemplate="Lap %{x}: %{y:.3f}s<extra>" + str(compound) + "</extra>",
+                        ))
+                else:
+                    fig_detail.add_trace(go.Scatter(
+                        x=drv_laps["lap_number"], y=drv_laps["lap_duration"],
+                        mode="lines+markers", name="Lap Time",
+                        hovertemplate="Lap %{x}: %{y:.3f}s<extra></extra>",
+                    ))
+
+                fig_detail.add_hline(
+                    y=field_median, line_dash="dash", line_color="grey",
+                    annotation_text="Field median", annotation_position="bottom right",
+                )
+                fig_detail.update_layout(
+                    xaxis_title="Lap", yaxis_title="Lap Time (s)", showlegend=True,
+                )
+                container.plotly_chart(fig_detail, width="stretch", key="tab4_pace_detail")
 
     # ---- Chart 7: Tyre Degradation by Compound ---------------------
     if st.session_state.get("show_tyre_deg", True):
@@ -1635,13 +1718,6 @@ def _render_charts(
         if tyre_deg.empty:
             container.info("Stint data unavailable — tyre degradation chart requires stint information.")
         else:
-            COMPOUND_COLORS = {
-                "SOFT": "#e8002d",
-                "MEDIUM": "#ffd700",
-                "HARD": "#cccccc",
-                "INTERMEDIATE": "#39b54a",
-                "WET": "#0067ff",
-            }
             fig7 = go.Figure()
             for compound, grp in tyre_deg.groupby("compound"):
                 color = COMPOUND_COLORS.get(str(compound).upper(), "#888888")

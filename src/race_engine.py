@@ -492,9 +492,10 @@ def stint_degradation(
     Fits a simple linear regression (lap_number vs lap_duration) within
     each stint.  Returns one row per stint with the slope as ``deg_per_lap``.
     """
+    _EMPTY = pd.DataFrame(columns=["driver_number", "stint_number", "compound", "laps_in_stint", "deg_per_lap", "mean_pace"])
     merged = _merge_stint_info(laps, stints)
     if merged.empty:
-        return pd.DataFrame()
+        return _EMPTY
 
     results = []
     for (drv, stint_no), grp in merged.groupby(["driver_number", "stint_number"]):
@@ -512,7 +513,7 @@ def stint_degradation(
             "deg_per_lap": round(float(slope), 4),
             "mean_pace": round(float(y.mean()), 3),
         })
-    return pd.DataFrame(results)
+    return pd.DataFrame(results) if results else _EMPTY
 
 
 def _merge_stint_info(

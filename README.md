@@ -2,7 +2,7 @@
 
 **Can a machine learning model identify an F1 driver purely from their telemetry — without ever seeing their name?**
 
-Driver DNA is a full-stack AI/ML platform built on Formula 1 telemetry data. It combines an XGBoost driver-identification model, a six-chart driving style analysis suite, an Explainable AI layer, a real-time race analytics engine, and **five distinct Agentic AI features** powered by GPT-4o-mini — all served through an interactive Streamlit dashboard across four tabs. A dedicated **Pipeline & Training tab** lets you download F1 telemetry datasets and retrain the classifier directly from the UI, with live progress logs and background threading. The UI uses a neo-brutalist design system with F1's red/black/white palette and Space Grotesk typography.
+Driver DNA is a full-stack AI/ML platform built on Formula 1 telemetry data. It combines an XGBoost driver-identification model, a six-chart driving style analysis suite, an Explainable AI layer, a real-time race analytics engine, and **five distinct Agentic AI features** powered by GPT-4o-mini — all served through an interactive Streamlit dashboard across four tabs. A dedicated **Pipeline & Training tab** lets you download F1 telemetry datasets and retrain the classifier directly from the UI, with live progress logs and background threading. Trained models and datasets are automatically persisted to and restored from **Google Drive** on every deployment — powered by the **Google Drive API v3** with per-user **OAuth 2.0** authentication. The UI uses a neo-brutalist design system with F1's red/black/white palette and Space Grotesk typography.
 
 ---
 
@@ -14,11 +14,12 @@ Driver DNA is a full-stack AI/ML platform built on Formula 1 telemetry data. It 
 | **Agentic AI / LLM** | OpenAI API (`gpt-4o-mini`), tool calling (ReAct), Reflexion self-critique loop, RAG via cosine similarity, JSON-mode structured output, prompt engineering, multi-step agent orchestration |
 | **Data Engineering** | FastF1, pandas, NumPy, Apache Parquet, time-series resampling, 200-point distance-normalised feature extraction |
 | **Visualisation** | Streamlit, Plotly (radar/spider charts, heatmaps, bar charts, line overlays, scatter track maps, horizontal similarity bars) |
-| **APIs** | OpenF1 REST API (live + historical), OpenAI Chat Completions API |
-| **MLOps** | joblib model serialisation, SHAP feature importance, confusion matrix evaluation, cross-validation scoring, per-driver precision/recall/F1 metrics, JSONL audit logging, LLM cost dashboard |
-| **Testing & Quality** | pytest (100 tests, 4 test modules), pytest-cov (coverage XML), ruff (linting), mypy (type checking), GitHub Actions CI |
+| **APIs** | OpenF1 REST API (live + historical), OpenAI Chat Completions API, Google Drive API v3 |
+| **Cloud Storage / MLOps** | Google Drive artifact persistence, OAuth 2.0 (per-user token flow), `google-auth-oauthlib`, joblib model serialisation, SHAP feature importance, confusion matrix evaluation, cross-validation scoring, per-driver precision/recall/F1 metrics, JSONL audit logging, LLM cost dashboard |
+| **AI Tooling (MCP)** | Model Context Protocol (MCP) — Claude Code's Google Drive MCP server used during development to manage, inspect, and iterate on artifacts; MCP-first development workflow |
+| **Testing & Quality** | pytest (121 tests, 5 test modules), pytest-cov (coverage XML), ruff (linting), mypy (type checking), GitHub Actions CI |
 | **Deployment** | Docker (multi-stage build, python:3.13-slim), GitHub Container Registry (GHCR), Streamlit Community Cloud |
-| **Security** | Prompt injection prevention, input sanitisation, API key management via `st.secrets`, tool name allowlisting, argument clamping, rate limiting, LLM response sanitisation, JSON schema validation |
+| **Security** | OAuth 2.0 `drive.file` scope (least-privilege, per-user), token persistence with auto-refresh, prompt injection prevention, input sanitisation, API key management via `st.secrets`, tool name allowlisting, argument clamping, rate limiting, LLM response sanitisation, JSON schema validation |
 
 ---
 
@@ -28,6 +29,7 @@ The codebase is split into focused, independently testable modules with a one-di
 
 ```
 app.py  (2 200+ lines — UI, tabs, session state, background threads)
+  ├── from drive_sync import ...   Google Drive OAuth + artifact sync
   ├── from features import ...     feature engineering + Streamlit caching
   ├── from viz import ...          Plotly figure builders — no st. calls
   ├── from llm_layer import ...    LLM orchestration, prompts, tool functions
@@ -41,9 +43,13 @@ llm_layer.py  (1 470 lines)
 
 viz.py  (577 lines)
   └── from features import ...     N_POINTS, OPENF1_TRACE_COLS
+
+drive_sync.py  (~220 lines)
+  └── google-auth-oauthlib, google-api-python-client
+      OAuth 2.0 flow · token persistence · Drive API v3 upload/download
 ```
 
-`llm_layer.py` and `viz.py` have zero Streamlit dependencies — they can be imported, tested, and benchmarked without a running Streamlit server. All session-state logic stays in `app.py`.
+`llm_layer.py`, `viz.py`, and `drive_sync.py` have zero Streamlit dependencies — they can be imported, tested, and benchmarked without a running Streamlit server. All session-state logic stays in `app.py`.
 
 ---
 
@@ -53,6 +59,7 @@ viz.py  (577 lines)
 driver-dna/
 ├── src/
 │   ├── app.py               # Dashboard — 4 tabs, 5 AI features, 13+ chart types
+│   ├── drive_sync.py        # Google Drive OAuth 2.0 + artifact persistence
 │   ├── features.py          # Feature constants, engineering helpers, classify_archetype
 │   ├── viz.py               # Plotly figure builders (no Streamlit dependency)
 │   ├── llm_layer.py         # LLM orchestration: Reflexion, RAG, ReAct, structured output
@@ -63,6 +70,7 @@ driver-dna/
 │   ├── pipeline.py          # Data extraction, telemetry resampling, feature engineering
 │   └── generate_circuits.py # One-off: generates data/circuits.json
 ├── tests/
+│   ├── test_drive_sync.py    # 21 tests — OAuth flow, token exchange, upload/download, restore
 │   ├── test_app_helpers.py   # 29 tests — LLM layer: parsing, validation, sanitisation, RAG
 │   ├── test_race_engine.py   # 30 tests — pace, gaps, undercuts, projections, degradation
 │   ├── test_openf1.py        # 18 tests — OpenF1 client response parsing, edge cases
@@ -71,11 +79,11 @@ driver-dna/
 │   ├── ci.yml               # Lint (ruff) → type check (mypy) → pytest with coverage
 │   ├── docker.yml           # Build & push to GHCR on every push to main
 │   └── eval.yml             # LLM evaluation + PR comment with RAG sanity metrics
-├── data/                    # Git-ignored — generated locally
+├── data/                    # Git-ignored — restored from Google Drive on cold start
 │   ├── dataset.parquet      # Driver DNA training data (pipeline.py output)
 │   ├── dataset_meta.json    # Session metadata — GP name, year, session type
 │   └── circuits.json        # Circuit XY outlines for Track Map
-├── models/                  # Git-ignored — generated locally
+├── models/                  # Git-ignored — restored from Google Drive on cold start
 │   ├── driver_dna_clf.joblib
 │   ├── label_encoder.joblib
 │   ├── metrics.json         # CV scores, train accuracy, per-driver F1
@@ -87,6 +95,71 @@ driver-dna/
 ├── requirements-dev.txt     # pytest, pytest-cov, responses, ruff, mypy, types-requests
 └── streamlit_app.py         # Streamlit Community Cloud entry point
 ```
+
+---
+
+## Google Drive Artifact Persistence
+
+`data/` and `models/` are git-ignored — every fresh deployment (Streamlit Cloud redeploy, new Docker container) would otherwise start cold with no dataset and no model. `drive_sync.py` solves this by treating Google Drive as a persistent artifact store, with per-user OAuth 2.0 authentication so every person who deploys the app uses their own Drive.
+
+### How it works
+
+```
+First run (unauthenticated):
+  Sidebar → "Connect Google Drive" button
+        ↓
+  User clicks → Google consent screen (OAuth 2.0, drive.file scope)
+        ↓
+  Google redirects to app URL with ?code=XXX
+        ↓
+  App detects code via st.query_params → exchange_code()
+        ↓
+  Access + refresh token saved to data/.google_token.json
+        ↓
+  Sidebar now shows "☁️ Google Drive connected"
+
+Every subsequent run (authenticated):
+  Token loaded from disk → auto-refreshed if expired (no re-auth needed)
+        ↓
+  restore_missing_artifacts() runs in a background thread (30 s timeout)
+        ↓
+  Any missing data/ or models/ file is downloaded from Drive before
+  the app renders its first content
+
+After each pipeline / training run:
+  save_dataset() / save_meta() → upload_file() → Drive
+  evaluate_model() / save_model() → upload_file() → Drive
+```
+
+### Security design
+
+| Principle | Implementation |
+|---|---|
+| **Least privilege** | `drive.file` scope — the app can only see files it created; it never reads any existing Drive content |
+| **Per-user isolation** | Each deployer authenticates their own Google account; no shared service account |
+| **Credential storage** | `client_id` / `client_secret` in `st.secrets` or env vars — never committed |
+| **Token storage** | `data/.google_token.json` — gitignored, refresh token enables silent re-auth |
+| **Graceful degradation** | All Drive calls wrapped in `try/except`; a Drive failure is logged to `stderr` and never crashes the app |
+
+### Artifacts synced
+
+| File | Size | Upload trigger |
+|---|---|---|
+| `data/dataset.parquet` | ~640 KB | After `save_dataset()` |
+| `data/dataset_meta.json` | ~4 KB | After `save_meta()` |
+| `data/circuits.json` | ~477 KB | After `save_dataset()` |
+| `models/driver_dna_clf.joblib` | ~2.7 MB | After `save_model()` |
+| `models/label_encoder.joblib` | ~545 B | After `save_model()` |
+| `models/metrics.json` | ~1.6 KB | After `evaluate_model()` |
+| `models/confusion_matrix.html` | ~4.6 MB | After `evaluate_model()` |
+| `models/shap_importance.png` | ~41 KB | After `evaluate_model()` |
+| `models/llm_audit.jsonl` | ~1.2 KB | After `save_model()` |
+
+**Not synced:** `data/fastf1_http_cache.sqlite` (~672 MB) — FastF1 rebuilds this automatically via HTTP.
+
+### MCP-assisted development
+
+This feature was designed and iterated using **Claude Code with the Google Drive MCP server** (Model Context Protocol). The MCP gave the AI assistant direct Drive access during development — to inspect folder structures, verify uploaded artifacts, and validate the sync logic — without requiring a separate test harness. This is an example of MCP-first development: AI tooling with real tool use in the development loop.
 
 ---
 
@@ -119,6 +192,7 @@ Active tab: red fill (`#E8002D`) with black text and `3px 3px 0 #000` shadow. In
 ### Sidebar Controls
 
 - **Model accuracy** — CV accuracy (±std dev), train accuracy, driver count, and lap count
+- **Google Drive status** — "☁️ Google Drive connected" when authenticated, or a **Connect Google Drive** button that triggers the OAuth 2.0 consent flow
 - **AI Response Mode toggle** — switch between **Concise** (3–6 sentence focused answers) and **Detailed** (multi-paragraph rich analysis, ~50% more tokens per call) across all five AI features simultaneously
 - **API key status** — live check for OpenAI key and required library imports
 
@@ -383,17 +457,11 @@ A form mirroring the inputs of `src/pipeline.py`:
 | **Session type** | `Q`, `R`, `FP1`, `FP2`, `FP3`, `S`, `SS` |
 | **Driver filter** | Optional — comma-separated 3-letter codes (e.g. `VER,HAM`). Leave blank for all drivers. |
 
-Clicking **Download Dataset** launches a background thread (via `threading.Thread`) that calls `extract_session_telemetry` → `save_dataset` → `save_meta`. The log panel updates every second while the thread is running. On success, the `get_data` and `get_dataset_meta` Streamlit caches are cleared automatically so the rest of the dashboard reflects the new data immediately.
+Clicking **Download Dataset** launches a background thread that calls `extract_session_telemetry` → `save_dataset` → `save_meta`. After saving locally, the files are automatically uploaded to Google Drive via `drive_sync.upload_file`. The log panel updates every second while the thread is running. On success, the `get_data` and `get_dataset_meta` Streamlit caches are cleared automatically.
 
 ### Train Model
 
-Displays the current model's CV accuracy, train accuracy, driver count, and lap count loaded from `models/metrics.json`. Clicking **Train Model** launches a background thread that runs `load_and_prepare` → `train_model` (5-fold CV) → `evaluate_model` → `save_model`. The `get_model` Streamlit resource cache is cleared on completion, reloading the classifier for the Mystery Driver tab without a page refresh.
-
-A guard raises a clear error if the dataset contains fewer than 2 unique drivers — preventing a cryptic StratifiedKFold failure.
-
-### Implementation details
-
-Both operations use `threading.Thread(daemon=True)` — the same polling approach as the Live Race mode — with a 1-second auto-rerun loop (`time.sleep(1)` + `st.rerun()`) while any thread is active. Button guards (`disabled=True`) prevent double-launches. Errors are caught in a `finally` block, ensuring the `*_running` flag is always cleared regardless of outcome.
+Displays the current model's CV accuracy, train accuracy, driver count, and lap count loaded from `models/metrics.json`. Clicking **Train Model** launches a background thread that runs `load_and_prepare` → `train_model` (5-fold CV) → `evaluate_model` → `save_model`. All model artifacts are uploaded to Google Drive automatically on completion. The `get_model` Streamlit resource cache is cleared on completion, reloading the classifier for the Mystery Driver tab without a page refresh.
 
 ---
 
@@ -454,21 +522,22 @@ Extracts XY circuit outlines for all 24 Grand Prix from FastF1 at **500 resample
 
 ## Testing & Quality
 
-### Test suite — 100 tests across 4 modules
+### Test suite — 121 tests across 5 modules
 
 | Module | Tests | What it covers |
 |---|---|---|
+| `test_drive_sync.py` | 21 | OAuth 2.0 flow: `is_authenticated`, `get_auth_url`, `exchange_code`; upload create vs. update paths; download with parent-dir creation; graceful error handling; restore selects only missing files |
 | `test_app_helpers.py` | 29 | LLM layer: JSON parsing, schema validation, input sanitisation, tool arg clamping, cosine similarity |
 | `test_race_engine.py` | 30 | Rolling pace, gap-to-leader, undercut detection, finishing order projection, tyre degradation, stint analysis |
 | `test_openf1.py` | 18 | OpenF1 API client: response parsing, error handling, live/historical edge cases |
 | `test_pipeline_tab.py` | 23 | Pipeline download session-state logic, model training session-state logic, error capture, finally-block cleanup, argument propagation, low-sample guard |
 
 ```bash
-pytest tests/ -v                                      # run all 100 tests
+pytest tests/ -v                                      # run all 121 tests
 pytest tests/ --cov=src --cov-report=term-missing     # with line coverage
 ```
 
-All business logic in `llm_layer.py`, `features.py`, `race_engine.py`, and the pipeline tab wrappers is imported directly — no inline copies, no Streamlit runtime required.
+All business logic — including the Drive sync layer — is imported directly and tested with mocked dependencies. No Streamlit runtime, no real Google API calls, and no real network access required.
 
 ### CI pipeline — `.github/workflows/ci.yml`
 
@@ -510,11 +579,15 @@ A multi-stage Dockerfile produces a lean production image:
 
 - **Stage 1 (builder):** `python:3.13-slim` + gcc/g++ to compile C-extension packages (numpy, shap, xgboost). Dependencies installed to `/install`.
 - **Stage 2 (runtime):** `python:3.13-slim` — copies only the compiled packages and application code. No build toolchain in the final image.
+- **Artifact directories** — `data/` and `models/` are created at build time with committed `.gitkeep` placeholders. Real artifacts are restored from Google Drive at container startup.
 
 ```bash
 docker build -t driver-dna .
 docker run -p 8501:8501 \
   -e OPENAI_API_KEY=sk-proj-... \
+  -e GOOGLE_CLIENT_ID=xxxx.apps.googleusercontent.com \
+  -e GOOGLE_CLIENT_SECRET=yyyy \
+  -e GOOGLE_REDIRECT_URI=http://localhost:8501 \
   driver-dna
 ```
 
@@ -526,7 +599,19 @@ The `docker.yml` workflow builds and pushes to GHCR on every push to `main`, tag
 
 ### Streamlit Community Cloud
 
-Deploy directly from this repository. Set the OpenAI API key via the **Secrets** panel — no `.toml` file needed in production.
+Deploy directly from this repository. Configure the following in the **Secrets** panel:
+
+```toml
+[openai]
+api_key = "sk-proj-..."
+
+[google]
+client_id     = "xxxx.apps.googleusercontent.com"
+client_secret = "yyyy"
+redirect_uri  = "https://your-app.streamlit.app"
+```
+
+On first load after deployment, click **Connect Google Drive** in the sidebar to authenticate. Artifacts are restored from Drive automatically on every subsequent cold start.
 
 ---
 
@@ -575,13 +660,31 @@ All five AI features require a paid OpenAI account. Create `.streamlit/secrets.t
 api_key = "sk-proj-..."
 ```
 
-Or export as an environment variable:
+### 3. Configure Google Drive (optional but recommended)
 
-```bash
-export OPENAI_API_KEY="sk-proj-..."
+Enables automatic artifact persistence — trained models and datasets survive fresh deployments without manual copying.
+
+**One-time GCP setup:**
+1. Go to [console.cloud.google.com](https://console.cloud.google.com) → create or select a project
+2. **APIs & Services → Library** → enable **Google Drive API**
+3. **APIs & Services → Credentials → Create Credentials → OAuth 2.0 Client ID**
+   - Configure consent screen if prompted (External, add your email as test user)
+   - Application type: **Web application**
+   - Authorized redirect URIs: `http://localhost:8501` (add your Streamlit Cloud URL too if deploying there)
+4. Copy the **Client ID** and **Client Secret**
+
+Add to `.streamlit/secrets.toml`:
+
+```toml
+[google]
+client_id     = "xxxx.apps.googleusercontent.com"
+client_secret = "yyyy"
+redirect_uri  = "http://localhost:8501"
 ```
 
-### 3. Generate circuit outlines *(required for Track Map and Throttle Map)*
+Then launch the app and click **Connect Google Drive** in the sidebar to complete the OAuth flow. After connecting, all future pipeline runs automatically sync to your Drive, and every cold start restores missing files automatically.
+
+### 4. Generate circuit outlines *(required for Track Map and Throttle Map)*
 
 Downloads XY geometry for all 24 Grand Prix circuits. Run once — takes 10–30 minutes. Resume-safe.
 
@@ -589,7 +692,7 @@ Downloads XY geometry for all 24 Grand Prix circuits. Run once — takes 10–30
 python src/generate_circuits.py
 ```
 
-### 4. Build the Driver DNA dataset
+### 5. Build the Driver DNA dataset
 
 Downloads session data, engineers features, and writes `data/dataset.parquet` and `data/dataset_meta.json`.
 
@@ -600,7 +703,7 @@ python src/pipeline.py
 
 **Option B — dashboard:** Launch the app (step 6), open the **⚙️ Pipeline** tab, fill in the Year / Grand Prix / Session form, and click **Download Dataset**.
 
-### 5. Train the classifier
+### 6. Train the classifier
 
 Runs 5-fold stratified CV and saves the model, label encoder, confusion matrix, SHAP importance chart, and `models/metrics.json`.
 
@@ -611,13 +714,13 @@ python src/model.py
 
 **Option B — dashboard:** In the **⚙️ Pipeline** tab, click **Train Model**. Progress is shown live and the model cache is refreshed automatically on completion.
 
-### 6. Launch the dashboard
+### 7. Launch the dashboard
 
 ```bash
 streamlit run src/app.py
 ```
 
-> The Race Dashboard and Race Intelligence Chat work independently of steps 4–5 — they query the OpenF1 API directly. Live mode only works during active F1 race weekends; historical mode works any time from 2022 onwards.
+> The Race Dashboard and Race Intelligence Chat work independently of steps 4–6 — they query the OpenF1 API directly. Live mode only works during active F1 race weekends; historical mode works any time from 2022 onwards.
 
 ---
 
@@ -664,3 +767,12 @@ The downloaded dataset contains laps from only one driver. Re-download with a di
 
 **Driver Radar AI features: no buttons visible**
 The three agentic AI features only appear once 2–4 drivers are selected in the multiselect and an OpenAI API key is configured.
+
+**"Connect Google Drive" button does nothing / Drive credentials not configured**
+`[google]` section is missing from `.streamlit/secrets.toml`. Add `client_id`, `client_secret`, and `redirect_uri` — see Setup step 3.
+
+**After clicking "Connect Google Drive", redirected but sidebar still shows the button**
+The OAuth redirect URI in GCP must exactly match the `redirect_uri` in your secrets. For local dev, ensure `http://localhost:8501` is registered under Authorized redirect URIs in the GCP console.
+
+**Drive sync stopped working after a long gap**
+The access token expired and the refresh token was revoked (e.g. GCP app credentials rotated). Delete `data/.google_token.json` and reconnect via the sidebar button.

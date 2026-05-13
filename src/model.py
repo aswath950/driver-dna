@@ -266,6 +266,13 @@ def evaluate_model(
     fig2.savefig(str(shap_path), dpi=150)
     plt.close(fig2)
     print(f"Saved SHAP importance plot → {shap_path}")
+    try:
+        from drive_sync import upload_file
+        upload_file(metrics_path, "application/json")
+        upload_file(cm_path, "text/html")
+        upload_file(shap_path, "image/png")
+    except Exception as _e:
+        print(f"[model] Drive upload skipped (eval): {_e}", file=sys.stderr)
 
 
 def save_model(model: XGBClassifier, label_encoder: LabelEncoder) -> None:
@@ -274,6 +281,15 @@ def save_model(model: XGBClassifier, label_encoder: LabelEncoder) -> None:
     joblib.dump(model, MODELS_DIR / "driver_dna_clf.joblib")
     joblib.dump(label_encoder, MODELS_DIR / "label_encoder.joblib")
     print(f"Saved model and label encoder → {MODELS_DIR}/")
+    try:
+        from drive_sync import upload_file
+        upload_file(MODELS_DIR / "driver_dna_clf.joblib")
+        upload_file(MODELS_DIR / "label_encoder.joblib")
+        _audit = MODELS_DIR / "llm_audit.jsonl"
+        if _audit.exists():
+            upload_file(_audit, "application/jsonlines")
+    except Exception as _e:
+        print(f"[model] Drive upload skipped (model): {_e}", file=sys.stderr)
 
 
 def load_model() -> tuple[XGBClassifier, LabelEncoder]:
