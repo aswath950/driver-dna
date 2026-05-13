@@ -1,5 +1,7 @@
 # FastF1 cache — files can be several GB
-data/
+data/*
+!data/.gitkeep
+data/.google_token.json
 
 # Python
 __pycache__/
@@ -23,7 +25,8 @@ ENV/
 *.ipynb_checkpoints
 
 # Trained model artifacts — regenerate with `python src/model.py`
-models/
+models/*
+!models/.gitkeep
 
 # IDE
 .vscode/

@@ -177,6 +177,14 @@ def save_dataset(df: pd.DataFrame, path: Path = DATASET_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, index=False)
     print(f"Saved {len(df)} laps → {path}")
+    try:
+        from drive_sync import upload_file
+        upload_file(path)
+        circuits = CACHE_DIR / "circuits.json"
+        if circuits.exists():
+            upload_file(circuits, "application/json")
+    except Exception as _e:
+        print(f"[pipeline] Drive upload skipped: {_e}", file=sys.stderr)
 
 
 def save_meta(year: int, grand_prix: str, session_type: str) -> None:
@@ -191,6 +199,11 @@ def save_meta(year: int, grand_prix: str, session_type: str) -> None:
     META_PATH.parent.mkdir(parents=True, exist_ok=True)
     META_PATH.write_text(json.dumps(meta, indent=2))
     print(f"Saved metadata → {META_PATH}")
+    try:
+        from drive_sync import upload_file
+        upload_file(META_PATH, "application/json")
+    except Exception as _e:
+        print(f"[pipeline] Drive upload skipped: {_e}", file=sys.stderr)
 
 
 def load_dataset(path: Path = DATASET_PATH) -> pd.DataFrame:

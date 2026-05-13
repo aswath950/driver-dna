@@ -241,6 +241,41 @@ for _key, _val in STATE_DEFAULTS.items():
     if _key not in st.session_state:
         st.session_state[_key] = _val
 
+# ── Google Drive OAuth callback ───────────────────────────────────────────────
+# When Google redirects back after consent it appends ?code=XXX to the URL.
+# We detect it here (before any widget rendering) and exchange it for tokens.
+try:
+    _oauth_code = st.query_params.get("code")
+    if _oauth_code:
+        from drive_sync import exchange_code as _drive_exchange
+        if _drive_exchange(_oauth_code):
+            st.query_params.clear()
+            st.rerun()
+        else:
+            st.query_params.clear()
+except Exception as _e:
+    print(f"[app] OAuth callback error: {_e}", file=sys.stderr)
+
+# ── Drive startup restore (runs only when authenticated) ──────────────────────
+# Restores any missing artifacts from the user's Drive before the
+# dataset/model guards below can fire.  Times out after 30 s.
+try:
+    from drive_sync import is_authenticated as _drive_authenticated
+    if _drive_authenticated():
+        def _maybe_restore_from_drive() -> None:
+            try:
+                from drive_sync import restore_missing_artifacts
+                restore_missing_artifacts()
+            except Exception as _e:
+                print(f"[app] Drive restore skipped: {_e}", file=sys.stderr)
+
+        _restore_thread = threading.Thread(target=_maybe_restore_from_drive, daemon=True)
+        _restore_thread.start()
+        _restore_thread.join(timeout=30)
+except Exception as _e:
+    print(f"[app] Drive startup check failed: {_e}", file=sys.stderr)
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 @st.cache_data
 def get_model_metrics() -> dict:
@@ -291,6 +326,22 @@ with st.sidebar:
     else:
         st.caption("Select a mode in the Race Dashboard tab to get started.")
     st.info("**Race Dashboard** — fastest lap telemetry comparison, plus live or historical race analysis with rolling pace, gap charts, undercut detection, and projected finishing order.")
+
+    # -- Google Drive --
+    st.divider()
+    try:
+        from drive_sync import is_authenticated as _drive_auth, get_auth_url as _drive_url
+        if _drive_auth():
+            st.caption("☁️ Google Drive connected")
+        else:
+            _auth_url = _drive_url()
+            if _auth_url:
+                st.link_button("Connect Google Drive", _auth_url, use_container_width=True)
+                st.caption("Artifacts sync to your Drive after connecting.")
+            else:
+                st.caption("⚠️ Drive credentials not configured")
+    except Exception:
+        pass
 
     # -- Visible Charts expander --
     st.divider()

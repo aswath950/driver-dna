@@ -33,15 +33,21 @@ COPY src/ src/
 COPY streamlit_app.py .
 COPY .streamlit/config.toml .streamlit/config.toml
 
-# Copy pre-generated model artefacts and data
-# (These are committed on the deploy branch — see README for details)
+# Create artifact directories and bake in any pre-built files present at
+# build time.  On a clean checkout only the committed .gitkeep placeholders
+# are copied; the Drive startup restore fills in the real artifacts at runtime.
+RUN mkdir -p models data
 COPY models/ models/
-COPY data/dataset.parquet data/dataset.parquet
-COPY data/dataset_meta.json data/dataset_meta.json
-COPY data/circuits.json data/circuits.json
+COPY data/ data/
 
 # FastF1 writes its HTTP cache here; mount a volume in production
 ENV FASTF1_CACHE_DIR=/tmp/fastf1_cache
+
+# Google Drive OAuth — each deployer supplies their own GCP OAuth client credentials.
+# Never bake credentials into the image.
+ENV GOOGLE_CLIENT_ID=""
+ENV GOOGLE_CLIENT_SECRET=""
+ENV GOOGLE_REDIRECT_URI=""
 
 EXPOSE 8501
 
