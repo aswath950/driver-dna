@@ -16,7 +16,7 @@ Driver DNA is a full-stack AI/ML platform built on Formula 1 telemetry data. It 
 | **Visualisation** | Streamlit, Plotly (radar/spider charts, heatmaps, bar charts, line overlays, scatter track maps, horizontal similarity bars) |
 | **APIs** | OpenF1 REST API (live + historical), OpenAI Chat Completions API, Google Drive API v3 |
 | **Cloud Storage / MLOps** | Google Drive artifact persistence, OAuth 2.0 (per-user token flow), `google-auth-oauthlib`, joblib model serialisation, SHAP feature importance, confusion matrix evaluation, cross-validation scoring, per-driver precision/recall/F1 metrics, JSONL audit logging, LLM cost dashboard |
-| **AI Tooling (MCP)** | Model Context Protocol (MCP) — Claude Code's Google Drive MCP server used during development to manage, inspect, and iterate on artifacts; MCP-first development workflow |
+| **Developer Tooling** | Model Context Protocol (MCP), Google Drive MCP server for artifact inspection and management, protocol-driven development workflow |
 | **Testing & Quality** | pytest (121 tests, 5 test modules), pytest-cov (coverage XML), ruff (linting), mypy (type checking), GitHub Actions CI |
 | **Deployment** | Docker (multi-stage build, python:3.13-slim), GitHub Container Registry (GHCR), Streamlit Community Cloud |
 | **Security** | OAuth 2.0 `drive.file` scope (least-privilege, per-user), token persistence with auto-refresh, prompt injection prevention, input sanitisation, API key management via `st.secrets`, tool name allowlisting, argument clamping, rate limiting, LLM response sanitisation, JSON schema validation |
@@ -157,9 +157,9 @@ After each pipeline / training run:
 
 **Not synced:** `data/fastf1_http_cache.sqlite` (~672 MB) — FastF1 rebuilds this automatically via HTTP.
 
-### MCP-assisted development
+### MCP-driven artifact management
 
-This feature was designed and iterated using **Claude Code with the Google Drive MCP server** (Model Context Protocol). The MCP gave the AI assistant direct Drive access during development — to inspect folder structures, verify uploaded artifacts, and validate the sync logic — without requiring a separate test harness. This is an example of MCP-first development: AI tooling with real tool use in the development loop.
+The Drive integration was developed using the **Model Context Protocol (MCP)** — specifically the Google Drive MCP server. MCP provides a standardised protocol for tools to expose capabilities (list files, read metadata, upload, download) as callable functions. Using the Drive MCP server directly during development made it possible to inspect folder structures, verify uploaded artifacts, and validate sync behaviour interactively — without a separate test harness or manual Drive UI checks. This is an example of a protocol-driven development workflow where the same API surface used in production is exercised directly during development.
 
 ---
 
