@@ -13,3 +13,4 @@ openai==2.31.0
 google-api-python-client==2.172.0
 google-auth==2.40.3
 google-auth-oauthlib==1.2.1
+mcp>=1.0.0

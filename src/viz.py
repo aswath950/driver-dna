@@ -206,12 +206,29 @@ def _fetch_fastest_lap_all_openf1(
         return None
 
     car = car.sort_values("date").reset_index(drop=True)
+
+    # Clip to the actual lap end. The 0.5s query buffer can capture early samples
+    # from the following lap when laps are closely spaced (sprint qualifying, etc.).
+    # Clipping here keeps the distance grid faithful to the real circuit length and
+    # prevents next-lap telemetry from distorting speed/throttle/brake traces.
+    ts_end_clip = ts_end
+    if car["date"].dt.tz is not None and ts_end_clip.tzinfo is None:
+        ts_end_clip = ts_end_clip.tz_localize("UTC")
+    car = car[car["date"] <= ts_end_clip].reset_index(drop=True)
+
     speeds = car["speed"].to_numpy(dtype=float)
     if len(speeds) < 2:
         return None
 
     # Cumulative elapsed time from real timestamps — immune to missing samples.
     cumtime_raw = (car["date"] - car["date"].iloc[0]).dt.total_seconds().to_numpy(dtype=float)
+
+    # Pin the cumtime endpoint to the official lap_duration. After clipping, the
+    # last retained sample typically falls 0–0.27s before the exact lap finish line
+    # (3.7 Hz sampling). Normalizing ensures both drivers' cumtime scales match the
+    # authoritative lap_duration, so the Time Delta final gap is always correct.
+    if cumtime_raw[-1] > 0:
+        cumtime_raw = cumtime_raw * (lap_time / cumtime_raw[-1])
 
     dt = car["date"].diff().dt.total_seconds().fillna(0.0).to_numpy(dtype=float)[1:]
     speeds_ms = speeds[:-1] / 3.6
@@ -246,6 +263,7 @@ def _fetch_fastest_lap_all_openf1(
 def _build_track_map_fig(
     data_a: dict, acronym_a: str, color_a: str,
     data_b: dict, acronym_b: str, color_b: str,
+    sector_fractions: list[float] | None = None,
 ) -> "go.Figure | None":
     """
     Circuit coloured by the faster driver per microsector.
@@ -254,6 +272,9 @@ def _build_track_map_fig(
     speed at that point. Consecutive same-winner segments are merged into one
     Scatter trace to keep the figure lightweight.
     Returns None if X/Y coordinates are missing from the dataset.
+
+    sector_fractions: optional [s1_end_frac, s2_end_frac] in range (0, 1) from
+    circuits.json — used to draw S1/S2/S3 boundary markers on the map.
     """
     x_a, y_a, spd_a = data_a["x"], data_a["y"], data_a["speed"]
     spd_b = data_b["speed"]
@@ -285,7 +306,7 @@ def _build_track_map_fig(
     fig.add_trace(go.Scatter(
         x=x_fine, y=y_fine,
         mode="markers",
-        marker=dict(color="rgba(120,120,120,0.25)", size=8, symbol="circle"),
+        marker=dict(color="rgba(120,120,120,0.25)", size=8, symbol="square"),
         showlegend=False,
         hoverinfo="skip",
     ))
@@ -306,7 +327,7 @@ def _build_track_map_fig(
         fig.add_trace(go.Scatter(
             x=seg_x, y=seg_y,
             mode="markers",
-            marker=dict(color=col, size=7, symbol="circle"),
+            marker=dict(color=col, size=7, symbol="square"),
             name=label,
             showlegend=not legend_added[w],
             legendgroup=w,
@@ -314,6 +335,31 @@ def _build_track_map_fig(
         ))
         legend_added[w] = True
         i = j
+
+    # Sector boundary markers and labels
+    if sector_fractions and len(sector_fractions) == 2:
+        s1_frac, s2_frac = sector_fractions
+        # Boundary points: start of lap (S1), end of S1/start of S2, end of S2/start of S3
+        boundaries = [(0.0, "S1"), (s1_frac, "S2"), (s2_frac, "S3")]
+        for frac, label in boundaries:
+            idx = int(round(frac * (N_DISPLAY - 1)))
+            bx, by = float(x_fine[idx]), float(y_fine[idx])
+            fig.add_trace(go.Scatter(
+                x=[bx], y=[by],
+                mode="markers+text",
+                marker=dict(
+                    color="white", size=14, symbol="circle",
+                    line=dict(color="rgba(0,0,0,0.8)", width=2),
+                ),
+                text=[f"<b>{label}</b>"],
+                textposition="top center",
+                textfont=dict(color="white", size=11),
+                name=label,
+                showlegend=True,
+                legendgroup="sectors",
+                legendgrouptitle_text="Sectors" if label == "S1" else None,
+                hovertemplate=f"{label} boundary<extra></extra>",
+            ))
 
     fig.update_layout(
         title=f"Track Map — {acronym_a} vs {acronym_b} (faster driver by microsector)",
@@ -366,7 +412,7 @@ def _build_time_delta_fig(
 
     # Per-point plain-language hover text
     hover_text = [
-        f"{acronym_a} +{abs(d):.3f}s ahead" if d >= 0 else f"{acronym_b} +{abs(d):.3f}s ahead"
+        f"{acronym_a} ahead {abs(d):.3f}s" if d >= 0 else f"{acronym_b} ahead {abs(d):.3f}s"
         for d in delta
     ]
 
@@ -383,7 +429,7 @@ def _build_time_delta_fig(
         fill="tozeroy",
         fillcolor=_to_rgba(color_a, 0.30),
         line=dict(width=0),
-        name=f"{acronym_a} faster",
+        name=f"{acronym_a} ahead",
         showlegend=False,
         hoverinfo="skip",
     ))
@@ -394,7 +440,7 @@ def _build_time_delta_fig(
         fill="tozeroy",
         fillcolor=_to_rgba(color_b, 0.30),
         line=dict(width=0),
-        name=f"{acronym_b} faster",
+        name=f"{acronym_b} ahead",
         showlegend=False,
         hoverinfo="skip",
     ))
@@ -408,7 +454,7 @@ def _build_time_delta_fig(
         mode="lines",
         connectgaps=False,
         line=dict(color=color_a, width=2.5),
-        name=f"{acronym_a} faster",
+        name=f"{acronym_a} ahead",
         customdata=hover_text,
         hovertemplate="%{x:.0f}%  —  %{customdata}<extra></extra>",
     ))
@@ -417,7 +463,7 @@ def _build_time_delta_fig(
         mode="lines",
         connectgaps=False,
         line=dict(color=color_b, width=2.5),
-        name=f"{acronym_b} faster",
+        name=f"{acronym_b} ahead",
         customdata=hover_text,
         hovertemplate="%{x:.0f}%  —  %{customdata}<extra></extra>",
     ))
@@ -447,7 +493,7 @@ def _build_time_delta_fig(
             marker=dict(color=color_a, size=10, symbol="triangle-up",
                         line=dict(color="white", width=1)),
             name=f"Peak {acronym_a}",
-            hovertemplate=f"Max {acronym_a} +{max_delta:.3f}s at %{{x:.0f}}%<extra></extra>",
+            hovertemplate=f"Peak {acronym_a} ahead {max_delta:.3f}s at %{{x:.0f}}%<extra></extra>",
         ))
 
     if min_delta < -0.05:
@@ -458,7 +504,7 @@ def _build_time_delta_fig(
             marker=dict(color=color_b, size=10, symbol="triangle-down",
                         line=dict(color="white", width=1)),
             name=f"Peak {acronym_b}",
-            hovertemplate=f"Max {acronym_b} +{abs(min_delta):.3f}s at %{{x:.0f}}%<extra></extra>",
+            hovertemplate=f"Peak {acronym_b} ahead {abs(min_delta):.3f}s at %{{x:.0f}}%<extra></extra>",
         ))
 
     # --- Final gap annotation at right edge ---
@@ -467,10 +513,10 @@ def _build_time_delta_fig(
         gap_text = "Dead heat"
         gap_color = "white"
     elif final_gap > 0:
-        gap_text = f"+{final_gap:.3f}s\n{acronym_a}"
+        gap_text = f"{acronym_a} ahead\n{abs(final_gap):.3f}s"
         gap_color = color_a
     else:
-        gap_text = f"{final_gap:.3f}s\n{acronym_b}"
+        gap_text = f"{acronym_b} ahead\n{abs(final_gap):.3f}s"
         gap_color = color_b
 
     fig.add_annotation(
@@ -503,7 +549,7 @@ def _build_time_delta_fig(
             zeroline=False,
         ),
         yaxis=dict(
-            title=f"Gap (s)   ↑ {acronym_a} faster   ·   {acronym_b} faster ↓",
+            title=f"Gap (s)   ↑ {acronym_a} ahead   ·   {acronym_b} ahead ↓",
             zeroline=True,
             zerolinecolor="rgba(255,255,255,0.6)",
             zerolinewidth=1.5,
@@ -512,6 +558,104 @@ def _build_time_delta_fig(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         height=460,
         margin=dict(t=80, b=50, l=60, r=120),
+    )
+    return fig
+
+
+def _build_sector_times_fig(
+    data_a: dict, acronym_a: str, color_a: str,
+    data_b: dict, acronym_b: str, color_b: str,
+    sector_fractions: list[float] | None = None,
+) -> go.Figure:
+    """Grouped bar chart of S1/S2/S3 times for two drivers with delta annotations."""
+    def _fallback(msg: str) -> go.Figure:
+        f = go.Figure()
+        f.add_annotation(text=msg, x=0.5, y=0.5, xref="paper", yref="paper",
+                         showarrow=False, font=dict(color="white", size=14))
+        f.update_layout(height=460, plot_bgcolor="rgba(0,0,0,0)",
+                        paper_bgcolor="rgba(0,0,0,0)", margin=dict(t=60, b=40, l=60, r=40))
+        return f
+
+    if not sector_fractions or len(sector_fractions) != 2:
+        return _fallback("Sector boundaries not available — re-run python src/generate_circuits.py")
+
+    n = len(data_a["cumtime"])
+    s1_frac, s2_frac = sector_fractions
+    i1 = int(round(s1_frac * (n - 1)))
+    i2 = int(round(s2_frac * (n - 1)))
+
+    ca, cb = data_a["cumtime"], data_b["cumtime"]
+    s1a, s2a, s3a = ca[i1], ca[i2] - ca[i1], ca[-1] - ca[i2]
+    s1b, s2b, s3b = cb[i1], cb[i2] - cb[i1], cb[-1] - cb[i2]
+
+    if any(not np.isfinite(v) or v <= 0 for v in [s1a, s2a, s3a, s1b, s2b, s3b]):
+        return _fallback("Sector time data is inconsistent — telemetry may be incomplete")
+
+    times_a = [s1a, s2a, s3a]
+    times_b = [s1b, s2b, s3b]
+    sectors = ["S1", "S2", "S3"]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=sectors, y=times_a, name=acronym_a, marker_color=color_a,
+        text=[f"{t:.3f}s" for t in times_a], textposition="outside",
+        hovertemplate="%{x}: %{y:.3f}s<extra>" + acronym_a + "</extra>",
+    ))
+    fig.add_trace(go.Bar(
+        x=sectors, y=times_b, name=acronym_b, marker_color=color_b,
+        text=[f"{t:.3f}s" for t in times_b], textposition="outside",
+        hovertemplate="%{x}: %{y:.3f}s<extra>" + acronym_b + "</extra>",
+    ))
+
+    for sector_name, ta, tb in zip(sectors, times_a, times_b):
+        delta = tb - ta  # positive = A faster
+        if abs(delta) < 0.001:
+            ann_text, ann_color = "Dead heat", "white"
+        elif delta > 0:
+            ann_text, ann_color = f"{acronym_a} ahead {delta:.3f}s", color_a
+        else:
+            ann_text, ann_color = f"{acronym_b} ahead {abs(delta):.3f}s", color_b
+        fig.add_annotation(x=sector_name, y=max(ta, tb), text=ann_text,
+                           showarrow=False, yshift=28,
+                           font=dict(color=ann_color, size=11), xanchor="center")
+
+    # Total lap time delta
+    total_delta = data_b["lap_time"] - data_a["lap_time"]  # positive = A faster
+    if abs(total_delta) < 0.001:
+        total_text, total_color = "Dead heat overall", "white"
+    elif total_delta > 0:
+        total_text, total_color = f"{acronym_a} ahead {total_delta:.3f}s overall", color_a
+    else:
+        total_text, total_color = f"{acronym_b} ahead {abs(total_delta):.3f}s overall", color_b
+    fig.add_annotation(
+        text=f"<b>{total_text}</b>",
+        xref="paper", yref="paper", x=0.5, y=-0.13,
+        xanchor="center", yanchor="top",
+        showarrow=False,
+        font=dict(color=total_color, size=13),
+    )
+
+    lap_a_num = data_a.get("lap_number")
+    lap_b_num = data_b.get("lap_number")
+    lap_a_str = f"Lap {lap_a_num}, {data_a['lap_time']:.3f}s" if lap_a_num else f"{data_a['lap_time']:.3f}s"
+    lap_b_str = f"Lap {lap_b_num}, {data_b['lap_time']:.3f}s" if lap_b_num else f"{data_b['lap_time']:.3f}s"
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                f"Sector Times — {acronym_a} vs {acronym_b}"
+                f"<br><sup>{acronym_a}: {lap_a_str}  |  {acronym_b}: {lap_b_str}</sup>"
+            ),
+            font=dict(size=14),
+        ),
+        barmode="group",
+        xaxis=dict(title="Sector"),
+        yaxis=dict(title="Time (s)", rangemode="tozero"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=460,
+        margin=dict(t=80, b=75, l=60, r=40),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
     )
     return fig
 

@@ -32,6 +32,7 @@ if _expected_venv.exists() and not sys.prefix.startswith(str(_expected_venv)):
 
 import fastf1  # noqa: E402
 import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 
 CACHE_DIR = Path(__file__).parent.parent / "data"
 OUTPUT_PATH = CACHE_DIR / "circuits.json"
@@ -123,8 +124,30 @@ def extract_circuit_xy(year: int, gp_name: str) -> dict | None:
     x_out = np.interp(dist_grid, dist, x_raw)
     y_out = np.interp(dist_grid, dist, y_raw)
 
-    print(f" OK ({N_CIRCUIT_POINTS} pts, driver={best_driver})")
-    return {"x": x_out.tolist(), "y": y_out.tolist()}
+    # Extract sector boundary fractions (distance fraction 0-1 at end of S1 and S2)
+    sector_fracs = None
+    try:
+        s1_t = fastest_lap["Sector1SessionTime"]
+        s2_t = fastest_lap["Sector2SessionTime"]
+        if pd.notna(s1_t) and pd.notna(s2_t):
+            tel_t = tel["SessionTime"].dt.total_seconds().to_numpy()
+            total_dist = dist[-1] - dist[0]
+            if total_dist > 0:
+                s1_idx = int(np.searchsorted(tel_t, s1_t.total_seconds(), side="right")) - 1
+                s2_idx = int(np.searchsorted(tel_t, s2_t.total_seconds(), side="right")) - 1
+                s1_frac = float((dist[max(0, s1_idx)] - dist[0]) / total_dist)
+                s2_frac = float((dist[max(0, s2_idx)] - dist[0]) / total_dist)
+                if 0.05 < s1_frac < s2_frac < 0.95:
+                    sector_fracs = [round(s1_frac, 4), round(s2_frac, 4)]
+    except Exception:
+        pass
+
+    suffix = f", sectors={sector_fracs}" if sector_fracs else ", no sector data"
+    print(f" OK ({N_CIRCUIT_POINTS} pts, driver={best_driver}{suffix})")
+    result: dict = {"x": x_out.tolist(), "y": y_out.tolist()}
+    if sector_fracs is not None:
+        result["sector_fractions"] = sector_fracs
+    return result
 
 
 def main() -> None:
