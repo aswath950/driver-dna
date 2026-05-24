@@ -22,7 +22,7 @@ TRACE_COLS = {"Speed": "speed_trace", "Throttle": "throttle_trace", "Brake": "br
 # OpenF1 car_data column names for the same channels
 OPENF1_TRACE_COLS = {"Speed": "speed", "Throttle": "throttle", "Brake": "brake"}
 # Channels that require special rendering (not a simple 1D line overlay)
-SPECIAL_CHANNELS = ["Track Map", "Time Delta"]
+SPECIAL_CHANNELS = ["Track Map", "Time Delta", "Sector Times"]
 RADAR_FEATURES = ["mean_speed", "throttle_mean", "throttle_std", "brake_events", "steer_std", "gear_changes"]
 EXTENDED_RADAR_FEATURES = [
     "mean_speed", "max_speed", "min_speed",
