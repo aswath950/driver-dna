@@ -16,8 +16,8 @@ Driver DNA is a full-stack AI/ML platform built on Formula 1 telemetry data. It 
 | **Visualisation** | Streamlit, Plotly (radar/spider charts, heatmaps, bar charts, line overlays, scatter track maps, horizontal similarity bars) |
 | **APIs** | OpenF1 REST API (live + historical), OpenAI Chat Completions API, Google Drive API v3 |
 | **Cloud Storage / MLOps** | Google Drive artifact persistence, OAuth 2.0 (per-user token flow), `google-auth-oauthlib`, joblib model serialisation, SHAP feature importance, confusion matrix evaluation, cross-validation scoring, per-driver precision/recall/F1 metrics, JSONL audit logging, LLM cost dashboard |
-| **Developer Tooling** | Model Context Protocol (MCP), Google Drive MCP server for artifact inspection and management, protocol-driven development workflow |
-| **Testing & Quality** | pytest (121 tests, 5 test modules), pytest-cov (coverage XML), ruff (linting), mypy (type checking), GitHub Actions CI |
+| **Developer Tooling** | Model Context Protocol (MCP), Google Drive MCP server for artifact inspection and management, driver-dna MCP server for programmatic telemetry access, protocol-driven development workflow |
+| **Testing & Quality** | pytest (163 tests, 7 test modules), pytest-cov (coverage XML), ruff (linting), mypy (type checking), GitHub Actions CI |
 | **Deployment** | Docker (multi-stage build, python:3.13-slim), GitHub Container Registry (GHCR), Streamlit Community Cloud |
 | **Security** | OAuth 2.0 `drive.file` scope (least-privilege, per-user), token persistence with auto-refresh, prompt injection prevention, input sanitisation, API key management via `st.secrets`, tool name allowlisting, argument clamping, rate limiting, LLM response sanitisation, JSON schema validation |
 
@@ -28,7 +28,7 @@ Driver DNA is a full-stack AI/ML platform built on Formula 1 telemetry data. It 
 The codebase is split into focused, independently testable modules with a one-directional dependency chain — no circular imports.
 
 ```
-app.py  (2 200+ lines — UI, tabs, session state, background threads)
+app.py  (2 390+ lines — UI, tabs, session state, background threads)
   ├── from drive_sync import ...   Google Drive OAuth + artifact sync
   ├── from features import ...     feature engineering + Streamlit caching
   ├── from viz import ...          Plotly figure builders — no st. calls
@@ -41,15 +41,19 @@ app.py  (2 200+ lines — UI, tabs, session state, background threads)
 llm_layer.py  (1 470 lines)
   └── from features import ...     classify_archetype, EXTENDED_RADAR_FEATURES
 
-viz.py  (577 lines)
-  └── from features import ...     N_POINTS, OPENF1_TRACE_COLS
+viz.py  (721 lines)
+  └── from features import ...     N_POINTS, OPENF1_TRACE_COLS, SPECIAL_CHANNELS
 
 drive_sync.py  (~220 lines)
   └── google-auth-oauthlib, google-api-python-client
       OAuth 2.0 flow · token persistence · Drive API v3 upload/download
+
+mcp/server.py  (standalone MCP server — no Streamlit dependency)
+  ├── from openf1 import ...       OpenF1 REST API client
+  └── from viz import ...          _fetch_fastest_lap_*, _build_*_fig
 ```
 
-`llm_layer.py`, `viz.py`, and `drive_sync.py` have zero Streamlit dependencies — they can be imported, tested, and benchmarked without a running Streamlit server. All session-state logic stays in `app.py`.
+`llm_layer.py`, `viz.py`, `drive_sync.py`, and `mcp/server.py` have zero Streamlit dependencies — they can be imported, tested, and run without a Streamlit server. All session-state logic stays in `app.py`.
 
 ---
 
@@ -69,12 +73,16 @@ driver-dna/
 │   ├── model.py             # XGBoost training, CV evaluation, SHAP, metrics.json
 │   ├── pipeline.py          # Data extraction, telemetry resampling, feature engineering
 │   └── generate_circuits.py # One-off: generates data/circuits.json
+├── mcp/
+│   └── server.py            # MCP server — 4 tools exposing fastest-lap telemetry via MCP
 ├── tests/
-│   ├── test_drive_sync.py    # 21 tests — OAuth flow, token exchange, upload/download, restore
-│   ├── test_app_helpers.py   # 29 tests — LLM layer: parsing, validation, sanitisation, RAG
-│   ├── test_race_engine.py   # 30 tests — pace, gaps, undercuts, projections, degradation
-│   ├── test_openf1.py        # 18 tests — OpenF1 client response parsing, edge cases
-│   └── test_pipeline_tab.py  # 23 tests — pipeline download + model training session logic
+│   ├── test_drive_sync.py         # 21 tests — OAuth flow, token exchange, upload/download, restore
+│   ├── test_app_helpers.py        # 29 tests — LLM layer: parsing, validation, sanitisation, RAG
+│   ├── test_race_engine.py        # 30 tests — pace, gaps, undercuts, projections, degradation
+│   ├── test_openf1.py             # 18 tests — OpenF1 client response parsing, edge cases
+│   ├── test_pipeline_tab.py       # 23 tests — pipeline download + model training session logic
+│   ├── test_mcp_server.py         # 38 tests — all 4 MCP tools, helpers, error paths (fully offline)
+│   └── test_telemetry_cumtime.py  #  4 tests — cumtime overflow clip + normalisation in viz.py
 ├── .github/workflows/
 │   ├── ci.yml               # Lint (ruff) → type check (mypy) → pytest with coverage
 │   ├── docker.yml           # Build & push to GHCR on every push to main
@@ -82,7 +90,7 @@ driver-dna/
 ├── data/                    # Git-ignored — restored from Google Drive on cold start
 │   ├── dataset.parquet      # Driver DNA training data (pipeline.py output)
 │   ├── dataset_meta.json    # Session metadata — GP name, year, session type
-│   └── circuits.json        # Circuit XY outlines for Track Map
+│   └── circuits.json        # Circuit XY outlines + sector boundary fractions for Track Map and Sector Times
 ├── models/                  # Git-ignored — restored from Google Drive on cold start
 │   ├── driver_dna_clf.joblib
 │   ├── label_encoder.joblib
@@ -414,12 +422,13 @@ Plain-prose answer rendered in chat UI
 
 ### Fastest Lap Telemetry Comparison
 
-Five channels comparing two drivers over their fastest recorded lap, fetched live from OpenF1:
+Six channels comparing two drivers over their fastest recorded lap, fetched live from OpenF1:
 
 | Channel | What it shows |
 |---|---|
-| **Time Delta** | Cumulative time gap through the lap, with shaded gain/loss regions |
-| **Track Map** | Circuit outline with ~999 microsectors coloured by faster driver, braking zone overlays, full-throttle overlays, auto-detected corner labels (T1–T12), start/finish marker, lap time subtitle, and rich per-microsector hover |
+| **Track Map** | Circuit outline coloured by faster driver per microsector (square markers), with bold S1/S2/S3 circle boundary markers and lap time subtitle |
+| **Time Delta** | Cumulative time gap through the lap, with shaded gain/loss regions, lead-change markers, and peak advantage annotations — all labelled as `DRIVER ahead X.XXXs` (no `+`/`-` signs) |
+| **Sector Times** | Grouped bar chart of S1, S2, and S3 times for both drivers; per-sector deltas shown as `DRIVER ahead X.XXXs`; total lap time difference displayed below the bars |
 | **Speed** | Overlaid speed traces (km/h) vs. distance |
 | **Throttle** | Overlaid throttle application (%) vs. distance |
 | **Brake** | Overlaid brake pressure (%) vs. distance |
@@ -439,6 +448,100 @@ Five channels comparing two drivers over their fastest recorded lap, fetched liv
 **Live mode** — connects to the OpenF1 live feed during an active F1 race weekend with auto-refresh at 10s / 30s / 60s intervals.
 
 **Historical mode** — any race from 2022 onwards via the OpenF1 archive.
+
+---
+
+## MCP Server — Fastest Lap Telemetry API
+
+`mcp/server.py` exposes the Race Dashboard's fastest-lap comparison capability as a standalone **Model Context Protocol (MCP) server**. Any MCP-compatible client — Claude Desktop, a custom LLM agent, or a CI tool — can query F1 session data and driver telemetry programmatically without the Streamlit UI.
+
+The server reuses `src/openf1.py` and `src/viz.py` directly, with no code duplication. It runs over stdio (the standard MCP transport) and adds zero new runtime dependencies beyond the `mcp` package.
+
+### Four tools
+
+| Tool | Inputs | Returns |
+|---|---|---|
+| `list_sessions` | `year`, `race_name` | All sessions for a race weekend (key, type, date) |
+| `list_drivers` | `year`, `race_name`, `session_type` | All drivers in a session (number, acronym, name, team) |
+| `get_fastest_lap_data` | `year`, `race_name`, `session_type`, `driver_number` | Full telemetry for one driver's fastest lap |
+| `get_channel_comparison` | `year`, `race_name`, `session_type`, `driver_a`, `driver_b`, `channel` | Two-driver comparison with raw data + Plotly figure JSON |
+
+### `get_fastest_lap_data` response
+
+Returns 200-point distance-normalised traces for the driver's fastest lap:
+
+```json
+{
+  "driver_number": 1,
+  "acronym": "VER",
+  "lap_time": 79.823,
+  "lap_number": 11,
+  "speed":    [342.5, 341.2, ...],   // km/h — 200 points
+  "throttle": [100.0, 97.4, ...],    // 0–100 %
+  "brake":    [0.0, 0.0, ...],       // 0–100
+  "cumtime":  [0.0, 0.4, ...]        // elapsed seconds at each distance point
+}
+```
+
+### `get_channel_comparison` response
+
+`channel` accepts: `"Speed"`, `"Throttle"`, `"Brake"`, `"Time Delta"`, `"Track Map"`.
+
+```json
+{
+  "driver_a": { "driver_number": 1, "acronym": "VER", "lap_time": 79.823, ... },
+  "driver_b": { "driver_number": 44, "acronym": "HAM", "lap_time": 80.156, ... },
+  "channel": "Time Delta",
+  "figure_json": "{...}"   // Plotly figure — use plotly.io.from_json() to render
+}
+```
+
+For `"Speed"` / `"Throttle"` / `"Brake"`: each driver dict contains only the relevant channel trace plus `lap_time` and `lap_number`. For `"Time Delta"` and `"Track Map"`: all four channels are returned for both drivers.
+
+### Session type values
+
+Pass the `session_type` strings returned by `list_sessions` — e.g. `"Race"`, `"Qualifying"`, `"Practice 1"`, `"Sprint"`. Matching is case-insensitive.
+
+### Usage
+
+```bash
+# Run via stdio (standard MCP transport)
+python mcp/server.py
+
+# Inspect all tools interactively
+npx @modelcontextprotocol/inspector python mcp/server.py
+```
+
+**Add to Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "driver-dna": {
+      "command": "python",
+      "args": ["/absolute/path/to/driver-dna/mcp/server.py"]
+    }
+  }
+}
+```
+
+Once connected, Claude can answer questions like *"Who had the fastest lap at Monza 2024 qualifying?"* or *"Give me the time delta chart between Verstappen and Hamilton at the 2024 Italian Grand Prix race"* using live OpenF1 data.
+
+### Example session (MCP Inspector)
+
+```
+list_sessions(2024, "Italian Grand Prix")
+→ [{"session_type": "Qualifying", "session_key": 9574, ...}, ...]
+
+list_drivers(2024, "Italian Grand Prix", "Qualifying")
+→ [{"driver_number": 1, "name_acronym": "VER", ...}, ...]
+
+get_fastest_lap_data(2024, "Italian Grand Prix", "Qualifying", 1)
+→ {"acronym": "VER", "lap_time": 79.823, "speed": [...200 values...], ...}
+
+get_channel_comparison(2024, "Italian Grand Prix", "Qualifying", 1, 16, "Time Delta")
+→ {"driver_a": {...}, "driver_b": {...}, "channel": "Time Delta", "figure_json": "..."}
+```
 
 ---
 
@@ -516,13 +619,13 @@ A gradient-boosted tree multi-class classifier trained with **5-fold stratified 
 
 ### 4. Circuit geometry store — `src/generate_circuits.py`
 
-Extracts XY circuit outlines for all 24 Grand Prix from FastF1 at **500 resampled distance points** per circuit and writes them to `data/circuits.json`. Resume-safe — skips circuits already written.
+Extracts XY circuit outlines for all 24 Grand Prix from FastF1 at **500 resampled distance points** per circuit and writes them to `data/circuits.json`. Also computes **sector boundary fractions** (`sector_fractions: [s1_end_frac, s2_end_frac]`) from each circuit's fastest lap telemetry — the normalised distance (0–1) at which Sector 1 and Sector 2 end. These fractions power the S1/S2/S3 boundary markers on the Track Map and the Sector Times comparison chart. Resume-safe — skips circuits already written.
 
 ---
 
 ## Testing & Quality
 
-### Test suite — 121 tests across 5 modules
+### Test suite — 163 tests across 7 modules
 
 | Module | Tests | What it covers |
 |---|---|---|
@@ -531,9 +634,11 @@ Extracts XY circuit outlines for all 24 Grand Prix from FastF1 at **500 resample
 | `test_race_engine.py` | 30 | Rolling pace, gap-to-leader, undercut detection, finishing order projection, tyre degradation, stint analysis |
 | `test_openf1.py` | 18 | OpenF1 API client: response parsing, error handling, live/historical edge cases |
 | `test_pipeline_tab.py` | 23 | Pipeline download session-state logic, model training session-state logic, error capture, finally-block cleanup, argument propagation, low-sample guard |
+| `test_mcp_server.py` | 38 | All 4 MCP tools, helper utilities (`_to_list`, `_acronym_map`, `_colour_map`, `_resolve_session`), and error paths — fully offline via mocked OpenF1 client and telemetry functions |
+| `test_telemetry_cumtime.py` | 4 | `_fetch_fastest_lap_all_openf1` cumtime overflow guard: next-lap clip, short-sample normalisation, Russell/Antonelli inversion regression test, no-overflow passthrough |
 
 ```bash
-pytest tests/ -v                                      # run all 121 tests
+pytest tests/ -v                                      # run all 163 tests
 pytest tests/ --cov=src --cov-report=term-missing     # with line coverage
 ```
 
@@ -684,9 +789,9 @@ redirect_uri  = "http://localhost:8501"
 
 Then launch the app and click **Connect Google Drive** in the sidebar to complete the OAuth flow. After connecting, all future pipeline runs automatically sync to your Drive, and every cold start restores missing files automatically.
 
-### 4. Generate circuit outlines *(required for Track Map and Throttle Map)*
+### 4. Generate circuit outlines *(required for Track Map, Throttle Map, and Sector Times)*
 
-Downloads XY geometry for all 24 Grand Prix circuits. Run once — takes 10–30 minutes. Resume-safe.
+Downloads XY geometry and computes sector boundary fractions for all 24 Grand Prix circuits. Run once — takes 10–30 minutes on first run (FastF1 downloads), near-instant on subsequent runs (cached). Resume-safe.
 
 ```bash
 python src/generate_circuits.py
@@ -722,6 +827,20 @@ streamlit run src/app.py
 
 > The Race Dashboard and Race Intelligence Chat work independently of steps 4–6 — they query the OpenF1 API directly. Live mode only works during active F1 race weekends; historical mode works any time from 2022 onwards.
 
+### 8. (Optional) Run the MCP server
+
+Exposes fastest-lap telemetry as an MCP service. No additional setup is needed — it reuses the same `src/` modules.
+
+```bash
+# Verify the server starts cleanly
+python mcp/server.py
+
+# Inspect all 4 tools interactively
+npx @modelcontextprotocol/inspector python mcp/server.py
+```
+
+To connect from Claude Desktop, add the server to `~/Library/Application Support/Claude/claude_desktop_config.json` (see [MCP Server section](#mcp-server--fastest-lap-telemetry-api) above for the full config snippet).
+
 ---
 
 ## Debugging
@@ -741,8 +860,8 @@ A VS Code debug configuration is included at [`.vscode/launch.json`](.vscode/lau
 **`ImportError: numpy.core.multiarray failed to import`**
 Wrong Python interpreter. In VS Code: `⇧⌘P` → **Python: Select Interpreter** → choose the `.venv` entry.
 
-**Track Map or Throttle Map shows no data**
-`data/circuits.json` not yet generated. Run `python src/generate_circuits.py`.
+**Track Map, Throttle Map, or Sector Times shows no data / "Sector boundaries not available"**
+`data/circuits.json` not yet generated, or was generated before sector fraction support was added. Run `python src/generate_circuits.py` (resume-safe — will only re-process missing or outdated circuits).
 
 **Model accuracy panel shows nothing in Mystery Driver tab**
 `models/metrics.json` not yet generated. Re-run `python src/model.py`.
