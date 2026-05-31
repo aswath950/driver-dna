@@ -1,897 +1,1051 @@
-# Driver DNA + Race Intelligence Dashboard
+# Driver DNA — F1 Telemetry Platform
 
-**Can a machine learning model identify an F1 driver purely from their telemetry — without ever seeing their name?**
+> A full-stack F1 analytics platform — ML driver identification, five distinct
+> agentic-AI features, REST + GraphQL backend over normalised Postgres,
+> Next.js 14 client, and a legacy Streamlit dashboard. Built as a
+> generalist-engineer portfolio piece.
 
-Driver DNA is a full-stack AI/ML platform built on Formula 1 telemetry data. It combines an XGBoost driver-identification model, a six-chart driving style analysis suite, an Explainable AI layer, a real-time race analytics engine, and **five distinct Agentic AI features** powered by GPT-4o-mini — all served through an interactive Streamlit dashboard across four tabs. A dedicated **Pipeline & Training tab** lets you download F1 telemetry datasets and retrain the classifier directly from the UI, with live progress logs and background threading. Trained models and datasets are automatically persisted to and restored from **Google Drive** on every deployment — powered by the **Google Drive API v3** with per-user **OAuth 2.0** authentication. The UI uses a neo-brutalist design system with F1's red/black/white palette and Space Grotesk typography.
+![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)
+![GraphQL](https://img.shields.io/badge/Strawberry-GraphQL-FF66B3?logo=graphql&logoColor=white)
+![Next.js](https://img.shields.io/badge/Next.js-14-000?logo=next.js&logoColor=white)
+![Postgres](https://img.shields.io/badge/Postgres-16-336791?logo=postgresql&logoColor=white)
+![OpenAI](https://img.shields.io/badge/OpenAI-gpt--4o--mini-412991?logo=openai&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)
+![CI](https://img.shields.io/badge/GitHub_Actions-3_workflows-2088FF?logo=githubactions&logoColor=white)
+
+**What's in the box**
+
+1. **AI / ML** — XGBoost driver classifier, SHAP explainability, five distinct
+   agentic-LLM patterns (Reflexion, RAG, structured output, single-shot XAI
+   narration, SSE-streamed ReAct chat).
+2. **Backend** — Postgres + FastAPI REST (`/api/v1` with RFC 7807 errors,
+   opaque cursor pagination, OpenAPI 3.1) co-hosted with Strawberry GraphQL
+   (`/graphql` with N+1-killing DataLoaders).
+3. **Frontend** — Next.js 14 App Router web client (RSC, Plotly, SSE chat)
+   **plus** the legacy Streamlit dashboard — both served by the same `src/`
+   Python library.
 
 ---
 
-## Tech Stack
+## At a glance
 
-| Category | Technologies |
-|---|---|
-| **Machine Learning** | XGBoost (multi-class classification), scikit-learn, SHAP (Explainable AI), 5-fold stratified cross-validation |
-| **Agentic AI / LLM** | OpenAI API (`gpt-4o-mini`), tool calling (ReAct), Reflexion self-critique loop, RAG via cosine similarity, JSON-mode structured output, prompt engineering, multi-step agent orchestration |
-| **Data Engineering** | FastF1, pandas, NumPy, Apache Parquet, time-series resampling, 200-point distance-normalised feature extraction |
-| **Visualisation** | Streamlit, Plotly (radar/spider charts, heatmaps, bar charts, line overlays, scatter track maps, horizontal similarity bars) |
-| **APIs** | OpenF1 REST API (live + historical), OpenAI Chat Completions API, Google Drive API v3 |
-| **Cloud Storage / MLOps** | Google Drive artifact persistence, OAuth 2.0 (per-user token flow), `google-auth-oauthlib`, joblib model serialisation, SHAP feature importance, confusion matrix evaluation, cross-validation scoring, per-driver precision/recall/F1 metrics, JSONL audit logging, LLM cost dashboard |
-| **Developer Tooling** | Model Context Protocol (MCP), Google Drive MCP server for artifact inspection and management, driver-dna MCP server for programmatic telemetry access, protocol-driven development workflow |
-| **Testing & Quality** | pytest (163 tests, 7 test modules), pytest-cov (coverage XML), ruff (linting), mypy (type checking), GitHub Actions CI |
-| **Deployment** | Docker (multi-stage build, python:3.13-slim), GitHub Container Registry (GHCR), Streamlit Community Cloud |
-| **Security** | OAuth 2.0 `drive.file` scope (least-privilege, per-user), token persistence with auto-refresh, prompt injection prevention, input sanitisation, API key management via `st.secrets`, tool name allowlisting, argument clamping, rate limiting, LLM response sanitisation, JSON schema validation |
+- **5** alembic migrations · **13** application tables · **17** indexes (9
+  query-path + 8 unique-constraint) — with measured query plans in
+  [backend/docs/query_plans.md](backend/docs/query_plans.md)
+- **23** production REST endpoints under `/api/v1`
+  — 9 reads · 5 analytics · 5 AI · 4 me/session
+- **GraphQL** schema with 12 query fields + 9 object types + 2 enums + per-request DataLoaders
+- **5 agentic-AI patterns** — Reflexion · RAG · Structured Output ·
+  Single-shot XAI · SSE-streamed ReAct
+- **282 tests** — 119 backend (modern stack) + 163 legacy (`src/` + Streamlit)
+- **3 GitHub Actions** workflows (legacy CI · backend CI · web CI)
+- **4 documented deploy paths** — local dev · Vercel+Railway · self-host VPS · Streamlit Cloud
+
+**Live demo:** _(set to your Vercel URL after deploy)_
+
+**Quick links:** [Architecture](#architecture) · [Feature tour](#feature-tour) ·
+[Get Started](#get-started) · [Deployment](#deployment) · [Testing](#testing)
 
 ---
 
 ## Architecture
 
-The codebase is split into focused, independently testable modules with a one-directional dependency chain — no circular imports.
+Three views: system, request lifecycle, and entity-relationship.
 
-```
-app.py  (2 390+ lines — UI, tabs, session state, background threads)
-  ├── from drive_sync import ...   Google Drive OAuth + artifact sync
-  ├── from features import ...     feature engineering + Streamlit caching
-  ├── from viz import ...          Plotly figure builders — no st. calls
-  ├── from llm_layer import ...    LLM orchestration, prompts, tool functions
-  ├── from model import ...        XGBoost training + evaluation
-  ├── from pipeline import ...     dataset download + feature extraction
-  ├── from openf1 import ...       OpenF1 REST API client
-  └── from race_engine import ...  pace analytics + strategy detection
+### System diagram
 
-llm_layer.py  (1 470 lines)
-  └── from features import ...     classify_archetype, EXTENDED_RADAR_FEATURES
+```mermaid
+flowchart LR
+    User([Browser]) -->|HTTPS| Vercel["Next.js 14<br/>App Router · RSC + Plotly"]
+    Vercel -->|REST /api/v1<br/>GraphQL /graphql<br/>SSE chat stream| Railway["FastAPI<br/>+ Strawberry GraphQL"]
+    Railway -->|asyncpg| PG[("Postgres 16<br/>13 tables · 17 indexes")]
+    Railway -->|OpenAI SDK| OAI[OpenAI<br/>gpt-4o-mini]
+    Railway -->|requests| OF1[OpenF1 REST]
 
-viz.py  (721 lines)
-  └── from features import ...     N_POINTS, OPENF1_TRACE_COLS, SPECIAL_CHANNELS
+    Streamlit["Streamlit<br/>legacy dashboard"] -.->|imports| Src[/"src/ — shared Python lib<br/>race_engine · viz · llm_layer · openf1"/]
+    Railway -.->|imports| Src
+    MCP["MCP server<br/>(stdio · 4 tools)"] -.->|imports| Src
 
-drive_sync.py  (~220 lines)
-  └── google-auth-oauthlib, google-api-python-client
-      OAuth 2.0 flow · token persistence · Drive API v3 upload/download
-
-mcp/server.py  (standalone MCP server — no Streamlit dependency)
-  ├── from openf1 import ...       OpenF1 REST API client
-  └── from viz import ...          _fetch_fastest_lap_*, _build_*_fig
+    classDef new fill:#e8002d,stroke:#fff,color:#fff
+    class Vercel,Railway,PG new
 ```
 
-`llm_layer.py`, `viz.py`, `drive_sync.py`, and `mcp/server.py` have zero Streamlit dependencies — they can be imported, tested, and run without a Streamlit server. All session-state logic stays in `app.py`.
+### Request lifecycle — one page load
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Browser
+    participant N as Next.js (Vercel)
+    participant F as FastAPI (Railway)
+    participant P as Postgres
+    B->>N: GET /race/1
+    N->>F: GET /api/v1/sessions/1/results<br/>(forwards dna_sid cookie)
+    F->>F: UserSessionMiddleware<br/>touch last_seen_at
+    F->>P: SELECT JOIN drivers JOIN teams<br/>(uses ix_race_results_session_pos)
+    P-->>F: 20 rows
+    F-->>N: 200 application/json<br/>+ X-Request-ID + API-Version: 1
+    N-->>B: SSR HTML — leaderboard inlined
+```
+
+### Entity-relationship (high-level)
+
+```mermaid
+erDiagram
+    SEASONS ||--o{ EVENTS : has
+    CIRCUITS ||--o{ EVENTS : hosts
+    EVENTS  ||--o{ SESSIONS : has
+    SESSIONS ||--o{ SESSION_DRIVERS : roster
+    SESSIONS ||--o{ RACE_RESULTS : produces
+    SESSIONS ||--o{ LAP_TIMES : produces
+    DRIVERS ||--o{ SESSION_DRIVERS : entered
+    TEAMS   ||--o{ SESSION_DRIVERS : fielded
+    DRIVERS ||--o{ DRIVER_STATS : aggregates
+    SEASONS ||--o{ DRIVER_STATS : aggregates
+    USER_SESSIONS ||--o{ SAVED_ANALYSES : owns
+    USER_SESSIONS ||--o{ LLM_AUDIT : attributed
+```
+
+### Why this shape
+
+**Why a shared `src/` library.** All three Python frontends — Streamlit, the
+FastAPI backend, and the MCP server — consume the same race-engine /
+OpenF1 / LLM modules. One bug fix benefits every frontend; no copy-paste.
+The shared lib pre-dates the backend and was kept intentionally
+import-stable, with `sys.path` wiring centralised in
+[backend/app/__init__.py](backend/app/__init__.py).
+
+**Why REST and GraphQL.** REST is the contract for Next.js RSC fetches,
+the OpenAPI-generated TypeScript client, the MCP server, and any future
+integrator. GraphQL is for graph-shaped queries (event → sessions →
+results → drivers in one round-trip) where DataLoaders guarantee a
+constant number of SQL statements. Both routes reuse the same Phase 6
+repositories — zero duplicate SQL.
+
+**Why cursor pagination over offset.** Stable order across pages, no
+`OFFSET 1000000` slowdowns. Opaque base64url cursor encodes
+`{"k": <sort_key>, "id": <pk>}` so clients never construct cursors —
+they only echo what the server returned. See
+[backend/app/core/pagination.py](backend/app/core/pagination.py).
 
 ---
 
-## Project Structure
+## Tech stack
+
+| Layer | Tools | Why |
+|---|---|---|
+| **Frontend** | Next.js 14 App Router · React 18 · Tailwind · Plotly.js · TypeScript strict | RSC for SEO + low-JS landing pages; Plotly for visual parity with Streamlit; types generated from `/openapi.json` |
+| **Backend** | FastAPI 0.115 · Strawberry GraphQL · SQLAlchemy 2.0 async · Alembic · Pydantic v2 · structlog | Async stack throughout; OpenAPI 3.1 out-of-the-box; one factory in [app/main.py](backend/app/main.py) wires every middleware |
+| **Data** | Postgres 16 · asyncpg / psycopg · pgcrypto | Normalised 3NF schema; UUID via `gen_random_uuid()`; JSONB for saved-analysis payloads |
+| **AI / ML** | OpenAI (gpt-4o-mini) · XGBoost · SHAP · scikit-learn · pandas · numpy | Reused legacy ML stack; backend wraps a single sync OpenAI helper in [app/llm/openai_client.py](backend/app/llm/openai_client.py) |
+| **External** | OpenF1 REST · FastF1 cache · Google Drive API v3 (OAuth 2.0) | Telemetry sources; legacy artifact persistence |
+| **Ops** | Docker · docker-compose · Railway (backend + Postgres) · Vercel (web) · GitHub Actions · pytest 8 · ruff · mypy | Two free-tier cloud services + GH-hosted CI |
+
+---
+
+## Repository map
+
+Top-level layout — each leaf has a one-line "what it is".
 
 ```
 driver-dna/
-├── src/
-│   ├── app.py               # Dashboard — 4 tabs, 5 AI features, 13+ chart types
-│   ├── drive_sync.py        # Google Drive OAuth 2.0 + artifact persistence
-│   ├── features.py          # Feature constants, engineering helpers, classify_archetype
-│   ├── viz.py               # Plotly figure builders (no Streamlit dependency)
-│   ├── llm_layer.py         # LLM orchestration: Reflexion, RAG, ReAct, structured output
-│   ├── eval_llm.py          # Offline LLM evaluation framework + token cost dashboard
-│   ├── race_engine.py       # Pace analytics, gap tracking, undercut detection, projections
-│   ├── openf1.py            # OpenF1 REST API client (live + historical modes)
-│   ├── model.py             # XGBoost training, CV evaluation, SHAP, metrics.json
-│   ├── pipeline.py          # Data extraction, telemetry resampling, feature engineering
-│   └── generate_circuits.py # One-off: generates data/circuits.json
-├── mcp/
-│   └── server.py            # MCP server — 4 tools exposing fastest-lap telemetry via MCP
-├── tests/
-│   ├── test_drive_sync.py         # 21 tests — OAuth flow, token exchange, upload/download, restore
-│   ├── test_app_helpers.py        # 29 tests — LLM layer: parsing, validation, sanitisation, RAG
-│   ├── test_race_engine.py        # 30 tests — pace, gaps, undercuts, projections, degradation
-│   ├── test_openf1.py             # 18 tests — OpenF1 client response parsing, edge cases
-│   ├── test_pipeline_tab.py       # 23 tests — pipeline download + model training session logic
-│   ├── test_mcp_server.py         # 38 tests — all 4 MCP tools, helpers, error paths (fully offline)
-│   └── test_telemetry_cumtime.py  #  4 tests — cumtime overflow clip + normalisation in viz.py
-├── .github/workflows/
-│   ├── ci.yml               # Lint (ruff) → type check (mypy) → pytest with coverage
-│   ├── docker.yml           # Build & push to GHCR on every push to main
-│   └── eval.yml             # LLM evaluation + PR comment with RAG sanity metrics
-├── data/                    # Git-ignored — restored from Google Drive on cold start
-│   ├── dataset.parquet      # Driver DNA training data (pipeline.py output)
-│   ├── dataset_meta.json    # Session metadata — GP name, year, session type
-│   └── circuits.json        # Circuit XY outlines + sector boundary fractions for Track Map and Sector Times
-├── models/                  # Git-ignored — restored from Google Drive on cold start
-│   ├── driver_dna_clf.joblib
-│   ├── label_encoder.joblib
-│   ├── metrics.json         # CV scores, train accuracy, per-driver F1
-│   ├── confusion_matrix.html
-│   ├── shap_importance.png
-│   └── llm_audit.jsonl      # Per-call LLM audit log (feature, tokens, latency, cost)
-├── Dockerfile               # Multi-stage build — builder + lean runtime (python:3.13-slim)
-├── requirements.txt
-├── requirements-dev.txt     # pytest, pytest-cov, responses, ruff, mypy, types-requests
-└── streamlit_app.py         # Streamlit Community Cloud entry point
+├── backend/                       FastAPI + Strawberry + Alembic (Phases 1–12)
+│   ├── app/
+│   │   ├── main.py                FastAPI factory; mounts middleware + handlers + routers
+│   │   ├── core/                  config, errors (RFC 7807), pagination, middleware,
+│   │   │                          sessions (cookie middleware)
+│   │   ├── api/v1/                REST routers + Pydantic schemas
+│   │   │   ├── routers/           seasons, events, sessions, drivers, standings,
+│   │   │   │                      analytics, ai, me
+│   │   │   └── schemas/           One Pydantic file per resource
+│   │   ├── graphql/               Strawberry schema · resolvers · DataLoaders
+│   │   ├── db/                    SQLAlchemy 2.0 models · repositories (one file per aggregate)
+│   │   ├── etl/                   hydrate_session.py · refresh_driver_stats.py · CLI
+│   │   ├── services/              DB → DataFrame adapters for src/race_engine
+│   │   └── llm/                   5 feature services · SSE race chat · audit
+│   ├── alembic/versions/          5 migrations
+│   ├── scripts/                   seed_demo.sql · hydrate_initial_data.sh
+│   ├── tests/                     119 tests across 11 files
+│   ├── docs/query_plans.md        EXPLAIN ANALYZE output before/after indexes
+│   ├── Dockerfile · railway.json  Cloud deploy config
+│   └── pyproject.toml
+├── web/                           Next.js 14 App Router (Phase 11)
+│   ├── app/
+│   │   ├── page.tsx                       Landing — recent races (RSC)
+│   │   ├── event/[eventId]/               Sessions per event (RSC)
+│   │   ├── race/[sessionId]/              Leaderboard + tyre deg + SSE chat
+│   │   ├── radar/[sessionId]/             Driver compare (Plotly client island)
+│   │   ├── mystery-driver/                XAI explainer (client)
+│   │   └── pipeline/                      Link to legacy Streamlit
+│   ├── components/                charts/PlotlyChart · chat/RaceChatStream · ui/*
+│   ├── lib/                       api (RSC + cookies) · api-client (browser) · env
+│   └── package.json
+├── src/                           SHARED Python library — UNCHANGED, reused by all
+│   ├── race_engine.py             rolling pace · gap-to-leader · undercut · tyre deg
+│   ├── llm_layer.py               Streamlit-era 5 agentic patterns (still in use)
+│   ├── viz.py                     Plotly figure builders
+│   ├── openf1.py                  OpenF1 sync client (used by ETL + MCP)
+│   ├── model.py · pipeline.py     XGBoost classifier + telemetry features
+│   └── drive_sync.py              Google Drive OAuth/upload (Streamlit only)
+├── streamlit_app.py               Legacy dashboard entry point
+├── mcp/server.py                  MCP server — 4 stdio tools over fastest-lap data
+├── docker-compose.yml             Postgres + backend (web runs separately)
+├── Makefile                       make {db,backend,web,migrate,hydrate,dev,...}
+└── .github/workflows/
+    ├── ci.yml                     legacy: src/ + Streamlit (ruff · mypy · pytest · eval · docker)
+    ├── backend-ci.yml             backend: Postgres svc · alembic · ruff · pytest · OpenAPI snapshot
+    └── web-ci.yml                 web: npm ci · tsc · next lint · next build
 ```
 
 ---
 
-## Google Drive Artifact Persistence
+## Feature tour
 
-`data/` and `models/` are git-ignored — every fresh deployment (Streamlit Cloud redeploy, new Docker container) would otherwise start cold with no dataset and no model. `drive_sync.py` solves this by treating Google Drive as a persistent artifact store, with per-user OAuth 2.0 authentication so every person who deploys the app uses their own Drive.
+The seven things most worth pointing at.
 
-### How it works
+### 1. REST API — `/api/v1`
 
-```
-First run (unauthenticated):
-  Sidebar → "Connect Google Drive" button
-        ↓
-  User clicks → Google consent screen (OAuth 2.0, drive.file scope)
-        ↓
-  Google redirects to app URL with ?code=XXX
-        ↓
-  App detects code via st.query_params → exchange_code()
-        ↓
-  Access + refresh token saved to data/.google_token.json
-        ↓
-  Sidebar now shows "☁️ Google Drive connected"
+Every endpoint inherits four contracts:
 
-Every subsequent run (authenticated):
-  Token loaded from disk → auto-refreshed if expired (no re-auth needed)
-        ↓
-  restore_missing_artifacts() runs in a background thread (30 s timeout)
-        ↓
-  Any missing data/ or models/ file is downloaded from Drive before
-  the app renders its first content
+- **Versioning** — mounted under `/api/v1`; every response carries
+  `API-Version: 1`. Future v2 mounts at `/api/v2`; no breaking changes
+  inside a major.
+- **RFC 7807 error envelope** — `application/problem+json` with `type`,
+  `title`, `status`, `detail`, `instance`, and a `request_id` extension.
+- **Cursor pagination** — opaque base64url cursor; default `limit=50`,
+  max 200. List endpoints return `{ data: [...], page: { next_cursor,
+  has_more, limit } }`.
+- **Request tracing** — `X-Request-ID` is minted (or echoed) on every
+  request and bound to a structlog contextvar.
 
-After each pipeline / training run:
-  save_dataset() / save_meta() → upload_file() → Drive
-  evaluate_model() / save_model() → upload_file() → Drive
-```
+23 endpoints in production (4 sentinel `_ping*` routes excluded):
 
-### Security design
-
-| Principle | Implementation |
-|---|---|
-| **Least privilege** | `drive.file` scope — the app can only see files it created; it never reads any existing Drive content |
-| **Per-user isolation** | Each deployer authenticates their own Google account; no shared service account |
-| **Credential storage** | `client_id` / `client_secret` in `st.secrets` or env vars — never committed |
-| **Token storage** | `data/.google_token.json` — gitignored, refresh token enables silent re-auth |
-| **Graceful degradation** | All Drive calls wrapped in `try/except`; a Drive failure is logged to `stderr` and never crashes the app |
-
-### Artifacts synced
-
-| File | Size | Upload trigger |
-|---|---|---|
-| `data/dataset.parquet` | ~640 KB | After `save_dataset()` |
-| `data/dataset_meta.json` | ~4 KB | After `save_meta()` |
-| `data/circuits.json` | ~477 KB | After `save_dataset()` |
-| `models/driver_dna_clf.joblib` | ~2.7 MB | After `save_model()` |
-| `models/label_encoder.joblib` | ~545 B | After `save_model()` |
-| `models/metrics.json` | ~1.6 KB | After `evaluate_model()` |
-| `models/confusion_matrix.html` | ~4.6 MB | After `evaluate_model()` |
-| `models/shap_importance.png` | ~41 KB | After `evaluate_model()` |
-| `models/llm_audit.jsonl` | ~1.2 KB | After `save_model()` |
-
-**Not synced:** `data/fastf1_http_cache.sqlite` (~672 MB) — FastF1 rebuilds this automatically via HTTP.
-
-### MCP-driven artifact management
-
-The Drive integration was developed using the **Model Context Protocol (MCP)** — specifically the Google Drive MCP server. MCP provides a standardised protocol for tools to expose capabilities (list files, read metadata, upload, download) as callable functions. Using the Drive MCP server directly during development made it possible to inspect folder structures, verify uploaded artifacts, and validate sync behaviour interactively — without a separate test harness or manual Drive UI checks. This is an example of a protocol-driven development workflow where the same API surface used in production is exercised directly during development.
-
----
-
-## Dashboard Overview
-
-Four tabs navigated via a boxy rectangular tab bar (neo-brutalist F1 design — red active state, dark inactive). Each tab is independently functional.
-
-| Tab | Name | What it does |
-|---|---|---|
-| 1 | **Driver Radar** | Driving style fingerprint visualisation + three agentic AI analysis features |
-| 2 | **Mystery Driver** | ML-based driver identification from a single lap + SHAP explainer + XAI narration + model accuracy panel |
-| 3 | **Race Dashboard** | Live and historical race analytics + conversational AI race analyst |
-| 4 | **⚙️ Pipeline** | Download F1 telemetry datasets and retrain the classifier — all from the UI, with live progress logs |
-
-### Visual Design
-
-Neo-brutalist design system with F1's red/black/white palette:
-
-| Token | Value | Used for |
-|---|---|---|
-| Page background | `#111111` | Base canvas |
-| Card background | `#1a1a1a` | Panels, report cards, alert boxes |
-| F1 Red | `#E8002D` | Active tabs, borders, shadows, buttons |
-| Offset shadow | `3–4px solid #E8002D` | All card and button shadows |
-| Border radius | `0px` | All containers (hard edges throughout) |
-| Font | Space Grotesk (Google Fonts) | All headings and body text |
-
-Active tab: red fill (`#E8002D`) with black text and `3px 3px 0 #000` shadow. Inactive tabs: dark `#1a1a1a` with `#333` border, red border on hover. Streamlit theme (`config.toml`) sets `primaryColor`, `backgroundColor`, `secondaryBackgroundColor`, and `textColor` to enforce F1 palette at the component level.
-
-### Sidebar Controls
-
-- **Model accuracy** — CV accuracy (±std dev), train accuracy, driver count, and lap count
-- **Google Drive status** — "☁️ Google Drive connected" when authenticated, or a **Connect Google Drive** button that triggers the OAuth 2.0 consent flow
-- **AI Response Mode toggle** — switch between **Concise** (3–6 sentence focused answers) and **Detailed** (multi-paragraph rich analysis, ~50% more tokens per call) across all five AI features simultaneously
-- **API key status** — live check for OpenAI key and required library imports
-
----
-
-## Tab 1 — Driver Radar
-
-A full driving style analysis suite. Select 2–4 drivers to compare across six visualisation layers and three AI features.
-
-### Visualisation 1 — Driver Style Radar
-
-An interactive spider chart showing normalised driving style across up to **12 dimensions**. A toggle switches between Standard (6) and Extended (12) mode.
-
-**Standard dimensions (6):** Avg Speed, Throttle Input, Throttle Variation, Brake Frequency, Steering Precision, Gear Shifts
-
-**Extended dimensions (12, adds):** Top Speed, Corner Speed, Brake Pressure, Full Throttle %, Trail Braking, Coasting %
-
-The three trace-derived dimensions are computed at runtime from the 200-point telemetry arrays:
-
-| Derived feature | Computation |
-|---|---|
-| `throttle_pickup_pct` | Fraction of lap distance where throttle > 80% |
-| `coasting_pct` | Fraction where both throttle < 2% and brake < 1% |
-| `trail_brake_score` | Fraction where throttle > 0 and brake > 0 simultaneously |
-
-### Visualisation 2 — Driver Archetype Cards
-
-A rule-based classifier assigns each selected driver a driving style archetype based on their normalised radar profile.
-
-| Archetype | Trigger conditions |
-|---|---|
-| 💥 Aggressive Braker | High brake frequency and high brake pressure |
-| 🎯 Trail Braking Specialist | High trail braking score and high steering variance |
-| 🚀 High Entry Speed | High average speed and low coasting fraction |
-| 🧊 Smooth Operator | High full-throttle % and low throttle variation |
-| ⚙️ Technical Driver | High gear-shift rate and high steering variance |
-| ⚖️ Balanced Driver | No dominant dimension |
-
-### Visualisation 3 — Speed Profile Comparison
-
-A multi-driver line chart showing **mean speed at every one of 200 normalised distance points** along the lap (`hovermode="x unified"`). Directly reveals where each driver goes faster — in corners, under braking, and on straights.
-
-### Visualisation 4 — Lap-by-Lap Consistency Heatmap
-
-A drivers × features heatmap coloured by cross-lap standard deviation. Red = high variance = inconsistent. Answers a question the mean-based radar cannot: *who is erratic under race pressure?*
-
-### Visualisation 5 — Lap Zone Performance
-
-The 200-point lap is split into three equal distance zones (0–33%, 33–67%, 67–100%). A grouped bar chart shows per-zone performance across Speed, Throttle, and Braking channels.
-
-### Visualisation 6 — Throttle Application Map
-
-The circuit outline (reconstructed from FastF1 XY coordinates) is coloured by average throttle — green for full throttle, red for coasting or braking. One panel per selected driver. Turns an abstract percentage into a spatial fingerprint.
-
----
-
-## Tab 1 — Agentic AI Features
-
-Three distinct agentic patterns, each architecturally different from the others and from the features in Tabs 2 and 3.
-
-### AI Feature 1 — Reflexion Loop: Driver Style Analyst
-
-**Pattern: Reflexion (Shinn et al. 2023) — iterative self-improvement via LLM self-critique**
-
-```
-Analyst LLM  →  generates driving style narrative from radar data
-                        ↓
-Critic LLM   →  evaluates narrative against raw data
-                returns JSON: {confidence: 1–10, factual_errors: [...], suggested_improvements: [...]}
-                        ↓
-  confidence ≥ 7  →  accept narrative
-  confidence < 7  →  Analyst receives critique and rewrites
-                        ↓
-Critic LLM (round 2)  →  re-evaluates the revised narrative
-                        ↓
-                  Final narrative accepted
-```
-
-The dashboard renders each round transparently in collapsible expanders — confidence score, flagged factual errors, and the revision side by side. The self-improvement process is visible to the user.
-
-The Critic runs at `temperature=0.0` (deterministic JSON); the Analyst at `temperature=0.4`. Parse failure on the Critic response gracefully accepts the existing narrative rather than crashing.
-
-**Token budget:** Concise — 400 (analyst) / 300 (critic). Detailed — 650 / 300.
-
----
-
-### AI Feature 2 — RAG: Historical Driver DNA Matching
-
-**Pattern: Retrieval-Augmented Generation — without a vector database**
-
-```
-Driver's 12-dimensional radar vector
-           ↓
-Cosine similarity vs. 10 curated historical F1 driver profiles
-           ↓
-Top-2 most similar profiles retrieved
-           ↓
-Retrieved profiles injected into LLM prompt as grounding context
-           ↓
-GPT-4o-mini explains WHY the current driver's style aligns with the historical matches,
-referencing specific dimension values from both profiles
-```
-
-The knowledge base encodes 10 F1 legends (Schumacher, Senna, Prost, Alonso, Vettel, Hamilton, Verstappen, Räikkönen, Sainz, Rosberg) as 12-dimensional normalised vectors. Retrieval uses cosine similarity directly on the feature vectors — no embedding API, no vector database.
-
-A horizontal bar chart shows all 10 similarity scores (x-axis zoomed to 0.80–1.0), with the top-2 matches highlighted. The LLM narration is anchored exclusively to retrieved data — no speculation.
-
-**Token budget:** Concise — 350. Detailed — 600.
-
----
-
-### AI Feature 3 — Structured Output: Driver DNA Report Card
-
-**Pattern: JSON-mode structured generation + schema validation + retry-on-failure**
-
-```
-GPT-4o-mini called with response_format={"type": "json_object"}
-           ↓
-Python validation layer checks every key, type, length constraint, and value range
-  → integers coerced from floats (e.g. 7.0 → 7)
-  → lists trimmed silently if too long
-  → HTML stripped from all string values
-           ↓
-  valid    →  render report card
-  invalid  →  retry once with specific validation error injected back into the prompt
-           ↓
-Rendered as a structured UI card with rating bars and pill badges
-```
-
-The schema enforces: `headline` (≥2 data references), `strengths` (exactly 3, each citing ≥2 metrics), `weaknesses` (exactly 2 with root-cause diagnosis), three integer ratings (1–10), `tactical_tips` (exactly 2 engineer-grade recommendations), `style_tags` (exactly 4 labels).
-
-**Token budget:** Concise — 500. Detailed — 700.
-
----
-
-## Tab 2 — Mystery Driver
-
-### ML Prediction
-
-Select any lap from the dataset. Click **Identify Driver**. The XGBoost classifier returns a predicted driver and a full probability distribution across all drivers, visualised as a horizontal bar chart.
-
-### XAI Explainer — AI Feature 4
-
-**Pattern: Single-shot LLM narration of SHAP values**
-
-1. **SHAP inference** — `shap.TreeExplainer` computes per-feature SHAP values for the predicted sample, identifying each feature's contribution to the predicted class
-2. **Percentile ranking** — each feature value is ranked against the full training dataset distribution
-3. **Validated prompt** — SHAP magnitudes, feature values, and percentile ranks are assembled into a structured prompt. No raw user input ever enters the LLM context.
-4. **LLM narration** — GPT-4o-mini produces a plain-English explanation
-5. **Session cache** — the explanation is stored in `st.session_state` and cleared when the user picks a different lap
-
-**Token budget:** Concise — 300. Detailed — 500.
-
-### Model Accuracy Panel
-
-Full evaluation results loaded from `models/metrics.json`:
-- CV Accuracy (±std dev), Train Accuracy, driver count, lap count
-- Per-fold CV scores with delta vs. mean
-- Per-driver precision, recall, F1, and support — colour-coded green/amber/red by F1
-
----
-
-## Tab 3 — Race Dashboard
-
-Real-time and historical race analysis powered by the OpenF1 API. No API key required for the data.
-
-### Race Intelligence Chat Agent — AI Feature 5
-
-**Pattern: ReAct tool-calling agent (Reason + Act loop)**
-
-```
-User question
-      ↓
-GPT-4o-mini decides which tools to call (up to 3 per round)
-      ↓
-App executes tools against live RaceAnalyser data
-      ↓
-Tool results returned to GPT-4o-mini
-      ↓
-GPT-4o-mini synthesises or calls more tools (up to 3 rounds)
-      ↓
-If loop exhausted without a text answer → forced synthesis pass
-      ↓
-Plain-prose answer rendered in chat UI
-```
-
-**6 tools exposed to the agent:**
-
-| Tool | Underlying call | Returns |
-|---|---|---|
-| `get_rolling_pace` | `analyser.rolling_pace(window)` | Per-driver rolling-average lap times |
-| `get_gap_to_leader` | `analyser.gap_to_leader()` | Cumulative gap per driver to the leader |
-| `detect_strategy_events` | `analyser.detect_undercuts()` | Undercut / overcut detections |
-| `project_finishing_order` | `analyser.project_finishing_order(laps_remaining)` | Projected final classification |
-| `get_tyre_degradation` | `analyser.tyre_degradation()` | Degradation rate per driver/compound |
-| `get_pace_summary` | `analyser.pace_summary()` | Mean, median, fastest lap per driver |
-
-**Security guardrails — 11 layers:**
-
-| # | Threat | Mitigation |
-|---|---|---|
-| 0 | Prompt injection via long/malicious input | `_ca_sanitize_input()` — strips control chars, 500-char limit |
-| 1 | Out-of-range LLM-supplied tool arguments | `_ca_validate_tool_args()` — typed schema validation + value clamping |
-| 2 | HTML/link injection via LLM response | `st.text()` renders plain text only |
-| 3 | Unknown tool names hallucinated by LLM | `_CA_ALLOWED_TOOLS` explicit allowlist |
-| 4 | Tool call flood within one round | `_CA_MAX_TOOLS_PER_ROUND = 3` cap |
-| 5 | History poisoning via long LLM responses | Per-message 2000-char truncation |
-| 6 | Hardcoded API key | `_get_openai_api_key()` reads `st.secrets` / env var only |
-| 7 | Infinite agent loop | `MAX_TOOL_ROUNDS = 3` hard cap + forced synthesis fallback |
-| 8 | Context window / cost blowout | 20-message history cap + `max_tokens` controlled by response mode |
-| 9 | API spam / cost abuse | 5-second per-session rate limiter |
-| 10 | Corrupt state on failed turn | User message popped from history on API error |
-
-**Example questions the agent can answer:**
-- *"Who has the best pace over the last 10 laps?"*
-- *"Is Verstappen likely to undercut Norris? What does the gap look like?"*
-- *"Which driver has the worst tyre degradation on softs?"*
-- *"Who is projected to win with 20 laps remaining?"*
-
-### Fastest Lap Telemetry Comparison
-
-Six channels comparing two drivers over their fastest recorded lap, fetched live from OpenF1:
-
-| Channel | What it shows |
-|---|---|
-| **Track Map** | Circuit outline coloured by faster driver per microsector (square markers), with bold S1/S2/S3 circle boundary markers and lap time subtitle |
-| **Time Delta** | Cumulative time gap through the lap, with shaded gain/loss regions, lead-change markers, and peak advantage annotations — all labelled as `DRIVER ahead X.XXXs` (no `+`/`-` signs) |
-| **Sector Times** | Grouped bar chart of S1, S2, and S3 times for both drivers; per-sector deltas shown as `DRIVER ahead X.XXXs`; total lap time difference displayed below the bars |
-| **Speed** | Overlaid speed traces (km/h) vs. distance |
-| **Throttle** | Overlaid throttle application (%) vs. distance |
-| **Brake** | Overlaid brake pressure (%) vs. distance |
-
-### 7 Race Analysis Charts
-
-| Chart | What it shows |
-|---|---|
-| **Rolling Race Pace** | 5-lap rolling-average lap time. Pit-out and safety car laps filtered automatically. |
-| **Gap to Leader** | Cumulative time gap to the race leader per lap, shaded per driver. |
-| **Undercut / Overcut Alerts** | Triangle markers on the gap chart at the exact lap a pit strategy caused a position swap. |
-| **Projected Finishing Order** | Projected final gaps accounting for current pace, tyre degradation, and DNF flags. |
-| **Average Race Pace** | Bars per driver coloured by consistency (Viridis scale). Hover shows mean, median, std dev, fastest lap, lap count. |
-| **Race Pace Ranking** | Bars sorted fastest to slowest with ±std dev error bars. |
-| **Tyre Degradation by Compound** | Scatter of mean stint pace vs. degradation rate (s/lap) from per-stint linear regression. |
-
-**Live mode** — connects to the OpenF1 live feed during an active F1 race weekend with auto-refresh at 10s / 30s / 60s intervals.
-
-**Historical mode** — any race from 2022 onwards via the OpenF1 archive.
-
----
-
-## MCP Server — Fastest Lap Telemetry API
-
-`mcp/server.py` exposes the Race Dashboard's fastest-lap comparison capability as a standalone **Model Context Protocol (MCP) server**. Any MCP-compatible client — Claude Desktop, a custom LLM agent, or a CI tool — can query F1 session data and driver telemetry programmatically without the Streamlit UI.
-
-The server reuses `src/openf1.py` and `src/viz.py` directly, with no code duplication. It runs over stdio (the standard MCP transport) and adds zero new runtime dependencies beyond the `mcp` package.
-
-### Four tools
-
-| Tool | Inputs | Returns |
-|---|---|---|
-| `list_sessions` | `year`, `race_name` | All sessions for a race weekend (key, type, date) |
-| `list_drivers` | `year`, `race_name`, `session_type` | All drivers in a session (number, acronym, name, team) |
-| `get_fastest_lap_data` | `year`, `race_name`, `session_type`, `driver_number` | Full telemetry for one driver's fastest lap |
-| `get_channel_comparison` | `year`, `race_name`, `session_type`, `driver_a`, `driver_b`, `channel` | Two-driver comparison with raw data + Plotly figure JSON |
-
-### `get_fastest_lap_data` response
-
-Returns 200-point distance-normalised traces for the driver's fastest lap:
-
-```json
-{
-  "driver_number": 1,
-  "acronym": "VER",
-  "lap_time": 79.823,
-  "lap_number": 11,
-  "speed":    [342.5, 341.2, ...],   // km/h — 200 points
-  "throttle": [100.0, 97.4, ...],    // 0–100 %
-  "brake":    [0.0, 0.0, ...],       // 0–100
-  "cumtime":  [0.0, 0.4, ...]        // elapsed seconds at each distance point
-}
-```
-
-### `get_channel_comparison` response
-
-`channel` accepts: `"Speed"`, `"Throttle"`, `"Brake"`, `"Time Delta"`, `"Track Map"`.
-
-```json
-{
-  "driver_a": { "driver_number": 1, "acronym": "VER", "lap_time": 79.823, ... },
-  "driver_b": { "driver_number": 44, "acronym": "HAM", "lap_time": 80.156, ... },
-  "channel": "Time Delta",
-  "figure_json": "{...}"   // Plotly figure — use plotly.io.from_json() to render
-}
-```
-
-For `"Speed"` / `"Throttle"` / `"Brake"`: each driver dict contains only the relevant channel trace plus `lap_time` and `lap_number`. For `"Time Delta"` and `"Track Map"`: all four channels are returned for both drivers.
-
-### Session type values
-
-Pass the `session_type` strings returned by `list_sessions` — e.g. `"Race"`, `"Qualifying"`, `"Practice 1"`, `"Sprint"`. Matching is case-insensitive.
-
-### Usage
-
-```bash
-# Run via stdio (standard MCP transport)
-python mcp/server.py
-
-# Inspect all tools interactively
-npx @modelcontextprotocol/inspector python mcp/server.py
-```
-
-**Add to Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
-
-```json
-{
-  "mcpServers": {
-    "driver-dna": {
-      "command": "python",
-      "args": ["/absolute/path/to/driver-dna/mcp/server.py"]
-    }
-  }
-}
-```
-
-Once connected, Claude can answer questions like *"Who had the fastest lap at Monza 2024 qualifying?"* or *"Give me the time delta chart between Verstappen and Hamilton at the 2024 Italian Grand Prix race"* using live OpenF1 data.
-
-### Example session (MCP Inspector)
-
-```
-list_sessions(2024, "Italian Grand Prix")
-→ [{"session_type": "Qualifying", "session_key": 9574, ...}, ...]
-
-list_drivers(2024, "Italian Grand Prix", "Qualifying")
-→ [{"driver_number": 1, "name_acronym": "VER", ...}, ...]
-
-get_fastest_lap_data(2024, "Italian Grand Prix", "Qualifying", 1)
-→ {"acronym": "VER", "lap_time": 79.823, "speed": [...200 values...], ...}
-
-get_channel_comparison(2024, "Italian Grand Prix", "Qualifying", 1, 16, "Time Delta")
-→ {"driver_a": {...}, "driver_b": {...}, "channel": "Time Delta", "figure_json": "..."}
-```
-
----
-
-## Tab 4 — Pipeline & Training
-
-A self-contained data and model management tab. Everything previously requiring a terminal is now accessible from the dashboard, including live progress feedback for both long-running operations.
-
-### Download Dataset
-
-A form mirroring the inputs of `src/pipeline.py`:
-
-| Field | Description |
-|---|---|
-| **Year** | Season year (1950–2100) |
-| **Grand Prix name** | e.g. `Italian Grand Prix` |
-| **Session type** | `Q`, `R`, `FP1`, `FP2`, `FP3`, `S`, `SS` |
-| **Driver filter** | Optional — comma-separated 3-letter codes (e.g. `VER,HAM`). Leave blank for all drivers. |
-
-Clicking **Download Dataset** launches a background thread that calls `extract_session_telemetry` → `save_dataset` → `save_meta`. After saving locally, the files are automatically uploaded to Google Drive via `drive_sync.upload_file`. The log panel updates every second while the thread is running. On success, the `get_data` and `get_dataset_meta` Streamlit caches are cleared automatically.
-
-### Train Model
-
-Displays the current model's CV accuracy, train accuracy, driver count, and lap count loaded from `models/metrics.json`. Clicking **Train Model** launches a background thread that runs `load_and_prepare` → `train_model` (5-fold CV) → `evaluate_model` → `save_model`. All model artifacts are uploaded to Google Drive automatically on completion. The `get_model` Streamlit resource cache is cleared on completion, reloading the classifier for the Mystery Driver tab without a page refresh.
-
----
-
-## Agentic AI Patterns — Summary
-
-Five AI features across tabs 1–3, each implementing a distinct real-world production pattern:
-
-| Feature | Tab | Pattern | Key technique |
+| Area | Method | Path | Returns |
 |---|---|---|---|
-| Driver Style Analyst | Radar | **Reflexion** | Analyst → Critic (JSON) → conditional revision loop |
-| Historical DNA Matching | Radar | **RAG** | Cosine similarity retrieval → context-augmented prompt |
-| Driver DNA Report Card | Radar | **Structured Output** | JSON mode + schema validation + retry-on-failure |
-| XAI Prediction Explainer | Mystery Driver | **Single-shot narration** | SHAP values + percentile ranks → validated prompt → prose |
-| Race Intelligence Chat | Race Dashboard | **ReAct** | Tool-calling loop, multi-round, forced synthesis fallback |
+| **Reads (9)** | GET | `/seasons` | `Page[SeasonOut]` |
+| | GET | `/seasons/{year}/events` | `Page[EventOut]` |
+| | GET | `/events/{event_id}/sessions` | `list[SessionOut]` |
+| | GET | `/sessions/{session_id}` | `SessionOut` |
+| | GET | `/sessions/{session_id}/results` | `list[RaceResultOut]` (leaderboard) |
+| | GET | `/sessions/{session_id}/laps` | `Page[LapOut]` — filterable by driver/from-lap/to-lap |
+| | GET | `/drivers` | `Page[DriverOut]` — filterable by season/team |
+| | GET | `/drivers/{driver_id}/stats?season=` | `DriverStatsOut` |
+| | GET | `/standings?season=` | `list[StandingRowOut]` |
+| **Analytics (5)** | GET | `/sessions/{id}/analytics/rolling-pace?window=` | `list[RollingPaceRow]` |
+| | GET | `/sessions/{id}/analytics/gap-to-leader` | `list[GapRow]` |
+| | GET | `/sessions/{id}/analytics/undercuts` | `list[UndercutEvent]` |
+| | GET | `/sessions/{id}/analytics/tyre-degradation` | `list[DegradationRow]` |
+| | GET | `/sessions/{id}/compare?driver_a&driver_b&channel=` | `ComparePayload` (Plotly JSON) |
+| **AI (5)** | POST | `/ai/style-analyst` | Reflexion narrative |
+| | POST | `/ai/dna-match` | RAG historical match |
+| | POST | `/ai/report-card` | Structured JSON report |
+| | POST | `/ai/xai-explain` | SHAP narration |
+| | POST | `/ai/race-chat/stream` | **SSE** stream (ReAct tool loop) |
+| **Me (4)** | GET | `/me` | `UserSessionOut` (cookie-bound) |
+| | POST | `/me/saved-analyses` | Persist analysis (cap=100) |
+| | GET | `/me/saved-analyses` | `Page[SavedAnalysisOut]` |
+| | DELETE | `/me/saved-analyses/{id}` | 204 |
+
+Live OpenAPI 3.1 spec served at `GET /openapi.json`; Swagger UI at
+`GET /docs`.
+
+**Error envelope example:**
+
+```bash
+$ curl -i -H 'X-Request-ID: demo' http://localhost:8000/api/v1/sessions/999
+HTTP/1.1 404 Not Found
+api-version: 1
+x-request-id: demo
+content-type: application/problem+json
+
+{"type":"https://driver-dna.dev/errors/not_found",
+ "title":"Resource not found","status":404,
+ "detail":"session 999 not found",
+ "instance":"/api/v1/sessions/999","request_id":"demo"}
+```
+
+**Cursor pagination example** (walks all laps for driver 1 in session 1):
+
+```bash
+$ curl -s 'http://localhost:8000/api/v1/sessions/1/laps?driver_id=1&limit=3'
+{"data":[
+  {"id":1,"lap_number":1,"lap_time_ms":78011,"compound":"SOFT", ...},
+  {"id":1441,"lap_number":2,"lap_time_ms":78014,"compound":"SOFT", ...},
+  {"id":2881,"lap_number":3,"lap_time_ms":78017,"compound":"SOFT", ...}
+ ],
+ "page":{"next_cursor":"eyJrIjozLCJpZCI6Mjg4MX0","has_more":true,"limit":3}}
+```
+
+### 2. GraphQL — `/graphql`
+
+Use GraphQL when the page needs a graph-shaped slice in one round trip
+(e.g. one session with its leaderboard + each driver's current team).
+DataLoaders batch every nested fetch — see the N+1 regression guard in
+[backend/tests/graphql/test_schema.py](backend/tests/graphql/test_schema.py)
+which asserts ≤ 10 SQL statements for a nested query over 20 rows.
+
+**Query root** (full SDL excerpt):
+
+```graphql
+type Query {
+  season(year: Int!): Season
+  seasons(first: Int! = 20): [Season!]!
+  event(id: ID!): Event
+  events(seasonYear: Int!, first: Int! = 50): [Event!]!
+  session(id: ID!): Session
+  sessionsForEvent(eventId: ID!): [Session!]!
+  sessionResults(sessionId: ID!): [RaceResult!]!
+  sessionLaps(sessionId: ID!, driverId: ID, fromLap: Int, toLap: Int,
+              first: Int! = 100): [Lap!]!
+  driver(id: ID!): Driver
+  drivers(season: Int, team: String, first: Int! = 50): [Driver!]!
+  driverStats(driverId: ID!, season: Int!): DriverStats
+  standings(season: Int!): [StandingRow!]!
+}
+```
+
+**Example** — leaderboard with nested driver + team in one call:
+
+```bash
+$ curl -s -X POST http://localhost:8000/graphql \
+   -H 'Content-Type: application/json' \
+   -d '{"query":"{ sessionResults(sessionId:\"1\") { position driver { code currentTeam { name } } } }"}'
+{"data":{"sessionResults":[
+  {"position":1,"driver":{"code":"HUL","currentTeam":{"name":"Haas"}}},
+  {"position":2,"driver":{"code":"VER","currentTeam":{"name":"Red Bull Racing"}}},
+  ...
+]}}
+```
+
+GraphiQL is served at `GET /graphql` when `ENV=local`.
+
+### 3. Postgres schema
+
+11 application tables in 3NF + 2 audit tables, 3 ENUM types, 17 indexes
+(9 query-path + 8 unique-constraint), pgcrypto for UUID defaults.
+
+**Migrations:**
+
+| # | File | Adds |
+|---|---|---|
+| 0001 | [`0001_core_schema.py`](backend/alembic/versions/0001_core_schema.py) | seasons · circuits · events · sessions · drivers · teams · session_drivers · race_results · lap_times · driver_stats + 2 ENUMs |
+| 0002 | [`0002_indexes.py`](backend/alembic/versions/0002_indexes.py) | 5 query indexes incl. **partial** `ix_lap_times_pit (session_id) WHERE is_pit_in OR is_pit_out` |
+| 0003 | [`0003_circuits_unique_name.py`](backend/alembic/versions/0003_circuits_unique_name.py) | UNIQUE on `circuits.name` (ETL upsert target) |
+| 0004 | [`0004_llm_audit.py`](backend/alembic/versions/0004_llm_audit.py) | `llm_audit` table + per-feature index |
+| 0005 | [`0005_user_sessions.py`](backend/alembic/versions/0005_user_sessions.py) | `user_sessions` + `saved_analyses` + FK on `llm_audit` + `analysis_kind` ENUM |
+
+**Indexed query-plan baseline** — captured before and after each
+migration, see [backend/docs/query_plans.md](backend/docs/query_plans.md).
+Excerpt for the leaderboard query:
+
+```text
+EXPLAIN ANALYZE SELECT ... FROM race_results WHERE session_id=$1 ORDER BY position;
+
+BEFORE (seq scan):     Cost=37..38   actual=1.2 ms
+AFTER  (index scan):   Cost= 8.4    actual=0.12 ms     ← 10× faster
+       Index Scan using ix_race_results_session_pos
+```
+
+A pytest sweep in [backend/tests/test_query_plans.py](backend/tests/test_query_plans.py)
+parses `EXPLAIN (FORMAT JSON)` and **asserts** every covered query plans
+to an `Index Scan`, not a `Seq Scan` — so a future migration that
+accidentally drops an index fails CI.
+
+### 4. The five agentic-AI patterns
+
+All five live in the legacy Streamlit dashboard **and** as REST endpoints
+in the new backend. Every call is persisted to `llm_audit` with token
+counts, latency, USD cost, status, and the `user_session_id` cookie of
+the originating browser.
+
+| # | Pattern | Streamlit tab | REST endpoint | Audit rows / call |
+|---|---|---|---|---|
+| 1 | **Reflexion** | Driver Style Analyst | `POST /api/v1/ai/style-analyst` | 2–3 (analyst → critic → revise) |
+| 2 | **RAG** (no vector DB) | Historical DNA Matching | `POST /api/v1/ai/dna-match` | 1 |
+| 3 | **Structured Output** | Driver DNA Report Card | `POST /api/v1/ai/report-card` | 1 (JSON-mode + schema validate) |
+| 4 | **Single-shot XAI** | Mystery Driver explainer | `POST /api/v1/ai/xai-explain` | 1 |
+| 5 | **ReAct + SSE stream** | Race Intelligence Chat | `POST /api/v1/ai/race-chat/stream` | up to `MAX_ROUNDS=3` |
+
+**Pattern 1 — Reflexion** (analyst → critic JSON → conditional revise):
+
+```
+Analyst LLM (T=0.4)  →  driving-style narrative
+                                ↓
+Critic LLM  (T=0.0)  →  JSON {confidence: 1–10, issues: [...]}
+                                ↓
+            confidence ≥ 7 → accept narrative
+            confidence < 7 → Analyst rewrites once with critique injected
+```
+
+**Pattern 5 — SSE-streamed ReAct race chat.** The model is given three
+analytics tools (`get_rolling_pace_top`, `get_leader_gap_summary`,
+`get_tyre_degradation_summary`) backed by the Phase 7 analytics service.
+Tool decisions stream live, the final answer streams token-by-token:
+
+```bash
+$ curl -N -X POST localhost:8000/api/v1/ai/race-chat/stream \
+   -H 'Content-Type: application/json' \
+   -d '{"session_id":1,"message":"Who had the best pace?"}'
+
+event: tool_call
+data: {"tool":"get_rolling_pace_top","args":{"top_n":5}}
+
+event: tool_result
+data: {"tool":"get_rolling_pace_top","summary":"[{\"driver_id\":1,...}]"}
+
+event: token
+data: {"delta":"Verstappen averaged 78.04s rolling pace..."}
+
+event: done
+data: {"input_tokens":312,"output_tokens":146,"rounds":2}
+```
+
+The five event types are `token`, `tool_call`, `tool_result`, `done`,
+`error` — see [backend/app/llm/sse.py](backend/app/llm/sse.py).
+
+**Cost observability.** Every call writes one `llm_audit` row with
+gpt-4o-mini pricing applied at insert time (USD per 1M tokens table in
+[backend/app/llm/audit.py](backend/app/llm/audit.py)):
+
+```sql
+SELECT feature, COUNT(*) AS calls,
+       ROUND(SUM(cost_usd)::numeric, 4) AS usd,
+       ROUND(AVG(latency_ms))           AS avg_ms
+FROM   llm_audit
+WHERE  created_at > now() - interval '24h'
+GROUP  BY feature
+ORDER  BY calls DESC;
+```
+
+### 5. Web client — Next.js 14
+
+App-Router, RSC-first. Client components only where needed (Plotly,
+SSE chat). All RSC fetches forward the `dna_sid` cookie via the wrapper
+in [web/lib/api.ts](web/lib/api.ts) so anonymous-session continuity
+works seamlessly. TypeScript types are generated from `/openapi.json`
+via `npm run openapi:gen` (`openapi-typescript` writes
+[web/lib/api-types.ts](web/lib/api-types.ts) — 2.8 k lines, every
+endpoint's request/response typed).
+
+| Route | Mode | Server fetches | Client islands |
+|---|---|---|---|
+| `/` | RSC | `/seasons` + `/events` | none |
+| `/event/[eventId]` | RSC | `/sessions` | none |
+| `/race/[sessionId]` | RSC + island | `/results` + `/tyre-degradation` | `RaceChatStream` (SSE) |
+| `/radar/[sessionId]` | RSC + island | `/results` | `CompareIsland` + `PlotlyChart` |
+| `/mystery-driver` | client only | `POST /ai/xai-explain` | full page |
+| `/pipeline` | static | — | link to Streamlit |
+
+Plotly (~3 MB minified) is lazy-loaded via `next/dynamic` with
+`ssr: false` — the landing page ships under 90 kB of JS.
+
+### 6. ETL pipeline
+
+One CLI, two subcommands, true-idempotent upserts inside a single
+transaction. The OpenF1 client is reused verbatim from `src/openf1.py`
+— no re-implementation.
+
+```bash
+# Hydrate one session
+python -m app.etl hydrate --year 2024 --gp "Monaco Grand Prix" --session R
+
+# Hydrate every session in a weekend
+python -m app.etl hydrate --year 2024 --gp "Monaco Grand Prix"
+
+# Dry-run (rollback before commit)
+python -m app.etl hydrate --year 2024 --gp "Monaco Grand Prix" --dry-run
+
+# Recompute driver_stats aggregates for a season
+python -m app.etl refresh-stats --season 2024
+```
+
+Real output from a Monaco 2024 hydrate:
+
+```json
+{
+  "season_id": 1,
+  "event_id": 1,
+  "session_ids": [1],
+  "counts": {"session_drivers": 20, "lap_times": 1237, "race_results": 20}
+}
+```
+
+Running the same command again is a true no-op — every write uses
+`INSERT ... ON CONFLICT DO UPDATE` keyed on natural unique constraints,
+and the entire job is wrapped in one transaction so partial failures
+leave the DB untouched. Proven by
+[`test_hydrate_is_idempotent`](backend/tests/etl/test_hydrate_session.py).
+
+For initial prod seeding, use
+[backend/scripts/hydrate_initial_data.sh](backend/scripts/hydrate_initial_data.sh)
+— hydrates 5 representative race weekends + refreshes stats.
+
+### 7. Anonymous-session layer
+
+No auth, no sign-up. Every browser gets a UUID cookie on first hit;
+saved analyses + LLM audit rows attribute back to it.
+
+```bash
+# 1) First request mints the cookie + creates a user_sessions row
+$ curl -i -c jar localhost:8000/api/v1/me
+HTTP/1.1 200 OK
+set-cookie: dna_sid=76d2ca32-3c52-4789-8cf4-9b4175b4860f;
+            HttpOnly; Max-Age=31536000; Path=/; SameSite=lax
+{"id":"76d2ca32-...","created_at":"...","last_seen_at":"..."}
+
+# 2) Save an analysis — capped at 100 per session, ownership-checked deletes
+$ curl -b jar -X POST localhost:8000/api/v1/me/saved-analyses \
+   -d '{"kind":"radar","payload":{"top":3}}'
+{"id":"426e01a3-...","kind":"radar","payload":{"top":3}, ...}
+
+# 3) List — paginated, newest first
+$ curl -b jar localhost:8000/api/v1/me/saved-analyses
+{"data":[{"id":"426e01a3-...","kind":"radar", ...}], "page":{...}}
+```
+
+Cookie is `HttpOnly`, `SameSite=Lax` locally, `SameSite=None; Secure`
+in prod so cross-origin Vercel → Railway requests carry it. Logic lives
+in [backend/app/core/sessions.py](backend/app/core/sessions.py).
 
 ---
 
-## Machine Learning Pipeline
+## Get Started
 
-### 1. Data extraction — `src/pipeline.py`
+Two paths: three terminals manually, or `make dev`.
 
-FastF1 pulls high-frequency telemetry from the F1 live timing feed. Invalid laps (in-laps, out-laps, deleted times) are excluded. Each valid lap is resampled to **200 evenly spaced distance-based points** via linear interpolation — normalising every lap to the same resolution regardless of circuit length or car speed.
+### Prerequisites
 
-### 2. Feature engineering — `src/features.py` + `src/pipeline.py`
-
-Each lap is compressed into **10 scalar driving-style features** plus three 200-point trace arrays:
-
-| Feature | What it captures |
-|---|---|
-| `lap_time_seconds` | Overall pace |
-| `mean_speed`, `max_speed`, `min_speed` | Speed profile across the lap |
-| `throttle_mean`, `throttle_std` | Throttle aggression and smoothness |
-| `brake_mean`, `brake_events` | Braking intensity and frequency |
-| `gear_changes` | Shift frequency — mechanical aggression |
-| `steer_std` | Steering smoothness |
-| `speed_trace`, `throttle_trace`, `brake_trace` | Full 200-point traces (radar + zone charts) |
-| `x_trace`, `y_trace` | Circuit XY coordinates (throttle map) |
-
-Three additional features derived at runtime from traces for the Extended Radar:
-
-| Derived feature | Computation |
-|---|---|
-| `coasting_pct` | `mean(throttle < 2% and brake < 1%)` |
-| `throttle_pickup_pct` | `mean(throttle > 80%)` |
-| `trail_brake_score` | `mean(throttle > 0 and brake > 0)` |
-
-### 3. XGBoost classifier — `src/model.py`
-
-A gradient-boosted tree multi-class classifier trained with **5-fold stratified cross-validation**. SHAP `TreeExplainer` generates both global feature importance (saved as `shap_importance.png` at training time) and local per-prediction explanations at inference time.
-
-`evaluate_model` saves `models/metrics.json` with CV mean accuracy, std dev, per-fold scores, full-dataset train accuracy, and per-driver precision / recall / F1 / support.
-
-### 4. Circuit geometry store — `src/generate_circuits.py`
-
-Extracts XY circuit outlines for all 24 Grand Prix from FastF1 at **500 resampled distance points** per circuit and writes them to `data/circuits.json`. Also computes **sector boundary fractions** (`sector_fractions: [s1_end_frac, s2_end_frac]`) from each circuit's fastest lap telemetry — the normalised distance (0–1) at which Sector 1 and Sector 2 end. These fractions power the S1/S2/S3 boundary markers on the Track Map and the Sector Times comparison chart. Resume-safe — skips circuits already written.
-
----
-
-## Testing & Quality
-
-### Test suite — 163 tests across 7 modules
-
-| Module | Tests | What it covers |
+| Tool | Version | Why |
 |---|---|---|
-| `test_drive_sync.py` | 21 | OAuth 2.0 flow: `is_authenticated`, `get_auth_url`, `exchange_code`; upload create vs. update paths; download with parent-dir creation; graceful error handling; restore selects only missing files |
-| `test_app_helpers.py` | 29 | LLM layer: JSON parsing, schema validation, input sanitisation, tool arg clamping, cosine similarity |
-| `test_race_engine.py` | 30 | Rolling pace, gap-to-leader, undercut detection, finishing order projection, tyre degradation, stint analysis |
-| `test_openf1.py` | 18 | OpenF1 API client: response parsing, error handling, live/historical edge cases |
-| `test_pipeline_tab.py` | 23 | Pipeline download session-state logic, model training session-state logic, error capture, finally-block cleanup, argument propagation, low-sample guard |
-| `test_mcp_server.py` | 38 | All 4 MCP tools, helper utilities (`_to_list`, `_acronym_map`, `_colour_map`, `_resolve_session`), and error paths — fully offline via mocked OpenF1 client and telemetry functions |
-| `test_telemetry_cumtime.py` | 4 | `_fetch_fastest_lap_all_openf1` cumtime overflow guard: next-lap clip, short-sample normalisation, Russell/Antonelli inversion regression test, no-overflow passthrough |
+| Python | 3.13 | Backend + legacy `src/` |
+| Node | 20 | Next.js 14 |
+| Docker + docker-compose | latest | Postgres |
+| `psql` | 16 | Inspect DB / EXPLAIN |
+| `npm` (or `pnpm`) | latest | Web deps |
+
+One-shot verification:
+`python --version && node --version && docker --version && psql --version`.
+
+### Three-terminal local dev
 
 ```bash
-pytest tests/ -v                                      # run all 163 tests
-pytest tests/ --cov=src --cov-report=term-missing     # with line coverage
+# Terminal 1 — Postgres + pgAdmin (monitoring dashboard)
+make db                                           # → postgres :5432, pgAdmin :5050
+
+# Terminal 2 — Backend
+cd backend
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+cp .env.example .env                              # add OPENAI_API_KEY if testing AI
+alembic upgrade head
+bash scripts/hydrate_initial_data.sh              # seed a few real race weekends
+uvicorn app.main:app --reload --port 8000         # → http://localhost:8000
+
+# Terminal 3 — Web
+cd web
+pnpm install
+cp .env.example .env.local
+pnpm dev                                          # → http://localhost:3000
+
+# (Optional) Terminal 4 — legacy Streamlit
+streamlit run streamlit_app.py                    # → http://localhost:8501
 ```
 
-All business logic — including the Drive sync layer — is imported directly and tested with mocked dependencies. No Streamlit runtime, no real Google API calls, and no real network access required.
+### One-command alternative — Makefile
 
-### CI pipeline — `.github/workflows/ci.yml`
-
-Three jobs run on every push to `main` and every pull request:
-
-```
-lint (ruff)  ──┐
-               ├──→  test (pytest + coverage upload)
-type-check  ──┘
-(mypy)
-```
-
-### LLM evaluation — `src/eval_llm.py`
-
-An offline evaluation framework for all five AI features:
-
-| Evaluation | Mode | What it measures |
-|---|---|---|
-| RAG retrieval sanity | Offline | Self-match rate and retrieval margin across all 10 historical profiles |
-| Report Card compliance | Live (opt-in) | First-attempt pass rate, retry rate, failure rate against JSON schema |
-| Reflexion critique quality | Live (opt-in) | Mean confidence score, revision rate, mean factual error count |
-| Token cost dashboard | Offline | Per-feature call count, mean latency, total tokens, estimated USD cost |
-
-Results are saved to `models/eval_*.json`. The CI eval workflow (`eval.yml`) runs the offline evaluations on every push and posts a RAG sanity summary as a PR comment.
+The repo root [Makefile](Makefile) wraps the most common commands:
 
 ```bash
-python src/eval_llm.py               # offline evaluations (RAG + token cost)
-python src/eval_llm.py --audit       # parse llm_audit.jsonl for cost report
-python src/eval_llm.py --live        # full suite with real OpenAI calls
+make dev             # full stack: postgres + pgAdmin + backend + web in one shot
+
+# Or bring up pieces individually:
+make db              # docker compose up -d postgres pgadmin (:5432 + :5050)
+make backend-install # python -m venv backend/.venv && pip install -e backend[dev]
+make backend         # uvicorn dev server on :8000
+make backend-test    # full pytest suite
+make migrate         # alembic upgrade head
+make hydrate YEAR=2024 GP='Monaco Grand Prix' SESSION=R
+make web-install     # pnpm install in web/
+make web             # next dev on :3000
+make web-typecheck   # tsc --noEmit
 ```
+
+### Env vars reference
+
+| File | Var | Default | Purpose |
+|---|---|---|---|
+| `backend/.env` | `DATABASE_URL` | `postgresql+asyncpg://dna:dna@localhost:5432/driver_dna` | App (asyncpg) |
+| `backend/.env` | `DATABASE_URL_SYNC` | `postgresql+psycopg://dna:dna@localhost:5432/driver_dna` | Alembic (sync) |
+| `backend/.env` | `OPENAI_API_KEY` | _empty_ | Required for `/api/v1/ai/*` |
+| `backend/.env` | `OPENF1_BASE_URL` | `https://api.openf1.org/v1` | Rarely changed |
+| `backend/.env` | `CORS_ORIGINS` | `http://localhost:3000` | Comma-sep allow-list (include `https://*.vercel.app` in prod) |
+| `backend/.env` | `COOKIE_SECRET` | `dev-secret-change-me` | Future-proof; not currently signing |
+| `backend/.env` | `RATE_LIMIT_PER_MIN` | `60` | Per-session AI rate limit |
+| `backend/.env` | `ENV` | `local` | `local` / `preview` / `prod` (toggles cookie attrs) |
+| `web/.env.local` | `NEXT_PUBLIC_API_BASE` | `http://localhost:8000` | Browser-visible API URL (SSE chat) |
+| `web/.env.local` | `API_BASE_INTERNAL` | `http://localhost:8000` | Server-side RSC fetch URL |
+| `web/.env.local` | `NEXT_PUBLIC_GRAPHQL_URL` | `http://localhost:8000/graphql` | GraphQL endpoint |
+
+### Smoke-check checklist
+
+After bring-up, in order:
+
+```bash
+# 1. Backend up?
+curl -s localhost:8000/healthz                                # {"status":"ok",...}
+
+# 2. v1 endpoint live + envelope working?
+curl -s localhost:8000/api/v1/seasons | jq '.data | length'   # > 0
+
+# 3. GraphQL alive?
+curl -s -X POST localhost:8000/graphql \
+  -d '{"query":"{ seasons(first:3) { year } }"}'              # 3 years back
+
+# 4. Standings populated?
+curl -s 'localhost:8000/api/v1/standings?season=2024' | jq '.[0].driver.code'
+
+# 5. Cookie issued?
+curl -is localhost:8000/api/v1/me | grep -i set-cookie        # dna_sid=...
+```
+
+Then in the browser:
+
+- <http://localhost:3000> — landing should list event cards
+- <http://localhost:3000/race/1> — leaderboard renders + chat input visible
+- <http://localhost:8000/docs> — Swagger UI for every endpoint
+- <http://localhost:8000/graphql> — GraphiQL (local only)
+- <http://localhost:5050> — pgAdmin (login: `admin@example.com` / `admin`; add server with host `postgres`, port `5432`, user/pass `dna`)
 
 ---
 
 ## Deployment
 
-### Docker
+Four paths. Pick by cost + setup time.
 
-A multi-stage Dockerfile produces a lean production image:
+| Path | Cost | Setup | Best for |
+|---|---|---|---|
+| **Local dev** | $0 | 10 min | Hacking |
+| **Vercel + Railway** ⭐ | $0–$5/mo | 30 min | Portfolio demo |
+| **Self-host VPS** | $5–$10/mo | 60 min | Full ownership |
+| **Streamlit Cloud** | $0 | 5 min | Legacy UI only |
 
-- **Stage 1 (builder):** `python:3.13-slim` + gcc/g++ to compile C-extension packages (numpy, shap, xgboost). Dependencies installed to `/install`.
-- **Stage 2 (runtime):** `python:3.13-slim` — copies only the compiled packages and application code. No build toolchain in the final image.
-- **Artifact directories** — `data/` and `models/` are created at build time with committed `.gitkeep` placeholders. Real artifacts are restored from Google Drive at container startup.
+### Path A — Vercel (web) + Railway (backend + Postgres) ⭐
+
+The recommended portfolio setup. Free tiers cover small demo traffic.
+
+#### Railway — backend + Postgres
+
+1. **Create project + Postgres plugin.**
+   - New Railway project → "+ New" → **Postgres**.
+   - Railway auto-injects `DATABASE_URL` into other services in the project.
+
+2. **Deploy the backend service.**
+   - "+ New" → **GitHub Repo** → pick this repo.
+   - Railway reads [backend/railway.json](backend/railway.json), which
+     points at [backend/Dockerfile](backend/Dockerfile) and runs
+     `alembic upgrade head` as the release command before starting
+     uvicorn.
+
+3. **Service env vars** (paste into the Railway dashboard):
+
+   | Var | Value |
+   |---|---|
+   | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` (Railway reference, **asyncpg** scheme) — append `?sslmode=require` if needed; replace `postgresql://` with `postgresql+asyncpg://` |
+   | `DATABASE_URL_SYNC` | Same DB, sync URL: `postgresql+psycopg://...` |
+   | `OPENAI_API_KEY` | Your key |
+   | `CORS_ORIGINS` | `https://<your-vercel-domain>,https://*.vercel.app` |
+   | `COOKIE_SECRET` | Output of `openssl rand -hex 32` |
+   | `ENV` | `prod` |
+   | `RATE_LIMIT_PER_MIN` | `60` |
+
+4. **Generate a public domain** (Settings → Networking → Generate
+   Domain). Confirm:
+   ```bash
+   curl -fsS https://<railway-domain>/healthz   # {"status":"ok",...}
+   ```
+
+5. **Seed the DB** (one-off):
+   ```bash
+   railway run bash backend/scripts/hydrate_initial_data.sh
+   ```
+
+6. **(Optional) Schedule the stats refresh.** Add a Railway cron service:
+   ```
+   schedule: 0 4 * * 1            # weekly Monday 04:00 UTC
+   command:  python -m app.etl refresh-stats --season 2024
+   ```
+
+#### Vercel — web
+
+1. **Import the repo** at <https://vercel.com/new>. Set **Root Directory**
+   to `web/` (Vercel auto-detects Next.js).
+2. **Env vars** for both Production and Preview:
+
+   | Var | Value |
+   |---|---|
+   | `NEXT_PUBLIC_API_BASE` | `https://<railway-domain>` |
+   | `API_BASE_INTERNAL` | `https://<railway-domain>` (Railway has no internal-only DNS for Vercel; use the public domain) |
+   | `NEXT_PUBLIC_GRAPHQL_URL` | `https://<railway-domain>/graphql` |
+
+3. **First deploy** creates a preview URL. Promote to prod once smoke
+   tests pass.
+
+4. **Cross-fill CORS.** Copy the Vercel prod domain back into Railway's
+   `CORS_ORIGINS` env var and redeploy the backend.
+
+#### Cookie attrs in prod
+
+`ENV=prod` switches the cookie middleware to
+`SameSite=None; Secure` so cross-origin Vercel → Railway requests carry
+the `dna_sid` cookie. See
+[backend/app/core/sessions.py](backend/app/core/sessions.py) `_cookie_attrs`.
+
+#### Post-deploy smoke
 
 ```bash
-docker build -t driver-dna .
-docker run -p 8501:8501 \
-  -e OPENAI_API_KEY=sk-proj-... \
-  -e GOOGLE_CLIENT_ID=xxxx.apps.googleusercontent.com \
-  -e GOOGLE_CLIENT_SECRET=yyyy \
-  -e GOOGLE_REDIRECT_URI=http://localhost:8501 \
-  driver-dna
+curl -fsS https://<railway-domain>/healthz
+curl -fsS https://<railway-domain>/api/v1/seasons | jq '.data | length'
+curl -fsS https://<vercel-domain>/                              # landing renders
+curl -fsS https://<railway-domain>/openapi.json | jq '.openapi' # "3.1.0"
 ```
 
-A health check polls `/_stcore/health` every 30 seconds (`--interval=30s --timeout=10s --retries=3`).
+### Path B — Self-host on a VPS (Docker only)
 
-### GitHub Container Registry
+For reviewers who'd rather run everything themselves on a Linux box.
 
-The `docker.yml` workflow builds and pushes to GHCR on every push to `main`, tagged as both `latest` and `sha-<commit>`.
+1. **Provision a VPS** (1 CPU / 2 GB RAM is plenty for demo) on
+   DigitalOcean / Hetzner / Linode / Fly.
+2. **Install Docker + docker-compose** following the official Docker
+   docs for your distro.
+3. **Clone the repo + configure envs**:
+   ```bash
+   git clone https://github.com/<you>/driver-dna.git
+   cd driver-dna
+   cp backend/.env.example backend/.env       # edit OPENAI_API_KEY, ENV=prod, CORS_ORIGINS
+   cp web/.env.example     web/.env.local     # set NEXT_PUBLIC_API_BASE to your domain
+   ```
+4. **Create a prod docker-compose overlay** (not in the repo by default
+   — add this file as `docker-compose.prod.yml`):
 
-### Streamlit Community Cloud
+   ```yaml
+   services:
+     postgres:
+       restart: unless-stopped
+       volumes:
+         - pgdata:/var/lib/postgresql/data
 
-Deploy directly from this repository. Configure the following in the **Secrets** panel:
+     backend:
+       restart: unless-stopped
+       env_file: ./backend/.env
+       expose: ["8000"]                # internal-only; Caddy proxies in
+       depends_on:
+         postgres: { condition: service_healthy }
 
-```toml
-[openai]
-api_key = "sk-proj-..."
+     web:
+       build:
+         context: ./web
+       restart: unless-stopped
+       env_file: ./web/.env.local
+       expose: ["3000"]
+       depends_on: [backend]
 
-[google]
-client_id     = "xxxx.apps.googleusercontent.com"
-client_secret = "yyyy"
-redirect_uri  = "https://your-app.streamlit.app"
-```
+     caddy:
+       image: caddy:2-alpine
+       restart: unless-stopped
+       ports: ["80:80", "443:443"]
+       volumes:
+         - ./Caddyfile:/etc/caddy/Caddyfile:ro
+         - caddy_data:/data
+         - caddy_config:/config
 
-On first load after deployment, click **Connect Google Drive** in the sidebar to authenticate. Artifacts are restored from Drive automatically on every subsequent cold start.
+   volumes:
+     pgdata: {}
+     caddy_data: {}
+     caddy_config: {}
+   ```
+
+5. **Caddyfile** (terminates TLS via Let's Encrypt automatically):
+
+   ```caddy
+   api.example.com {
+     reverse_proxy backend:8000
+   }
+   example.com, www.example.com {
+     reverse_proxy web:3000
+   }
+   ```
+
+6. **Bring everything up**:
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+   docker compose exec backend sh -c "cd /app/backend && alembic upgrade head && bash scripts/hydrate_initial_data.sh"
+   ```
+
+7. **Verify**:
+   ```bash
+   curl -fsS https://api.example.com/healthz
+   curl -fsS https://example.com
+   ```
+
+Updates: `git pull && docker compose -f ... -f ... up -d --build`.
+Logs: `docker compose logs -f backend web caddy`.
+
+### Path C — Streamlit Cloud (legacy UI only)
+
+The legacy Streamlit dashboard can run on the free
+<https://streamlit.io/cloud> tier. It does **not** reach the Postgres
+backend — it's a standalone dashboard over Google-Drive-persisted
+artifacts. Use this in parallel with Path A to demo "all surfaces" on
+free infra.
+
+1. Push the repo to GitHub (must be public for the free tier).
+2. <https://streamlit.io/cloud> → New app → pick repo + branch.
+3. **Main file path:** `streamlit_app.py`.
+4. **Secrets** (Settings → Secrets) — paste TOML, mirroring
+   `.streamlit/secrets.toml`:
+   ```toml
+   OPENAI_API_KEY = "sk-..."
+   [google_drive]
+   client_id = "..."
+   client_secret = "..."
+   ```
+5. Deploy. First boot creates the FastF1 cache (~600 MB), then restores
+   model artifacts from Google Drive via OAuth on first user click.
+
+The full legacy setup steps (Google Drive OAuth, FastF1 cache, dataset
+generation, model training) live in
+[the Streamlit deploy section below](#legacy-streamlit-dashboard).
 
 ---
 
-## AI Response Mode Toggle
+## CI / quality bar
 
-A sidebar radio button switches all five AI features between two response depths simultaneously:
+Three GitHub Actions workflows, each path-filtered to its area.
 
-| Mode | Behaviour | Token budget |
+| Workflow | Triggers on changes to | Steps | Typical duration |
+|---|---|---|---|
+| [`ci.yml`](.github/workflows/ci.yml) | `src/**`, `tests/**` | ruff · mypy · pytest · LLM eval · docker build → GHCR | ~4 min |
+| [`backend-ci.yml`](.github/workflows/backend-ci.yml) | `backend/**`, `src/**` | Postgres service container · ruff · `alembic upgrade head` · pytest with coverage · OpenAPI 3.1 snapshot assertion | ~3 min |
+| [`web-ci.yml`](.github/workflows/web-ci.yml) | `web/**` | `npm ci` · `tsc --noEmit` · `next lint` · `next build` | ~2 min |
+
+**Backend quality bar:**
+- **ruff** subset `E F I B UP SIM` — 9 noisy rules explicitly ignored
+  with documentation in [backend/pyproject.toml](backend/pyproject.toml)
+  (each ignore explains why).
+- **alembic upgrade head** runs against an ephemeral Postgres service
+  container — every migration must apply on a fresh DB on every push.
+- **pytest --cov=app** must pass; coverage report saved as artifact.
+- **OpenAPI snapshot** — a tiny Python step asserts
+  `openapi.json["openapi"].startswith("3.1")` so we never accidentally
+  fall back to 3.0.
+
+**Web quality bar:**
+- `tsc --noEmit` with `"strict": true` in [tsconfig.json](web/tsconfig.json).
+- `next lint` with [.eslintrc.json](web/.eslintrc.json) checked in (no
+  interactive setup wizard in CI).
+- `next build` validates SSR rendering for every dynamic route.
+
+**Real bugs CI caught during Phase 12 lint cleanup:** two
+`status.HTTP_*_*` references with no `status` import, two unused locals,
+one unused import, one OpenAPI field rename
+(`lap_time_sec` → `fastest_lap_time_sec`) — all surfaced by `ruff` /
+`tsc` before merge.
+
+---
+
+## Testing
+
+**119 backend tests** across 11 files + **163 legacy tests** for `src/` +
+the Streamlit app = **282 tests total**. All required to pass before
+merge.
+
+| Suite | File | # | What it covers |
+|---|---|---|---|
+| Smoke | [`test_healthz.py`](backend/tests/test_healthz.py) | 3 | App boots; `/healthz`; shared-`src/` on `sys.path` |
+| Contracts | [`test_contracts.py`](backend/tests/test_contracts.py) | 14 | RFC 7807 envelope shape · cursor round-trip + 100-int walk · `X-Request-ID` mint/echo · `API-Version` header |
+| OpenAPI | [`test_openapi.py`](backend/tests/test_openapi.py) | 4 | 3.1 conformance · `ErrorEnvelope` referenced by every 4xx/5xx |
+| Schema | [`test_schema.py`](backend/tests/test_schema.py) | 10 | Table presence · FK CASCADE/RESTRICT semantics · ENUM types · unique + check constraints |
+| Query plans | [`test_query_plans.py`](backend/tests/test_query_plans.py) | 4 | `EXPLAIN (FORMAT JSON)` asserts `Index Scan` for the 3 hot queries + all indexes present |
+| ETL | [`tests/etl/*.py`](backend/tests/etl/) | 11 | Mocked OpenF1 via `responses` · idempotency proven (run twice = identical rows) · dry-run rollback · compound normalisation |
+| REST reads | [`test_v1_*.py`](backend/tests/api/) | 32 | Happy + 404 envelope + invalid cursor + season/team filters + per-driver lap walk |
+| Analytics | [`test_v1_analytics.py`](backend/tests/api/test_v1_analytics.py) | 12 | All 4 analytics endpoints + compare endpoint with mocked OpenAPI car_data |
+| GraphQL | [`tests/graphql/*.py`](backend/tests/graphql/) | 8 | Introspection · REST↔GraphQL parity for leaderboards · **N+1 regression guard** |
+| LLM | [`tests/llm/*.py`](backend/tests/llm/) | 11 | OpenAI mocked via queue-fake · all 5 patterns · SSE event sequence asserted |
+| /me | [`test_v1_me.py`](backend/tests/api/test_v1_me.py) | 10 | Cookie issuance · 2-client isolation · 100-row cap → 409 · ownership-check deletes |
+| **Total backend** | | **119** | |
+
+### Test infrastructure highlights
+
+- **Per-test NullPool engine override** in
+  [tests/api/conftest.py](backend/tests/api/conftest.py) — `TestClient`
+  uses a fresh event-loop portal per request; the global async engine
+  pools connections across loops and fails with `Event loop is closed`.
+  The fixture swaps `app.db.session.{engine, AsyncSessionLocal}` and
+  the middleware-internal factory for a per-test `NullPool` engine.
+- **Queue-based OpenAI mock** in
+  [tests/llm/conftest.py](backend/tests/llm/conftest.py) — tests enqueue
+  canned responses (text, JSON, tool calls, stream chunks); the patched
+  `openai.OpenAI` consumes one per call. Zero network in tests.
+- **N+1 regression guard** in
+  [tests/graphql/test_schema.py](backend/tests/graphql/test_schema.py)
+  — attaches a SQLAlchemy `before_cursor_execute` listener, runs a
+  nested query returning 20 rows, asserts ≤ 10 SELECTs total. Catches
+  any future regression that drops a `joinedload` or a DataLoader.
+
+### Local run
+
+```bash
+cd backend
+pytest -v                                  # all 119
+pytest tests/api -v                        # just REST
+pytest tests/llm -v                        # just LLM (mocked OpenAI)
+pytest --cov=app --cov-report=term-missing # with coverage
+```
+
+---
+
+## Operations & troubleshooting
+
+### Observability
+
+Every request emits one structured log line (structlog → JSON to stdout)
+with a bound `request_id`:
+
+```json
+{"method":"GET","path":"/api/v1/sessions/1/results","status":200,
+ "latency_ms":18.4,"event":"http.request",
+ "request_id":"01KSHS9M2G6FQF1CAPACTQJYW8","level":"info",
+ "timestamp":"2026-05-26T09:19:17Z"}
+```
+
+Same `request_id` appears in error envelopes — copy-paste straight from
+a user-visible error into the log search.
+
+### Cost tracking — `llm_audit`
+
+Every LLM call writes one row with token counts, latency, USD cost, and
+the originating `user_session_id`. Daily per-feature spend:
+
+```sql
+SELECT feature,
+       COUNT(*)                          AS calls,
+       SUM(input_tokens + output_tokens) AS tokens,
+       ROUND(SUM(cost_usd), 4)           AS usd,
+       ROUND(AVG(latency_ms))            AS avg_ms
+FROM   llm_audit
+WHERE  created_at > now() - interval '1 day'
+GROUP  BY feature
+ORDER  BY usd DESC;
+```
+
+### Common failure modes
+
+| Symptom | Cause | Fix |
 |---|---|---|
-| **Concise** (default) | 3–6 sentence focused answers | Lower cost |
-| **Detailed** | Multi-paragraph rich analysis with bold numbers, data citations, forward-looking observations | ~50% more tokens per call |
+| Web → API call returns CORS error | Missing origin in `CORS_ORIGINS` | Add `https://<vercel-domain>` to backend env, restart |
+| `Event loop is closed` in tests | Reusing async engine across TestClient loops | Use the `client` fixture from `tests/api/conftest.py` (NullPool override) |
+| SSE chat stalls in browser | Vercel buffers responses through its proxy | Set `NEXT_PUBLIC_API_BASE` directly to Railway domain so client hits backend, not Vercel |
+| `alembic upgrade head` errors "relation already exists" | DB has hand-created tables | `docker compose down -v` to drop volume, then up + migrate |
+| Empty leaderboard | Session not hydrated | `python -m app.etl hydrate --year 2024 --gp "..." --session R` |
 
-**Token budget by feature:**
+### Migration runbook
 
-| Feature | Concise | Detailed |
-|---|---|---|
-| XAI Explainer | 300 | 500 |
-| Reflexion Analyst | 400 | 650 |
-| Reflexion Critic | 300 | 300 (unchanged) |
-| RAG DNA Match | 350 | 600 |
-| Report Card | 500 | 700 |
-| Race Chat | 500 | 700 |
+Add migration #6:
+
+```bash
+cd backend
+alembic revision -m "add_telemetry_traces_table"
+# Edit the new file in alembic/versions/0006_*.py
+alembic upgrade head                       # apply locally
+pytest tests/test_schema.py -v             # verify table shape
+git add alembic/versions/0006_*.py app/db/models.py
+git commit -m "feat(db): cache telemetry traces"
+```
+
+Postgres ENUM gotcha (the trap that hit us in 0005): when a new
+`saved_analyses.kind` column uses `PgEnum(create_type=True)`,
+SQLAlchemy issues its own `CREATE TYPE` even if you also wrote one
+manually — duplicating it. Pattern used: create the ENUM explicitly
+with `kind_enum.create(op.get_bind(), checkfirst=True)`, then use
+`PgEnum(..., create_type=False)` on the column.
+
+### Re-seeding prod
+
+```bash
+railway run bash backend/scripts/hydrate_initial_data.sh
+# or one race
+railway run python -m app.etl hydrate --year 2024 --gp "Bahrain Grand Prix" --session R
+railway run python -m app.etl refresh-stats --season 2024
+```
 
 ---
 
-## Setup
+## Roadmap — not yet shipped
 
-### 1. Clone and install
+Honest disclosure so reviewers know what's deferred, not broken.
 
-```bash
-git clone <repo-url>
-cd driver-dna
-python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-> **Always activate the project venv first.** Running with a system Python causes `ImportError: numpy.core.multiarray failed to import` due to version mismatches. Verify with `which python` — it should point to `.venv/bin/python`.
-
-### 2. Configure the OpenAI API key
-
-All five AI features require a paid OpenAI account. Create `.streamlit/secrets.toml` (gitignored):
-
-```toml
-[openai]
-api_key = "sk-proj-..."
-```
-
-### 3. Configure Google Drive (optional but recommended)
-
-Enables automatic artifact persistence — trained models and datasets survive fresh deployments without manual copying.
-
-**One-time GCP setup:**
-1. Go to [console.cloud.google.com](https://console.cloud.google.com) → create or select a project
-2. **APIs & Services → Library** → enable **Google Drive API**
-3. **APIs & Services → Credentials → Create Credentials → OAuth 2.0 Client ID**
-   - Configure consent screen if prompted (External, add your email as test user)
-   - Application type: **Web application**
-   - Authorized redirect URIs: `http://localhost:8501` (add your Streamlit Cloud URL too if deploying there)
-4. Copy the **Client ID** and **Client Secret**
-
-Add to `.streamlit/secrets.toml`:
-
-```toml
-[google]
-client_id     = "xxxx.apps.googleusercontent.com"
-client_secret = "yyyy"
-redirect_uri  = "http://localhost:8501"
-```
-
-Then launch the app and click **Connect Google Drive** in the sidebar to complete the OAuth flow. After connecting, all future pipeline runs automatically sync to your Drive, and every cold start restores missing files automatically.
-
-### 4. Generate circuit outlines *(required for Track Map, Throttle Map, and Sector Times)*
-
-Downloads XY geometry and computes sector boundary fractions for all 24 Grand Prix circuits. Run once — takes 10–30 minutes on first run (FastF1 downloads), near-instant on subsequent runs (cached). Resume-safe.
-
-```bash
-python src/generate_circuits.py
-```
-
-### 5. Build the Driver DNA dataset
-
-Downloads session data, engineers features, and writes `data/dataset.parquet` and `data/dataset_meta.json`.
-
-**Option A — terminal:**
-```bash
-python src/pipeline.py
-```
-
-**Option B — dashboard:** Launch the app (step 6), open the **⚙️ Pipeline** tab, fill in the Year / Grand Prix / Session form, and click **Download Dataset**.
-
-### 6. Train the classifier
-
-Runs 5-fold stratified CV and saves the model, label encoder, confusion matrix, SHAP importance chart, and `models/metrics.json`.
-
-**Option A — terminal:**
-```bash
-python src/model.py
-```
-
-**Option B — dashboard:** In the **⚙️ Pipeline** tab, click **Train Model**. Progress is shown live and the model cache is refreshed automatically on completion.
-
-### 7. Launch the dashboard
-
-```bash
-streamlit run src/app.py
-```
-
-> The Race Dashboard and Race Intelligence Chat work independently of steps 4–6 — they query the OpenF1 API directly. Live mode only works during active F1 race weekends; historical mode works any time from 2022 onwards.
-
-### 8. (Optional) Run the MCP server
-
-Exposes fastest-lap telemetry as an MCP service. No additional setup is needed — it reuses the same `src/` modules.
-
-```bash
-# Verify the server starts cleanly
-python mcp/server.py
-
-# Inspect all 4 tools interactively
-npx @modelcontextprotocol/inspector python mcp/server.py
-```
-
-To connect from Claude Desktop, add the server to `~/Library/Application Support/Claude/claude_desktop_config.json` (see [MCP Server section](#mcp-server--fastest-lap-telemetry-api) above for the full config snippet).
+- **GraphQL `Query.me` + `Mutation.saveAnalysis`** — REST `/me/*` covers
+  this fully today; GraphQL bindings can land additively.
+- **Playwright web smoke tests** — Phase 12 deferred them; current web
+  CI relies on `next build` succeeding as the smoke.
+- **Rate limiter is in-memory** — adequate for one Railway dyno; a Redis
+  backend would unblock multi-instance scaling.
+- **Compare endpoint channels** — supports Speed / Throttle / Brake;
+  Time-Delta + Track-Map builders exist in
+  [src/viz.py](src/viz.py) but aren't wired into REST yet.
+- **Telemetry trace cache** — `/compare` hits OpenF1 live every call.
+  A `telemetry_traces` cache table keyed on
+  `(session_key, driver_number, channel)` would cut compare latency
+  ~5×.
+- **Streaming GraphQL subscriptions** — race chat uses SSE on REST;
+  could move to GraphQL subscriptions when we have a second
+  streaming use case.
 
 ---
 
-## Debugging
+## Credits & license
 
-A VS Code debug configuration is included at [`.vscode/launch.json`](.vscode/launch.json).
+**Data sources**
+- [OpenF1](https://openf1.org) — live + historical race telemetry REST API
+- [FastF1](https://docs.fastf1.dev/) — Python F1 telemetry SDK + cache
 
-| Configuration | What it runs |
-|---|---|
-| **Streamlit: app.py** | Full dashboard with breakpoints on `localhost:8501` |
-| **Python: pipeline.py** | Data extraction with interactive breakpoints |
-| **Python: model.py** | Full train → evaluate → save pipeline |
-| **Python: race_engine.py** | Race engine in isolation |
-| **Python: current file** | Debugs the currently open file |
+**Libraries**
+- FastAPI · Strawberry · SQLAlchemy · Alembic · Pydantic
+- Next.js · React · Plotly · Tailwind
+- XGBoost · SHAP · scikit-learn · pandas · numpy
+- OpenAI (gpt-4o-mini)
 
-### Common Issues
+**Design**
+- Typography: [Space Grotesk](https://fonts.google.com/specimen/Space+Grotesk)
+- Brand red: `#E8002D` (F1)
 
-**`ImportError: numpy.core.multiarray failed to import`**
-Wrong Python interpreter. In VS Code: `⇧⌘P` → **Python: Select Interpreter** → choose the `.venv` entry.
+**License**
+- MIT — see [LICENSE](LICENSE) if present; otherwise treat the repo as
+  MIT-licensed source available for portfolio review.
 
-**Track Map, Throttle Map, or Sector Times shows no data / "Sector boundaries not available"**
-`data/circuits.json` not yet generated, or was generated before sector fraction support was added. Run `python src/generate_circuits.py` (resume-safe — will only re-process missing or outdated circuits).
+---
 
-**Model accuracy panel shows nothing in Mystery Driver tab**
-`models/metrics.json` not yet generated. Re-run `python src/model.py`.
+## Legacy Streamlit dashboard
 
-**AI features: "OpenAI rate limit reached"**
-The OpenAI API requires a paid account. Free-tier accounts have no API access — enable billing at `platform.openai.com/settings/billing`.
+The full original README — Streamlit visual tour, MCP server tools,
+Google Drive OAuth setup, ML pipeline details — is preserved in git
+history before the Phase 12 rewrite. If you need:
 
-**AI features: "OpenAI API key not configured"**
-`.streamlit/secrets.toml` is missing or the placeholder key was not replaced. See Setup step 2.
-
-**Mystery Driver tab shows "—" for Grand Prix / Season / Session**
-`data/dataset_meta.json` was not generated. Re-run `python src/pipeline.py` or use the **⚙️ Pipeline** tab to download a dataset.
-
-**Pipeline tab: "Download Dataset" button is greyed out**
-A download or training operation is already running in the background. Wait for the active operation to complete — the button re-enables automatically.
-
-**Pipeline tab: "Train Model" button is greyed out**
-Either a download or training thread is still active, or `data/dataset.parquet` does not yet exist. Download a dataset first.
-
-**Pipeline tab: "Need at least 2 drivers to train a classifier"**
-The downloaded dataset contains laps from only one driver. Re-download with a different session or remove the driver filter to include all drivers.
-
-**Driver Radar AI features: no buttons visible**
-The three agentic AI features only appear once 2–4 drivers are selected in the multiselect and an OpenAI API key is configured.
-
-**"Connect Google Drive" button does nothing / Drive credentials not configured**
-`[google]` section is missing from `.streamlit/secrets.toml`. Add `client_id`, `client_secret`, and `redirect_uri` — see Setup step 3.
-
-**After clicking "Connect Google Drive", redirected but sidebar still shows the button**
-The OAuth redirect URI in GCP must exactly match the `redirect_uri` in your secrets. For local dev, ensure `http://localhost:8501` is registered under Authorized redirect URIs in the GCP console.
-
-**Drive sync stopped working after a long gap**
-The access token expired and the refresh token was revoked (e.g. GCP app credentials rotated). Delete `data/.google_token.json` and reconnect via the sidebar button.
+- **Streamlit tab-by-tab feature reference** (Driver Radar, Mystery
+  Driver, Race Dashboard, Pipeline) → `git log --diff-filter=D -- README.md`
+  to locate the pre-rewrite revision, or run `streamlit run streamlit_app.py`
+  and explore the UI directly.
+- **MCP server details** — see [mcp/server.py](mcp/server.py) and the
+  inline docstrings. Four tools: `list_sessions`, `list_drivers`,
+  `get_fastest_lap_data`, `get_channel_comparison`. Run with
+  `python mcp/server.py` over stdio or via the MCP Inspector:
+  `npx @modelcontextprotocol/inspector python mcp/server.py`.
+- **Google Drive artifact persistence** — see
+  [src/drive_sync.py](src/drive_sync.py). OAuth 2.0 with `drive.file`
+  scope (least-privilege). Tokens at `data/.google_token.json`. Files
+  synced: dataset.parquet, model joblibs, metrics.json, confusion
+  matrix HTML, SHAP PNG, llm_audit.jsonl.
+- **ML training pipeline** — `python src/pipeline.py` to extract
+  features from a FastF1 session; `python src/model.py` to train the
+  XGBoost classifier with 5-fold stratified CV.
