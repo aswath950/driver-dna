@@ -1,0 +1,57 @@
+# Local dev stack. Run from repo root.
+#   docker compose up -d postgres            # just the DB (recommended for dev)
+#   docker compose up --build                # full stack (postgres + backend)
+#
+# The Next.js web app is run separately with `pnpm dev` in web/ for HMR.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: driver_dna_postgres
+    environment:
+      POSTGRES_USER: dna
+      POSTGRES_PASSWORD: dna
+      POSTGRES_DB: driver_dna
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dna -d driver_dna"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: driver_dna_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: driver_dna_backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ENV: local
+      DATABASE_URL: postgresql+asyncpg://dna:dna@postgres:5432/driver_dna
+      DATABASE_URL_SYNC: postgresql://dna:dna@postgres:5432/driver_dna
+      CORS_ORIGINS: "http://localhost:3000"
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    # In Phase 2+ this becomes: `alembic upgrade head && uvicorn ...`
+    command: ["uvicorn", "app.main:app", "--app-dir", "/app/backend", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  pgdata:
