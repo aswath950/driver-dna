@@ -10,10 +10,12 @@ from sqlalchemy import (
     CheckConstraint,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     Numeric,
     PrimaryKeyConstraint,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -91,7 +93,10 @@ class Circuit(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     country: Mapped[str | None] = mapped_column(Text)
     length_km: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
-    sector_fractions: Mapped[dict | None] = mapped_column(JSONB)
+    sector_fractions: Mapped[list | None] = mapped_column(JSONB)
+    x: Mapped[list | None] = mapped_column(JSONB)
+    y: Mapped[list | None] = mapped_column(JSONB)
+    corners: Mapped[list | None] = mapped_column(JSONB)
 
     events: Mapped[list[Event]] = relationship(back_populates="circuit")
 
@@ -133,6 +138,7 @@ class Session(Base):
     type: Mapped[SessionType] = mapped_column(session_type_pg, nullable=False)
     date_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     openf1_session_key: Mapped[int | None] = mapped_column(BigInteger)
+    telemetry_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     event: Mapped[Event] = relationship(back_populates="sessions")
     session_drivers: Mapped[list[SessionDriver]] = relationship(back_populates="session")
@@ -355,5 +361,50 @@ class SavedAnalysis(Base):
     )
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# Car telemetry cache — raw OpenF1 samples per session × driver × lap.
+# ---------------------------------------------------------------------------
+
+
+class CarTelemetry(Base):
+    """Cached raw car_data samples from OpenF1, stored as columnar JSONB arrays.
+
+    ``samples`` shape::
+
+        {
+          "dates":    ["2024-05-26T15:00:00.027Z", ...],
+          "speed":    [152.3, ...],
+          "throttle": [100, ...],
+          "brake":    [0, ...],
+          "rpm":      [11400, ...],
+          "n_gear":   [6, ...],
+          "drs":      [1, ...]
+        }
+
+    Reconstruct as a DataFrame with::
+
+        pd.DataFrame({**samples, "date": pd.to_datetime(samples["dates"], utc=True)})
+    """
+
+    __tablename__ = "car_telemetry"
+    __table_args__ = (
+        PrimaryKeyConstraint("session_id", "driver_id", "lap_number",
+                             name="pk_car_telemetry"),
+    )
+
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    driver_id: Mapped[int] = mapped_column(
+        ForeignKey("drivers.id"), nullable=False
+    )
+    lap_number: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    lap_duration: Mapped[float | None] = mapped_column(Float)
+    samples: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
