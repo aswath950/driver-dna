@@ -20,6 +20,8 @@ dependencies = [
   # ETL (Phase 5) — required by ../src/openf1.py which we reuse directly.
   "pandas>=2.2",
   "requests>=2.32",
+  # ETL corner seeding — FastF1 provides official turn numbers + distances.
+  "fastf1>=3.8",
   # Compute endpoints (Phase 7) — analytics adapter + Plotly figure builder.
   "numpy>=1.26",
   "scipy>=1.13",

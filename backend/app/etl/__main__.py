@@ -5,6 +5,10 @@
     python -m app.etl hydrate --year 2024 --gp "Monaco" --dry-run
     python -m app.etl refresh-stats --season 2024
     python -m app.etl refresh-stats --all-seasons
+    python -m app.etl seed-circuits
+    python -m app.etl seed-circuits --path /custom/path/to/circuits.json
+    python -m app.etl seed-circuit-corners
+    python -m app.etl seed-circuit-corners --year 2024
 """
 
 from __future__ import annotations
@@ -13,8 +17,9 @@ import argparse
 import json
 import logging
 import sys
+from pathlib import Path
 
-from app.etl import hydrate_session, refresh_driver_stats
+from app.etl import fetch_telemetry, hydrate_session, refresh_driver_stats, seed_circuit_corners, seed_circuits
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -35,6 +40,37 @@ def _build_parser() -> argparse.ArgumentParser:
     grp = rs.add_mutually_exclusive_group(required=True)
     grp.add_argument("--season", type=int, help="Refresh stats for one season year.")
     grp.add_argument("--all-seasons", action="store_true", help="Refresh every season.")
+
+    sc = sub.add_parser(
+        "seed-circuits", help="Upsert circuit geometry from data/circuits.json."
+    )
+    sc.add_argument(
+        "--path",
+        default=None,
+        help="Override path to circuits.json (defaults to repo data/circuits.json).",
+    )
+
+    scc = sub.add_parser(
+        "seed-circuit-corners",
+        help="Fetch official corner data from FastF1 and store in circuits.corners.",
+    )
+    scc.add_argument(
+        "--year",
+        type=int,
+        default=2024,
+        help="Season year to look up representative events for each circuit (default: 2024).",
+    )
+
+    ft = sub.add_parser(
+        "fetch-telemetry",
+        help="Download and cache all car telemetry for a session from OpenF1.",
+    )
+    ft.add_argument(
+        "--session-id",
+        type=int,
+        required=True,
+        help="Database session ID (e.g. 73).",
+    )
 
     return p
 
@@ -60,6 +96,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "refresh-stats":
         year = None if args.all_seasons else args.season
         result = refresh_driver_stats.run(season_year=year)
+        print(json.dumps(result.as_dict(), indent=2))
+        return 0
+
+    if args.command == "seed-circuits":
+        path = Path(args.path) if args.path else None
+        result = seed_circuits.run(path=path)
+        print(json.dumps(result.as_dict(), indent=2))
+        return 0
+
+    if args.command == "seed-circuit-corners":
+        result = seed_circuit_corners.run(year=args.year)
+        print(json.dumps(result.as_dict(), indent=2))
+        return 0
+
+    if args.command == "fetch-telemetry":
+        result = fetch_telemetry.run(session_id=args.session_id)
         print(json.dumps(result.as_dict(), indent=2))
         return 0
 

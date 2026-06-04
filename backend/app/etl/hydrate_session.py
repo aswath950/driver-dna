@@ -118,13 +118,31 @@ class SessionHydrator:
         )
         return int(row["id"])
 
-    def _upsert_default_circuit(self) -> int:
-        """For v1 we don't have circuit geometry per meeting in OpenF1 cheaply;
-        fall back to a single 'Unknown' circuit. Phase 6+ can swap this for a
-        proper circuits sync."""
+    def _resolve_circuit_id(self, meeting_name: str | None) -> int:
+        """Resolve the FK target for ``events.circuit_id``.
+
+        Prefers an existing ``circuits`` row matching ``meeting_name`` (the
+        natural key shared with ``data/circuits.json`` — e.g. "Australian
+        Grand Prix"). Falls back to a sentinel "Unknown" row if the circuit
+        has not been seeded yet — logged as a warning so unseeded weekends
+        are visible. Run ``python -m app.etl seed-circuits`` to populate
+        circuit geometry and sector fractions.
+        """
+        from app.db.models import Circuit  # local import — avoids cycles
+        if meeting_name:
+            existing = self.db.execute(
+                Circuit.__table__.select().where(Circuit.name == meeting_name)
+            ).first()
+            if existing is not None:
+                return int(existing.id)
+            logger.warning(
+                "circuits row missing for meeting_name=%r — falling back to 'Unknown' "
+                "(run `python -m app.etl seed-circuits` to seed geometry)",
+                meeting_name,
+            )
         row = upsert_one(
             self.db,
-            __import__("app.db.models", fromlist=["Circuit"]).Circuit.__table__,
+            Circuit.__table__,
             values={"name": "Unknown"},
             conflict_cols=["name"],
             update_cols=[],
@@ -440,7 +458,16 @@ class SessionHydrator:
         # first matching session.
         first = targets.iloc[0]
         season_id = self._upsert_season(year)
-        circuit_id = self._upsert_default_circuit()
+        # OpenF1 /sessions doesn't return meeting_name; fall back to the
+        # grand_prix argument (e.g. "Monaco Grand Prix"), which matches the
+        # keys in data/circuits.json.
+        raw_meeting_name = first.get("meeting_name")
+        meeting_name = (
+            str(raw_meeting_name)
+            if raw_meeting_name and pd.notna(raw_meeting_name)
+            else grand_prix
+        )
+        circuit_id = self._resolve_circuit_id(meeting_name)
         round_n = int(first.get("meeting_key", 0)) if round_hint is None else round_hint
         if round_n == 0 and round_hint is None:
             # meeting_key works as a unique-per-season round substitute when we
