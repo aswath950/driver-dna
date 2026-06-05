@@ -8,6 +8,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import LapTime
 
 
+async def fastest_lap_sectors(
+    db: AsyncSession,
+    *,
+    session_id: int,
+    driver_id: int,
+) -> LapTime | None:
+    """Return the fastest non-pit-out lap row with a recorded lap time, or None."""
+    stmt = (
+        select(LapTime)
+        .where(
+            and_(
+                LapTime.session_id == session_id,
+                LapTime.driver_id == driver_id,
+                LapTime.is_pit_out == False,  # noqa: E712
+                LapTime.lap_time_ms.is_not(None),
+            )
+        )
+        .order_by(LapTime.lap_time_ms.asc())
+        .limit(1)
+    )
+    return (await db.scalars(stmt)).first()
+
+
 async def list_laps(
     db: AsyncSession,
     *,
