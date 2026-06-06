@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from fastapi import APIRouter
+from pydantic import BaseModel
+from sqlalchemy import select
 
 from app.api.v1.schemas.lap import LapOut
 from app.api.v1.schemas.race_result import RaceResultOut
@@ -15,11 +17,18 @@ from app.core.pagination import (
     build_page,
     decode_cursor,
 )
+from app.db.models import SessionDriver, Team
 from app.db.repositories import laps as laps_repo
 from app.db.repositories import results as results_repo
 from app.db.repositories import sessions as sessions_repo
 
 router = APIRouter(tags=["sessions"])
+
+
+class SessionTeamOut(BaseModel):
+    id: int
+    name: str
+    color_hex: str | None = None
 
 
 @router.get(
@@ -101,3 +110,24 @@ async def list_laps(
             rows=data, limit=limit, next_sort_key=last.lap_number, next_pk=last.id
         )
     return build_page(rows=data, limit=limit)
+
+
+@router.get(
+    "/sessions/{session_id}/teams",
+    response_model=list[SessionTeamOut],
+    responses={404: {"model": ErrorEnvelope}},
+    summary="Distinct teams participating in a session.",
+)
+async def list_session_teams(session_id: int, db: DB) -> list[SessionTeamOut]:
+    if await sessions_repo.get_session(db, session_id) is None:
+        raise NotFoundError("session", session_id)
+    rows = (
+        await db.execute(
+            select(Team.id, Team.name, Team.color_hex)
+            .join(SessionDriver, SessionDriver.team_id == Team.id)
+            .where(SessionDriver.session_id == session_id)
+            .distinct()
+            .order_by(Team.name)
+        )
+    ).all()
+    return [SessionTeamOut(id=r.id, name=r.name, color_hex=r.color_hex) for r in rows]

@@ -13,6 +13,7 @@ from app.api.v1.routers import analytics as analytics_router
 from app.api.v1.routers import drivers as drivers_router
 from app.api.v1.routers import events as events_router
 from app.api.v1.routers import me as me_router
+from app.api.v1.routers import pipeline as pipeline_router
 from app.api.v1.routers import seasons as seasons_router
 from app.api.v1.routers import sessions as sessions_router
 from app.api.v1.routers import standings as standings_router
@@ -43,6 +44,7 @@ router.include_router(standings_router.router)
 router.include_router(analytics_router.router)
 router.include_router(ai_router.router)
 router.include_router(me_router.router)
+router.include_router(pipeline_router.router)
 
 
 @router.get("/_ping", summary="Sentinel endpoint for contract tests.")

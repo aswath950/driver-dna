@@ -36,7 +36,51 @@ class DegradationRow(ORMModel):
 # --- Compare ---------------------------------------------------------------
 
 
-Channel = Literal["Speed", "Throttle", "Brake"]
+Channel = Literal[
+    "Speed", "Throttle", "Brake", "RPM", "nGear", "DRS",
+    "TimeDelta", "TrackMap", "SectorTimes",
+]
+
+
+# --- Sector Times ------------------------------------------------------------
+
+
+class SectorDriverSplits(ORMModel):
+    driver_id: int
+    code: str
+    lap_number: int | None = None
+    lap_time_ms: int | None = None
+    sector1_ms: int | None = None
+    sector2_ms: int | None = None
+    sector3_ms: int | None = None
+
+
+class SectorTimesPayload(ORMModel):
+    session_id: int
+    driver_a: SectorDriverSplits
+    driver_b: SectorDriverSplits
+    figure_json: str
+
+
+# --- Track Map ---------------------------------------------------------------
+
+
+class TrackMapDriverTrace(ORMModel):
+    driver_id: int
+    code: str
+
+
+class TrackMapPayload(ORMModel):
+    session_id: int
+    driver_a: TrackMapDriverTrace
+    driver_b: TrackMapDriverTrace
+    # Circuit outline shared by both drivers (from circuits.x / circuits.y).
+    circuit_x: list[float]
+    circuit_y: list[float]
+    figure_json: str
+
+
+# --- Compare -----------------------------------------------------------------
 
 
 class CompareDriverTrace(ORMModel):
@@ -56,3 +100,45 @@ class ComparePayload(ORMModel):
     driver_b: CompareDriverTrace
     # Plotly figure JSON (string) — frontend renders directly with Plotly.js.
     figure_json: str
+
+
+# --- Corner Performance -------------------------------------------------------
+
+
+class CornerMetrics(ORMModel):
+    v_min: float
+    exit_speed: float
+    throttle_dist_frac: float
+    brake_point_frac: float
+
+
+class TeamInfo(ORMModel):
+    id: int
+    name: str
+    color_hex: str
+
+
+class SingleCorner(ORMModel):
+    corner_number: int
+    corner_class: Literal["slow", "medium", "high"]
+    apex_fraction: float
+    ref_speed_kmh: float
+    team_a: CornerMetrics
+    team_b: CornerMetrics
+
+
+class ClassSummary(ORMModel):
+    corner_count: int
+    team_a: CornerMetrics
+    team_b: CornerMetrics
+
+
+class CornerPerformancePayload(ORMModel):
+    session_id: int
+    team_a: TeamInfo
+    team_b: TeamInfo
+    corners: list[SingleCorner]
+    summary: dict[str, ClassSummary]   # keys: "slow", "medium", "high"
+    v_min_figure: str                  # Plotly JSON
+    class_summary_figure: str          # Plotly JSON
+    track_map_figure: str              # Plotly JSON
