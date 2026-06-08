@@ -37,6 +37,12 @@ export interface Page<T> {
   page: { next_cursor: string | null; has_more: boolean; limit: number };
 }
 
+export interface TeamOut {
+  id: number;
+  name: string;
+  color_hex: string | null;
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -147,4 +153,7 @@ export const apiServer = {
     request<UndercutEvent[]>(
       `/api/v1/sessions/${sessionId}/analytics/undercuts`,
     ),
+
+  listTeamsForSession: (sessionId: number | string) =>
+    request<TeamOut[]>(`/api/v1/sessions/${sessionId}/teams`),
 };

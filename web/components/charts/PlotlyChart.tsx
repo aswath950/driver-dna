@@ -13,9 +13,11 @@ const Plot = dynamic(() => import("react-plotly.js"), {
 export function PlotlyChart({
   figureJson,
   height = 420,
+  margin,
 }: {
   figureJson: string;
   height?: number;
+  margin?: { l?: number; r?: number; t?: number; b?: number };
 }) {
   const fig = useMemo(() => {
     try {
@@ -34,7 +36,7 @@ export function PlotlyChart({
         paper_bgcolor: "rgba(0,0,0,0)",
         plot_bgcolor: "rgba(0,0,0,0)",
         font: { color: "#fff", family: "Space Grotesk, system-ui" },
-        margin: { l: 50, r: 20, t: 40, b: 40 },
+        margin: margin ?? { l: 50, r: 20, t: 40, b: 40 },
       }}
       useResizeHandler
       style={{ width: "100%", height }}

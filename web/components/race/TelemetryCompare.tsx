@@ -1,9 +1,9 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { Card } from "@/components/ui/Card";
 import { PlotlyChart } from "@/components/charts/PlotlyChart";
-import { apiClient } from "@/lib/api-client";
+import { apiClient, type SectorTimesPayload } from "@/lib/api-client";
 
 interface Driver {
   id: number;
@@ -11,7 +11,10 @@ interface Driver {
   full_name: string;
 }
 
-const CHANNELS = ["Speed", "Throttle", "Brake"] as const;
+const CHANNELS = [
+  "Speed", "Throttle", "Brake", "RPM", "nGear", "DRS",
+  "TimeDelta", "Sector Times", "Track Map",
+] as const;
 type Channel = (typeof CHANNELS)[number];
 
 interface Props {
@@ -27,17 +30,36 @@ export function TelemetryCompare({ sessionId, drivers }: Props) {
   const [driverBId, setDriverBId] = useState<number>(drivers[1]?.id ?? 0);
   const [channel, setChannel] = useState<Channel>("Speed");
   const [figureJson, setFigureJson] = useState<string | null>(null);
+  const [sectorPayload, setSectorPayload] = useState<SectorTimesPayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [telemetryCached, setTelemetryCached] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    setTelemetryCached(null);
+    apiClient.telemetryStatus(sessionId)
+      .then((s) => setTelemetryCached(s.fetched_at !== null))
+      .catch(() => setTelemetryCached(null));
+  }, [sessionId]);
 
   const fetchCompare = useCallback(
     async (aId: number, bId: number, ch: Channel) => {
       if (!aId || !bId) return;
       setLoading(true);
       setError(null);
+      setSectorPayload(null);
       try {
-        const payload = await apiClient.compare(sessionId, aId, bId, ch);
-        setFigureJson(payload.figure_json);
+        if (ch === "Sector Times") {
+          const payload = await apiClient.sectorTimes(sessionId, aId, bId);
+          setSectorPayload(payload);
+          setFigureJson(payload.figure_json);
+        } else if (ch === "Track Map") {
+          const payload = await apiClient.trackMap(sessionId, aId, bId);
+          setFigureJson(payload.figure_json);
+        } else {
+          const payload = await apiClient.compare(sessionId, aId, bId, ch);
+          setFigureJson(payload.figure_json);
+        }
       } catch {
         setError("Comparison data unavailable.");
         setFigureJson(null);
@@ -119,6 +141,15 @@ export function TelemetryCompare({ sessionId, drivers }: Props) {
         </div>
       </div>
 
+      {/* Cache status banner */}
+      {telemetryCached === false && (
+        <p className="text-xs text-white/40 border border-white/10 px-3 py-2">
+          Telemetry not pre-cached — first comparison may take a few seconds.
+          Visit the <a href="/pipeline" className="underline text-white/60">Pipeline page</a> to
+          pre-download all session telemetry for instant loads.
+        </p>
+      )}
+
       {/* Chart */}
       <Card>
         {loading ? (
@@ -130,7 +161,24 @@ export function TelemetryCompare({ sessionId, drivers }: Props) {
             {error}
           </div>
         ) : figureJson ? (
-          <PlotlyChart figureJson={figureJson} height={320} />
+          <>
+            <PlotlyChart
+            figureJson={figureJson}
+            height={320}
+            margin={channel === "Track Map" ? { l: 5, r: 5, t: 30, b: 5 } : undefined}
+          />
+            {sectorPayload &&
+              [sectorPayload.driver_a, sectorPayload.driver_b].some(
+                (d) =>
+                  d.sector1_ms === null ||
+                  d.sector2_ms === null ||
+                  d.sector3_ms === null,
+              ) && (
+                <p className="text-xs text-white/40 mt-1">
+                  Some sector splits unavailable for this driver/lap.
+                </p>
+              )}
+          </>
         ) : (
           <div className="flex h-64 items-center justify-center text-center text-sm text-white/40">
             Select two drivers then change any control to load the comparison.

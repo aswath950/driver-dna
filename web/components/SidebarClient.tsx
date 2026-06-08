@@ -5,12 +5,22 @@ import {
   useVisibleCharts,
   useAIMode,
   CHART_LABELS,
+  CHARTS_FOR_SESSION,
+  SESSION_TYPE_EVENT,
+  SESSION_TYPE_STORAGE_KEY,
   type AIMode,
   type ChartLabel,
 } from "@/lib/preferences";
+import { StatPill } from "@/components/ui/StatPill";
 
 const AI_MODES: AIMode[] = ["Concise", "Detailed", "Critique loop"];
 const RACE_MODE_KEY = "dna_rp_mode";
+export const MODEL_METRICS_REFRESH_EVENT = "dna_model_metrics_refresh";
+
+interface ModelMetrics {
+  cv_accuracy: number | null;
+  train_accuracy: number | null;
+}
 
 // ── Custom radio indicator ─────────────────────────────────────────────────
 // The native <input> is opacity-0 and fills the container; peer-checked
@@ -99,27 +109,66 @@ function CheckOption({
 
 // ── SidebarClient ──────────────────────────────────────────────────────────
 
+function fmt(v: number | null, decimals = 1): string {
+  return v == null ? "—" : `${(v * 100).toFixed(decimals)}%`;
+}
+
 export function SidebarClient() {
   const { charts, toggle } = useVisibleCharts();
   const { mode, setMode } = useAIMode();
   const [raceMode, setRaceMode] = useState<string | null>(null);
+  const [sessionType, setSessionType] = useState<string | null>(null);
   const [apiStatus, setApiStatus] = useState<"loading" | "ok" | "error">(
     "loading",
   );
+  const [metrics, setMetrics] = useState<ModelMetrics>({
+    cv_accuracy: null,
+    train_accuracy: null,
+  });
+
+  const base = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+
+  function fetchMetrics() {
+    fetch(`${base}/api/v1/pipeline/model-metrics`)
+      .then((r) => r.json())
+      .then((d: ModelMetrics) => setMetrics(d))
+      .catch(() => null);
+  }
 
   useEffect(() => {
     setRaceMode(localStorage.getItem(RACE_MODE_KEY));
+    setSessionType(localStorage.getItem(SESSION_TYPE_STORAGE_KEY));
   }, []);
 
   useEffect(() => {
-    const base = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+    const handler = (e: Event) => {
+      setSessionType((e as CustomEvent<string | null>).detail);
+    };
+    window.addEventListener(SESSION_TYPE_EVENT, handler);
+    return () => window.removeEventListener(SESSION_TYPE_EVENT, handler);
+  }, []);
+
+  useEffect(() => {
     fetch(`${base}/healthz`)
       .then((r) => setApiStatus(r.ok ? "ok" : "error"))
       .catch(() => setApiStatus("error"));
+  }, [base]);
+
+  useEffect(() => {
+    fetchMetrics();
+    window.addEventListener(MODEL_METRICS_REFRESH_EVENT, fetchMetrics);
+    return () => window.removeEventListener(MODEL_METRICS_REFRESH_EVENT, fetchMetrics);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
     <>
+      {/* Model accuracy stats */}
+      <div className="grid grid-cols-2 gap-2 mb-4">
+        <StatPill label="CV Accuracy" value={fmt(metrics.cv_accuracy)} />
+        <StatPill label="Train Accuracy" value={fmt(metrics.train_accuracy)} />
+      </div>
+
       {/* Race Dashboard mode indicator */}
       {raceMode ? (
         <p className="mb-1 text-xs text-white/60">Mode: 🗂️ Historical</p>
@@ -143,7 +192,7 @@ export function SidebarClient() {
           Visible Charts
         </summary>
         <div className="mt-2 space-y-2">
-          {CHART_LABELS.map((label) => (
+          {(sessionType ? (CHARTS_FOR_SESSION[sessionType] ?? CHART_LABELS) : CHART_LABELS).map((label) => (
             <CheckOption
               key={label}
               label={label}

@@ -19,9 +19,83 @@ export type SessionOut = components["schemas"]["SessionOut"];
 export type ComparePayload = components["schemas"]["ComparePayload"];
 export type UndercutEvent = components["schemas"]["UndercutEvent"];
 
+// Hand-written until openapi:gen picks up the new endpoint.
+export interface SectorDriverSplits {
+  driver_id: number;
+  code: string;
+  lap_number: number | null;
+  lap_time_ms: number | null;
+  sector1_ms: number | null;
+  sector2_ms: number | null;
+  sector3_ms: number | null;
+}
+export interface SectorTimesPayload {
+  session_id: number;
+  driver_a: SectorDriverSplits;
+  driver_b: SectorDriverSplits;
+  figure_json: string;
+}
+export interface TrackMapDriverTrace {
+  driver_id: number;
+  code: string;
+}
+export interface TrackMapPayload {
+  session_id: number;
+  driver_a: TrackMapDriverTrace;
+  driver_b: TrackMapDriverTrace;
+  circuit_x: number[];
+  circuit_y: number[];
+  figure_json: string;
+}
+
 interface Page<T> {
   data: T[];
   page: { next_cursor: string | null; has_more: boolean; limit: number };
+}
+
+export interface TeamOut {
+  id: number;
+  name: string;
+  color_hex: string | null;
+}
+
+export interface CornerMetrics {
+  v_min: number;
+  exit_speed: number;
+  throttle_dist_frac: number;
+  brake_point_frac: number;
+}
+
+export interface SingleCorner {
+  corner_number: number;
+  corner_class: "slow" | "medium" | "high";
+  apex_fraction: number;
+  ref_speed_kmh: number;
+  team_a: CornerMetrics;
+  team_b: CornerMetrics;
+}
+
+export interface ClassSummary {
+  corner_count: number;
+  team_a: CornerMetrics;
+  team_b: CornerMetrics;
+}
+
+export interface CornerPerformancePayload {
+  session_id: number;
+  team_a: { id: number; name: string; color_hex: string };
+  team_b: { id: number; name: string; color_hex: string };
+  corners: SingleCorner[];
+  summary: Record<string, ClassSummary>;
+  v_min_figure: string;
+  class_summary_figure: string;
+  track_map_figure: string;
+}
+
+export interface GpScheduleItem {
+  name: string;
+  date: string;
+  round: number;
 }
 
 // Critic evaluation shape nested inside StyleAnalystResponse.critique
@@ -85,11 +159,37 @@ export const apiClient = {
   events: (year: number) =>
     clientFetch<Page<EventOut>>(`/api/v1/seasons/${year}/events?limit=50`),
 
+  gpSchedule: (year: number) =>
+    clientFetch<GpScheduleItem[]>(`/api/v1/pipeline/gp-schedule?year=${year}`),
+
   sessions: (eventId: number) =>
     clientFetch<SessionOut[]>(`/api/v1/events/${eventId}/sessions`),
 
   compare: (sessionId: number, driverA: number, driverB: number, channel: string) =>
     clientFetch<ComparePayload>(
       `/api/v1/sessions/${sessionId}/compare?driver_a=${driverA}&driver_b=${driverB}&channel=${channel}`,
+    ),
+
+  sectorTimes: (sessionId: number, driverA: number, driverB: number) =>
+    clientFetch<SectorTimesPayload>(
+      `/api/v1/sessions/${sessionId}/compare/sectors?driver_a=${driverA}&driver_b=${driverB}`,
+    ),
+
+  trackMap: (sessionId: number, driverA: number, driverB: number) =>
+    clientFetch<TrackMapPayload>(
+      `/api/v1/sessions/${sessionId}/compare/track-map?driver_a=${driverA}&driver_b=${driverB}`,
+    ),
+
+  telemetryStatus: (sessionId: number) =>
+    clientFetch<{ session_id: number; fetched_at: string | null }>(
+      `/api/v1/pipeline/telemetry-status?session_id=${sessionId}`,
+    ),
+
+  sessionTeams: (sessionId: number) =>
+    clientFetch<TeamOut[]>(`/api/v1/sessions/${sessionId}/teams`),
+
+  cornerPerformance: (sessionId: number, teamA: number, teamB: number) =>
+    clientFetch<CornerPerformancePayload>(
+      `/api/v1/sessions/${sessionId}/corner-performance?team_a=${teamA}&team_b=${teamB}`,
     ),
 };

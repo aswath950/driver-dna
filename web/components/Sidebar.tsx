@@ -1,4 +1,3 @@
-import { StatPill } from "@/components/ui/StatPill";
 import { SidebarClient } from "./SidebarClient";
 
 export function Sidebar() {
@@ -10,7 +9,7 @@ export function Sidebar() {
           🧬 Driver DNA + 🏁 Race Pace
         </h1>
 
-        {/* Driver DNA section */}
+        {/* Driver DNA section — model metrics rendered by SidebarClient */}
         <div className="mb-1">
           <h2 className="text-xs uppercase tracking-widest text-white/60 mb-1">
             Driver DNA
@@ -18,10 +17,6 @@ export function Sidebar() {
           <p className="text-xs text-white/50 mb-3">
             Identify F1 drivers from telemetry alone using XGBoost.
           </p>
-          <div className="grid grid-cols-2 gap-2 mb-3">
-            <StatPill label="CV Accuracy" value="—" />
-            <StatPill label="Train Accuracy" value="—" />
-          </div>
           <div className="border-l-2 border-[var(--f1-red)] pl-3 py-1 text-xs text-white/60">
             <strong className="text-white/80">Mystery Driver</strong> — pick
             any lap and see if the ML model can identify the driver from driving

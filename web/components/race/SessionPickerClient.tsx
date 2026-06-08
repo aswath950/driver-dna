@@ -1,29 +1,67 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { useRouter } from "next/navigation";
+import { useState, useEffect, useRef } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@/components/ui/Button";
-import { apiClient, type SeasonOut, type EventOut, type SessionOut } from "@/lib/api-client";
+import { apiClient, type EventOut, type SessionOut, type GpScheduleItem } from "@/lib/api-client";
 
-interface Props {
-  seasons: SeasonOut[];
+// Years for which OpenF1 has real race data (confirmed via /meetings API).
+const AVAILABLE_YEARS = [2026, 2025, 2024, 2023];
+
+const LAST_SESSION_KEY = "dna_last_session";
+
+interface LastSession {
+  year: number;
+  eventId: number;
+  sessionId: number;
+}
+
+function readLastSession(): LastSession | null {
+  try {
+    const raw = localStorage.getItem(LAST_SESSION_KEY);
+    return raw ? (JSON.parse(raw) as LastSession) : null;
+  } catch {
+    return null;
+  }
 }
 
 const SELECT_CLASS =
   "border border-white/20 bg-[var(--bg-2)] px-3 py-2 text-sm text-white focus:outline-none";
 const DISABLED_CLASS = "cursor-not-allowed opacity-50";
 
-export function SessionPickerClient({ seasons }: Props) {
+export function SessionPickerClient() {
   const router = useRouter();
-  const defaultYear = seasons[0]?.year ?? new Date().getFullYear();
+  const searchParams = useSearchParams();
+  const forcePickerMode = searchParams.get("pick") === "1";
 
-  const [year, setYear] = useState(defaultYear);
+  // Carry target eventId/sessionId to restore across async effect boundaries
+  const restoreEventId   = useRef<number | null>(null);
+  const restoreSessionId = useRef<number | null>(null);
+
+  const [year, setYear] = useState(AVAILABLE_YEARS[0]);
   const [events, setEvents] = useState<EventOut[]>([]);
   const [eventId, setEventId] = useState<number | null>(null);
   const [sessions, setSessions] = useState<SessionOut[]>([]);
   const [sessionId, setSessionId] = useState<number | null>(null);
   const [loadingEvents, setLoadingEvents] = useState(false);
   const [loadingSessions, setLoadingSessions] = useState(false);
+
+  // On mount: auto-redirect to last session, or restore picker state when ?pick=1
+  useEffect(() => {
+    const stored = readLastSession();
+    if (!stored) return;
+
+    if (!forcePickerMode) {
+      // Send user straight back to the session they were viewing
+      router.replace(`/race/${stored.sessionId}`);
+      return;
+    }
+
+    // ?pick=1 — restore dropdowns so user sees their last selection
+    restoreEventId.current   = stored.eventId;
+    restoreSessionId.current = stored.sessionId;
+    setYear(stored.year); // triggers year effect which cascades restore
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Fetch events whenever the selected year changes (including on initial mount)
   useEffect(() => {
@@ -33,15 +71,33 @@ export function SessionPickerClient({ seasons }: Props) {
     setSessions([]);
     setSessionId(null);
     setLoadingEvents(true);
-    apiClient
-      .events(year)
-      .then((page) => {
-        if (!cancelled) setEvents(page.data);
+
+    Promise.all([
+      apiClient.events(year),
+      apiClient.gpSchedule(year).catch((): GpScheduleItem[] => []),
+    ])
+      .then(([page, schedule]) => {
+        if (cancelled) return;
+        // Map OpenF1 round number → real GP name
+        const nameByRound = new Map(schedule.map((gp) => [gp.round, gp.name]));
+        const enriched = page.data.map((ev) => ({
+          ...ev,
+          name: nameByRound.get(ev.round) ?? ev.name,
+        }));
+        setEvents(enriched);
+
+        // Cascade restore: set eventId if the stored one exists in this year's events
+        const toRestore = restoreEventId.current;
+        if (toRestore && enriched.some((ev) => ev.id === toRestore)) {
+          restoreEventId.current = null;
+          setEventId(toRestore); // triggers session effect
+        }
       })
       .catch(() => {})
       .finally(() => {
         if (!cancelled) setLoadingEvents(false);
       });
+
     return () => {
       cancelled = true;
     };
@@ -57,7 +113,16 @@ export function SessionPickerClient({ seasons }: Props) {
     apiClient
       .sessions(eventId)
       .then((data) => {
-        if (!cancelled) setSessions(data);
+        if (!cancelled) {
+          setSessions(data);
+
+          // Cascade restore: set sessionId if the stored one exists in this event
+          const toRestore = restoreSessionId.current;
+          if (toRestore && data.some((s) => s.id === toRestore)) {
+            restoreSessionId.current = null;
+            setSessionId(toRestore);
+          }
+        }
       })
       .catch(() => {})
       .finally(() => {
@@ -108,9 +173,9 @@ export function SessionPickerClient({ seasons }: Props) {
             onChange={(e) => setYear(Number(e.target.value))}
             className={SELECT_CLASS}
           >
-            {seasons.map((s) => (
-              <option key={s.id} value={s.year}>
-                {s.year}
+            {AVAILABLE_YEARS.map((y) => (
+              <option key={y} value={y}>
+                {y}
               </option>
             ))}
           </select>
@@ -160,7 +225,16 @@ export function SessionPickerClient({ seasons }: Props) {
         {/* Load button */}
         <Button
           disabled={!sessionId}
-          onClick={() => sessionId && router.push(`/race/${sessionId}`)}
+          onClick={() => {
+            if (!sessionId || !eventId) return;
+            try {
+              localStorage.setItem(
+                LAST_SESSION_KEY,
+                JSON.stringify({ year, eventId, sessionId }),
+              );
+            } catch {}
+            router.push(`/race/${sessionId}`);
+          }}
           className="disabled:cursor-not-allowed disabled:opacity-50"
         >
           Load Session

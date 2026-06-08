@@ -6,11 +6,15 @@ import {
   type GapRow,
   type DegradationRow,
   type UndercutEvent,
+  type TeamOut,
 } from "@/lib/api";
 import { Card } from "@/components/ui/Card";
 import { RaceChatStream } from "@/components/chat/RaceChatStream";
 import { TelemetryCompare } from "@/components/race/TelemetryCompare";
+import { CornerPerformance } from "@/components/race/CornerPerformance";
 import { AnalyticsSections } from "@/components/race/AnalyticsSections";
+import { Leaderboard, type LeaderboardRow, type LeaderboardSessionType } from "@/components/race/Leaderboard";
+import { SessionTypeSync } from "@/components/race/SessionTypeSync";
 
 // ── Server-side Plotly figure builders ────────────────────────────────────
 
@@ -109,7 +113,7 @@ export default async function RaceSessionPage({
 }) {
   const sid = Number(params.sessionId);
 
-  const [session, leaderboard, rollingPace, gapToLeader, undercuts, tyreDeg] =
+  const [session, leaderboard, rollingPace, gapToLeader, undercuts, tyreDeg, teams] =
     await Promise.all([
       apiServer.getSession(sid).catch(() => null),
       apiServer.getLeaderboard(sid).catch(() => []),
@@ -117,6 +121,7 @@ export default async function RaceSessionPage({
       apiServer.gapToLeader(sid).catch(() => []),
       apiServer.undercuts(sid).catch(() => [] as UndercutEvent[]),
       apiServer.tyreDegradation(sid).catch(() => []),
+      apiServer.listTeamsForSession(sid).catch(() => [] as TeamOut[]),
     ]);
 
   if (!session) return notFound();
@@ -138,13 +143,86 @@ export default async function RaceSessionPage({
   const gapToLeaderFigJson = buildGapToLeaderFig(gapToLeader, driverCodeMap);
   const tyreDegFigJson = buildTyreDegFig(tyreDeg);
 
+  // ── Leaderboard rows with session-type-aware columns ────────────────────
+
+  function fmtLap(ms: number): string {
+    const secs = ms / 1000;
+    const m = Math.floor(secs / 60);
+    const s = (secs % 60).toFixed(3).padStart(6, "0");
+    return `${m}:${s}`;
+  }
+  function fmtDeltaMs(deltaMs: number): string {
+    return `+${(deltaMs / 1000).toFixed(3)}s`;
+  }
+  function fmtDeltaSec(sec: number): string {
+    return `+${sec.toFixed(3)}s`;
+  }
+
+  const sessionType = session.type as LeaderboardSessionType;
+  let leaderboardRows: LeaderboardRow[];
+
+  if (sessionType === "R" || sessionType === "S") {
+    // Last recorded gap_sec per driver is the finishing gap to leader.
+    const lastGap = new Map<number, number>();
+    for (const g of gapToLeader) lastGap.set(g.driver_id, g.gap_sec);
+    const p1Id = leaderboard[0]?.driver.id;
+    leaderboardRows = leaderboard.map((r) => ({
+      position: r.position ?? null,
+      driverCode: r.driver.code,
+      driverFullName: r.driver.full_name,
+      teamName: r.team.name,
+      points: r.points,
+      fastestLap: null,
+      delta:
+        r.driver.id === p1Id
+          ? "Leader"
+          : lastGap.has(r.driver.id)
+          ? fmtDeltaSec(lastGap.get(r.driver.id)!)
+          : (r.status && r.status !== "Finished" ? r.status : null),
+    }));
+  } else if (sessionType === "FP1" || sessionType === "FP2" || sessionType === "FP3") {
+    const p1Ms = leaderboard[0]?.fastest_lap_ms ?? null;
+    leaderboardRows = leaderboard.map((r, i) => ({
+      position: r.position ?? null,
+      driverCode: r.driver.code,
+      driverFullName: r.driver.full_name,
+      teamName: r.team.name,
+      points: "",
+      fastestLap: null,
+      delta:
+        i === 0
+          ? "Leader"
+          : r.fastest_lap_ms != null && p1Ms != null
+          ? fmtDeltaMs(r.fastest_lap_ms - p1Ms)
+          : null,
+    }));
+  } else {
+    // Q or SQ
+    const p1Ms = leaderboard[0]?.fastest_lap_ms ?? null;
+    leaderboardRows = leaderboard.map((r, i) => ({
+      position: r.position ?? null,
+      driverCode: r.driver.code,
+      driverFullName: r.driver.full_name,
+      teamName: r.team.name,
+      points: "",
+      fastestLap: r.fastest_lap_ms != null ? fmtLap(r.fastest_lap_ms) : null,
+      delta:
+        i === 0
+          ? "Leader"
+          : r.fastest_lap_ms != null && p1Ms != null
+          ? fmtDeltaMs(r.fastest_lap_ms - p1Ms)
+          : null,
+    }));
+  }
+
   return (
     <div className="flex flex-col gap-6">
+      <SessionTypeSync sessionType={session.type} />
       {/* Session header */}
       <header>
         <div className="mb-2">
           <Link
-            href="/race"
+            href="/race?pick=1"
             className="text-xs text-white/50 transition-colors hover:text-white/80"
           >
             ← Change session
@@ -163,46 +241,7 @@ export default async function RaceSessionPage({
 
       {/* Leaderboard */}
       <Card title="Leaderboard">
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[480px] text-sm">
-            <thead>
-              <tr className="border-b border-white/10 text-left text-xs uppercase tracking-widest text-white/40">
-                <th className="py-2 pr-3">Pos</th>
-                <th className="py-2 pr-3">Driver</th>
-                <th className="py-2 pr-3">Team</th>
-                <th className="py-2 pr-3 text-right">Pts</th>
-                <th className="py-2 text-right">Best lap (ms)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {leaderboard.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={5}
-                    className="py-4 text-center text-sm italic text-white/40"
-                  >
-                    No results for this session.
-                  </td>
-                </tr>
-              ) : (
-                leaderboard.map((r, i) => (
-                  <tr key={i} className="border-t border-white/10">
-                    <td className="py-2 pr-3 text-white/80">{r.position ?? "—"}</td>
-                    <td className="py-2 pr-3 font-semibold">
-                      {r.driver.code}{" "}
-                      <span className="text-xs text-white/40">{r.driver.full_name}</span>
-                    </td>
-                    <td className="py-2 pr-3 text-white/70">{r.team.name}</td>
-                    <td className="py-2 pr-3 text-right">{r.points}</td>
-                    <td className="py-2 text-right text-white/60">
-                      {r.fastest_lap_ms ?? "—"}
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
+        <Leaderboard rows={leaderboardRows} sessionType={sessionType} />
       </Card>
 
       {/* Telemetry compare */}
@@ -214,6 +253,15 @@ export default async function RaceSessionPage({
           Select two drivers and a channel to compare their fastest lap.
         </p>
         <TelemetryCompare sessionId={session.id} drivers={drivers} />
+      </section>
+
+      {/* Corner performance — team-vs-team */}
+      <section>
+        <h3 className="mb-1 text-base font-semibold">Corner Performance</h3>
+        <p className="mb-3 text-sm text-white/50">
+          Compare how two teams&apos; cars perform through slow, medium, and high-speed corners.
+        </p>
+        <CornerPerformance sessionId={session.id} teams={teams} />
       </section>
 
       {/* Analytics sections (gated by Visible Charts toggles) */}

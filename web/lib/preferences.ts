@@ -9,12 +9,18 @@ export const AI_MODE_STORAGE_KEY = "dna_ai_mode";
 const AI_MODE_EVENT = "dna_ai_mode_change";
 const CHARTS_EVENT = "dna_charts_change";
 
+// Exported so SessionTypeSync can dispatch the same event.
+export const CHARTS_CHANGE_EVENT = CHARTS_EVENT;
+export const SESSION_TYPE_EVENT = "dna_session_type_change";
+export const SESSION_TYPE_STORAGE_KEY = "dna_session_type";
+
 export const CHART_LABELS = [
   "Rolling pace",
   "Gap to leader",
   "Undercuts",
   "Tyre degradation",
   "Telemetry compare",
+  "Corner performance",
 ] as const;
 
 export type ChartLabel = (typeof CHART_LABELS)[number];
@@ -26,6 +32,18 @@ const DEFAULT_VISIBLE: VisibleCharts = {
   Undercuts: true,
   "Tyre degradation": true,
   "Telemetry compare": true,
+  "Corner performance": true,
+};
+
+// Charts available per session type.  Sessions not listed here default to all charts.
+export const CHARTS_FOR_SESSION: Record<string, ChartLabel[]> = {
+  R:   [...CHART_LABELS],
+  S:   [...CHART_LABELS],
+  FP1: ["Tyre degradation", "Telemetry compare", "Corner performance"],
+  FP2: ["Tyre degradation", "Telemetry compare", "Corner performance"],
+  FP3: ["Tyre degradation", "Telemetry compare", "Corner performance"],
+  Q:   ["Telemetry compare", "Corner performance"],
+  SQ:  ["Telemetry compare", "Corner performance"],
 };
 
 export type AIMode = "Concise" | "Detailed" | "Critique loop";
@@ -34,7 +52,14 @@ const DEFAULT_AI_MODE: AIMode = "Detailed";
 function readLS<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);
-    return raw ? (JSON.parse(raw) as T) : fallback;
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as T;
+    // For plain objects, merge so new keys always get their default value
+    // even when an older stored object predates them.
+    if (typeof fallback === "object" && fallback !== null && typeof parsed === "object" && parsed !== null) {
+      return { ...fallback, ...parsed } as T;
+    }
+    return parsed;
   } catch {
     return fallback;
   }
