@@ -3,9 +3,9 @@
 -- first so re-running is safe.
 --
 -- Shape:
---   10 seasons (2015..2024)        — exercises ix_driver_stats_season_points
+--   12 seasons (2015..2026)        — exercises ix_driver_stats_season_points
 --   1 circuit                       — Monaco
---   220 events                      — 22 events per season for all 10 seasons
+--   264 events                      — 22 events per season for all 12 seasons
 --                                     (full history is what makes ix_events_start_date pay off)
 --   72 sessions                     — Q + S + R per recent-2-seasons event (24 events)
 --                                     historical seasons have events but no sessions —
@@ -26,9 +26,9 @@ BEGIN;
 TRUNCATE driver_stats, lap_times, race_results, session_drivers, sessions,
          events, drivers, teams, circuits, seasons RESTART IDENTITY CASCADE;
 
--- seasons 2015..2024
+-- seasons 2015..2026
 INSERT INTO seasons (year)
-SELECT y FROM generate_series(2015, 2024) AS y;
+SELECT y FROM generate_series(2015, 2026) AS y;
 
 -- one circuit
 INSERT INTO circuits (id, name, country, length_km)
@@ -70,7 +70,7 @@ INSERT INTO drivers (id, code, full_name, nationality, current_team_id) VALUES
   (19, 'MAG', 'Kevin Magnussen',    'DK', 10),
   (20, 'HUL', 'Nico Hulkenberg',    'DE', 10);
 
--- events: 22 events per season across all 10 seasons = 220 events.
+-- events: 22 events per season across all 12 seasons = 264 events.
 -- Historical breadth is what makes ix_events_start_date pay off.
 INSERT INTO events (season_id, circuit_id, round, name, start_date)
 SELECT s.id, 1, r AS round,
@@ -91,7 +91,7 @@ FROM events e
 JOIN seasons s ON s.id = e.season_id
 CROSS JOIN (VALUES ('Q', 1, 0), ('S', 2, 1), ('R', 3, 2))
         AS t(type, day_offset, k)
-WHERE s.year IN (2023, 2024) AND e.round <= 12;
+WHERE s.year IN (2025, 2026) AND e.round <= 12;
 
 -- session_drivers: every driver in every session
 INSERT INTO session_drivers (session_id, driver_id, team_id, car_number)
@@ -138,7 +138,7 @@ FROM sessions s
 CROSS JOIN drivers d
 CROSS JOIN generate_series(1, 70) AS lap_n;
 
--- driver_stats: aggregate across seasons 2015..2024 (10 × 20 = 200 rows)
+-- driver_stats: aggregate across seasons 2015..2026 (12 × 20 = 240 rows)
 INSERT INTO driver_stats (driver_id, season_id, wins, podiums, poles, dnfs, points, avg_finish)
 SELECT d.id, sn.id,
        ((d.id * 7) % 11)                                     AS wins,

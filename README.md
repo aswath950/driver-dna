@@ -1,9 +1,11 @@
 # Driver DNA — F1 Telemetry Platform
 
-> A full-stack F1 analytics platform — ML driver identification, five distinct
-> agentic-AI features, REST + GraphQL backend over normalised Postgres,
-> Next.js 14 client, and a legacy Streamlit dashboard. Built as a
-> generalist-engineer portfolio piece.
+> A full-stack F1 analytics platform built end-to-end by one engineer:
+> async Python backend (REST + GraphQL over Postgres), Next.js 14 client,
+> five distinct agentic-AI patterns, XGBoost driver classifier with SHAP
+> explainability, idempotent ETL, Postgres-backed telemetry cache, and
+> three CI workflows. Built as a portfolio piece to showcase
+> generalist-SDE + agentic-AI breadth in one shippable codebase.
 
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)
@@ -12,7 +14,7 @@
 ![Postgres](https://img.shields.io/badge/Postgres-16-336791?logo=postgresql&logoColor=white)
 ![OpenAI](https://img.shields.io/badge/OpenAI-gpt--4o--mini-412991?logo=openai&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)
-![CI](https://img.shields.io/badge/GitHub_Actions-3_workflows-2088FF?logo=githubactions&logoColor=white)
+![CI](https://img.shields.io/badge/GitHub_Actions-5_workflows-2088FF?logo=githubactions&logoColor=white)
 
 **What's in the box**
 
@@ -25,27 +27,234 @@
 3. **Frontend** — Next.js 14 App Router web client (RSC, Plotly, SSE chat)
    **plus** the legacy Streamlit dashboard — both served by the same `src/`
    Python library.
+4. **Telemetry cache** — Raw car telemetry stored per-lap in Postgres (columnar
+   JSONB), served from DB on repeat requests — **28× faster** compare loads vs.
+   live OpenF1 calls.
 
 ---
 
 ## At a glance
 
-- **5** alembic migrations · **13** application tables · **17** indexes (9
+- **8** alembic migrations · **14** application tables · **18** indexes (10
   query-path + 8 unique-constraint) — with measured query plans in
   [backend/docs/query_plans.md](backend/docs/query_plans.md)
-- **23** production REST endpoints under `/api/v1`
-  — 9 reads · 5 analytics · 5 AI · 4 me/session
+- **35** production REST endpoints under `/api/v1`
+  — 10 reads · 9 analytics · 5 AI · 4 me · 7 pipeline
 - **GraphQL** schema with 12 query fields + 9 object types + 2 enums + per-request DataLoaders
 - **5 agentic-AI patterns** — Reflexion · RAG · Structured Output ·
   Single-shot XAI · SSE-streamed ReAct
-- **282 tests** — 119 backend (modern stack) + 163 legacy (`src/` + Streamlit)
-- **3 GitHub Actions** workflows (legacy CI · backend CI · web CI)
+- **311 tests** — 148 backend (modern stack) + 163 legacy (`src/` + Streamlit)
+- **5 GitHub Actions** workflows (legacy CI · backend CI · web CI ·
+  Docker build → GHCR · LLM eval with PR comment)
 - **4 documented deploy paths** — local dev · Vercel+Railway · self-host VPS · Streamlit Cloud
 
-**Live demo:** _(set to your Vercel URL after deploy)_
+**Live demo:** _(URL available after deploy)_
 
-**Quick links:** [Architecture](#architecture) · [Feature tour](#feature-tour) ·
+**Quick links:** [Skills demonstrated](#skills-demonstrated) ·
+[Architecture](#architecture) · [Feature tour](#feature-tour) ·
 [Get Started](#get-started) · [Deployment](#deployment) · [Testing](#testing)
+
+---
+
+## Skills demonstrated
+
+A reading guide for reviewers — where each engineering competency lives
+in the code. Every claim links to the file that proves it.
+
+### Backend engineering — Python, async, API design
+
+- **Async Python end-to-end** — FastAPI 0.115 + SQLAlchemy 2.0 async +
+  asyncpg; no sync escape hatches in the request path —
+  [backend/app/main.py](backend/app/main.py),
+  [backend/app/db/session.py](backend/app/db/session.py)
+- **REST contract design** — RFC 7807 `application/problem+json` error
+  envelope, opaque base64url cursor pagination, `X-Request-ID` tracing,
+  `API-Version` header, OpenAPI 3.1 spec —
+  [backend/app/core/errors.py](backend/app/core/errors.py) ·
+  [pagination.py](backend/app/core/pagination.py) ·
+  [middleware.py](backend/app/core/middleware.py)
+- **GraphQL co-existing with REST** — Strawberry on the same FastAPI
+  app; per-request DataLoaders prevent N+1; both surfaces reuse one
+  repository layer (zero duplicate SQL) — [backend/app/graphql/](backend/app/graphql/) ·
+  [backend/app/db/repositories/](backend/app/db/repositories/)
+- **Domain-driven layout** — routers (HTTP) → schemas (Pydantic) →
+  services (business logic) → repositories (SQL) — each layer mockable
+  in isolation
+- **Shared Python library across three frontends** — Streamlit,
+  FastAPI, and MCP server import the same `src/` modules; one bugfix
+  benefits all — [backend/app/__init__.py](backend/app/__init__.py)
+  wires `sys.path` centrally
+
+### Database engineering — Postgres, modelling, performance
+
+- **3NF schema** — 12 application tables + 2 audit tables, 3 ENUM
+  types, 18 indexes (10 query-path + 8 unique-constraint), pgcrypto
+  UUID defaults; JSONB used for telemetry samples, saved-analysis
+  payloads, and circuit corner geometry —
+  [backend/app/db/models.py](backend/app/db/models.py)
+- **Index strategy designed from `EXPLAIN`** — a **partial** index on
+  the pit-lap predicate (`WHERE is_pit_in OR is_pit_out`); a covering
+  composite index on leaderboard ordering — captured before/after
+  query plans in [backend/docs/query_plans.md](backend/docs/query_plans.md)
+- **CI-enforced query plans** — a pytest sweep parses
+  `EXPLAIN (FORMAT JSON)` and **asserts** every hot query uses an
+  `Index Scan`; a future migration that drops an index fails CI —
+  [backend/tests/test_query_plans.py](backend/tests/test_query_plans.py)
+- **8 reversible Alembic migrations** — every migration must apply on
+  a fresh Postgres service container in CI; ENUM duplication trap
+  documented in the migration runbook — [backend/alembic/versions/](backend/alembic/versions/)
+- **JSONB for columnar telemetry** — parallel sample arrays
+  (`speed[]`, `throttle[]`, …) reconstructed into a DataFrame in one
+  read; 28× faster than re-fetching OpenF1 —
+  [backend/app/services/telemetry_compute.py](backend/app/services/telemetry_compute.py)
+
+### Frontend engineering — TypeScript, React, streaming
+
+- **Next.js 14 App Router** — RSC-first for SEO and low-JS landing
+  pages; client islands only where they earn it (Plotly, SSE chat) —
+  [web/app/](web/app/)
+- **Strongly typed end-to-end** — TypeScript `strict: true`; types
+  generated from `/openapi.json` via `openapi-typescript`; `tsc
+  --noEmit` enforced in CI — [web/lib/api-types.ts](web/lib/api-types.ts)
+- **Streaming UI** — native `fetch` `ReadableStream` consumes
+  SSE-framed events (`token`, `tool_call`, `tool_result`, `done`,
+  `error`); tool decisions and tokens render live —
+  [web/components/chat/RaceChatStream.tsx](web/components/chat/RaceChatStream.tsx)
+- **Anonymous-session cookie forwarding** — RSC server fetches
+  propagate `dna_sid` so server-rendered pages still attribute to the
+  visitor's session — [web/lib/api.ts](web/lib/api.ts)
+- **Bundle discipline** — Plotly (~3 MB) lazy-loaded via
+  `next/dynamic` with `ssr: false`; landing ships under 90 kB JS
+
+### Agentic AI — five distinct patterns, observable, evaluated
+
+- **Five LLM patterns shipped** — Reflexion (analyst → critic →
+  conditional revise) · RAG without a vector DB · Structured Output
+  (JSON-mode + schema validate) · single-shot XAI narration · ReAct
+  with SSE tool-use streaming —
+  [backend/app/llm/services.py](backend/app/llm/services.py) ·
+  [backend/app/llm/race_chat.py](backend/app/llm/race_chat.py)
+- **Tool-use ReAct loop** — `MAX_ROUNDS=3 × MAX_TOOLS_PER_ROUND=3`,
+  schema-validated tool args, streamed back over SSE event types
+  `token`/`tool_call`/`tool_result`/`done`/`error` —
+  [backend/app/llm/sse.py](backend/app/llm/sse.py)
+- **LLM observability + cost tracking** — every call writes one
+  `llm_audit` row with input/output tokens, latency, USD cost
+  (gpt-4o-mini price table applied at insert), feature name, and the
+  originating `user_session_id` — [backend/app/llm/audit.py](backend/app/llm/audit.py)
+- **Offline evaluation framework** — RAG self-match rate (100%),
+  retrieval margin (0.0091), Report-Card schema compliance, per-
+  feature token/cost dashboard — [src/eval_llm.py](src/eval_llm.py),
+  CI workflow [.github/workflows/eval.yml](.github/workflows/eval.yml)
+- **MCP server** — 4 stdio tools (`list_sessions`, `list_drivers`,
+  `get_fastest_lap_data`, `get_channel_comparison`) exposed to any
+  MCP-compatible host (Claude Desktop, MCP Inspector) — [mcp/server.py](mcp/server.py)
+- **Per-session rate limiting on AI endpoints** to bound spend on
+  shared demos
+
+### ML engineering
+
+- **XGBoost driver classifier** with telemetry-derived features
+  (rolling pace, sector deltas, braking points) —
+  [src/model.py](src/model.py) · [src/features.py](src/features.py)
+- **SHAP explainability** narrated by the XAI LLM into plain English
+  with the top-3 contributing features per prediction
+- **5-fold stratified CV** with metrics persisted to
+  `models/metrics.json` and served via `GET /api/v1/pipeline/model-metrics`
+- **Reproducible pipeline** — `python src/pipeline.py` regenerates
+  features from a FastF1 cache; `python src/model.py` retrains; the
+  Pipeline admin page triggers training over SSE with live logs
+
+### Performance & caching
+
+- **Postgres-backed telemetry cache** — 28× speedup vs. live OpenF1
+  (~50 ms cached vs. ~1 400 ms live); write-through on cache miss;
+  proactive pre-warm via SSE-streamed CLI or admin page —
+  [backend/app/services/telemetry_compute.py](backend/app/services/telemetry_compute.py)
+- **N+1 regression guard** — SQLAlchemy `before_cursor_execute` event
+  listener counts SELECTs per request; CI fails if a nested GraphQL
+  query over 20 rows exceeds 10 SQL statements —
+  [backend/tests/graphql/test_schema.py](backend/tests/graphql/test_schema.py)
+- **Cursor pagination over offset** — stable order, no
+  `OFFSET 1_000_000` slowdowns at scale
+
+### Testing strategy
+
+- **311 tests across two suites** — 148 backend (pytest 8) + 163
+  legacy (`src/` + Streamlit); both required to pass before merge
+- **Mocking without flakes** — OpenAI is mocked via a queue-fake
+  fixture (tests enqueue canned responses including streaming
+  chunks); OpenF1 is mocked via `responses` — zero network in tests
+- **Per-test `NullPool` engine override** — solves the "Event loop is
+  closed" pool-reuse bug that breaks naïve async FastAPI tests —
+  [backend/tests/api/conftest.py](backend/tests/api/conftest.py)
+- **Contract tests** — RFC 7807 envelope shape, cursor round-trip
+  + 100-int walk, OpenAPI 3.1 conformance asserted in CI —
+  [backend/tests/test_contracts.py](backend/tests/test_contracts.py) ·
+  [test_openapi.py](backend/tests/test_openapi.py)
+- **Idempotency proven** — `test_hydrate_is_idempotent` runs the ETL
+  twice and asserts identical row counts and contents
+
+### DevOps & CI
+
+- **Five GitHub Actions workflows**, each path-filtered or
+  event-scoped — legacy [ci.yml](.github/workflows/ci.yml),
+  [backend-ci.yml](.github/workflows/backend-ci.yml),
+  [web-ci.yml](.github/workflows/web-ci.yml),
+  [docker.yml](.github/workflows/docker.yml),
+  [eval.yml](.github/workflows/eval.yml)
+- **Postgres service container in CI** — `alembic upgrade head` must
+  succeed on a fresh DB on every push
+- **OpenAPI snapshot gate** — CI asserts
+  `openapi.json["openapi"].startswith("3.1")` so we never silently
+  regress to 3.0
+- **Multi-stage Docker build**, image published to GHCR on `main` —
+  [Dockerfile](Dockerfile) · [.github/workflows/docker.yml](.github/workflows/docker.yml)
+- **Four documented deploy paths** — Vercel+Railway (recommended),
+  self-host VPS w/ Caddy + Let's Encrypt, Streamlit Cloud, local
+
+### Observability
+
+- **Structured JSON logging** via `structlog`; every HTTP request
+  emits one line with method, path, status, latency, and a bound
+  `request_id` contextvar
+- **End-to-end request tracing** — the same `request_id` appears in
+  the log line, the `X-Request-ID` response header, and the RFC 7807
+  error envelope — copy-paste from a user-visible error directly into
+  log search
+- **Cost dashboard in SQL** — `llm_audit` is queryable for daily
+  per-feature spend in one `GROUP BY`
+
+### Security
+
+- **Anonymous-session layer** — UUID cookie issued on first hit,
+  `HttpOnly`, `SameSite=Lax` locally / `None; Secure` in prod; no
+  sign-up, no PII collected — [backend/app/core/sessions.py](backend/app/core/sessions.py)
+- **Ownership checks on writes** — saved analyses delete-by-id only
+  succeeds if the cookie matches the row's `user_session_id`
+- **Parameterised SQL throughout** — SQLAlchemy ORM/core only; no
+  string interpolation in queries
+- **OAuth 2.0 with least-privilege scope** — Google Drive sync uses
+  `drive.file` (per-file access only), not `drive` (full access)
+- **Bounded LLM blast radius** — per-session rate limit; row cap of
+  100 saved analyses returns 409 Conflict; ReAct loop hard-capped at
+  3 rounds × 3 tools
+
+### Engineering judgement & architecture
+
+- **REST and GraphQL on one stack, deliberately** — REST for the
+  TypeScript client and integrators (stable, versioned), GraphQL for
+  graph-shaped queries (event → sessions → results → drivers in one
+  trip); both reuse one repo layer
+- **Cursor pagination, not offset** — opaque base64url payload encodes
+  `{"k": <sort_key>, "id": <pk>}` so clients never construct cursors,
+  only echo what the server returned
+- **Shared `src/` library** is consciously preserved instead of
+  duplicated — every frontend benefits from one bugfix; the cost is
+  a single `sys.path` shim documented in `app/__init__.py`
+- **Honest roadmap** — known gaps (GraphQL `me` mutations, Playwright
+  smoke tests, Redis rate limiter, GraphQL subscriptions) listed in
+  the README rather than papered over
 
 ---
 
@@ -59,7 +268,7 @@ Three views: system, request lifecycle, and entity-relationship.
 flowchart LR
     User([Browser]) -->|HTTPS| Vercel["Next.js 14<br/>App Router · RSC + Plotly"]
     Vercel -->|REST /api/v1<br/>GraphQL /graphql<br/>SSE chat stream| Railway["FastAPI<br/>+ Strawberry GraphQL"]
-    Railway -->|asyncpg| PG[("Postgres 16<br/>13 tables · 17 indexes")]
+    Railway -->|asyncpg| PG[("Postgres 16<br/>14 tables · 18 indexes")]
     Railway -->|OpenAI SDK| OAI[OpenAI<br/>gpt-4o-mini]
     Railway -->|requests| OF1[OpenF1 REST]
 
@@ -99,7 +308,9 @@ erDiagram
     SESSIONS ||--o{ SESSION_DRIVERS : roster
     SESSIONS ||--o{ RACE_RESULTS : produces
     SESSIONS ||--o{ LAP_TIMES : produces
+    SESSIONS ||--o{ CAR_TELEMETRY : caches
     DRIVERS ||--o{ SESSION_DRIVERS : entered
+    DRIVERS ||--o{ CAR_TELEMETRY : has
     TEAMS   ||--o{ SESSION_DRIVERS : fielded
     DRIVERS ||--o{ DRIVER_STATS : aggregates
     SEASONS ||--o{ DRIVER_STATS : aggregates
@@ -137,7 +348,7 @@ they only echo what the server returned. See
 |---|---|---|
 | **Frontend** | Next.js 14 App Router · React 18 · Tailwind · Plotly.js · TypeScript strict | RSC for SEO + low-JS landing pages; Plotly for visual parity with Streamlit; types generated from `/openapi.json` |
 | **Backend** | FastAPI 0.115 · Strawberry GraphQL · SQLAlchemy 2.0 async · Alembic · Pydantic v2 · structlog | Async stack throughout; OpenAPI 3.1 out-of-the-box; one factory in [app/main.py](backend/app/main.py) wires every middleware |
-| **Data** | Postgres 16 · asyncpg / psycopg · pgcrypto | Normalised 3NF schema; UUID via `gen_random_uuid()`; JSONB for saved-analysis payloads |
+| **Data** | Postgres 16 · asyncpg / psycopg · pgcrypto · JSONB | Normalised 3NF schema; UUID via `gen_random_uuid()`; JSONB for saved-analysis payloads and columnar telemetry cache |
 | **AI / ML** | OpenAI (gpt-4o-mini) · XGBoost · SHAP · scikit-learn · pandas · numpy | Reused legacy ML stack; backend wraps a single sync OpenAI helper in [app/llm/openai_client.py](backend/app/llm/openai_client.py) |
 | **External** | OpenF1 REST · FastF1 cache · Google Drive API v3 (OAuth 2.0) | Telemetry sources; legacy artifact persistence |
 | **Ops** | Docker · docker-compose · Railway (backend + Postgres) · Vercel (web) · GitHub Actions · pytest 8 · ruff · mypy | Two free-tier cloud services + GH-hosted CI |
@@ -157,16 +368,21 @@ driver-dna/
 │   │   │                          sessions (cookie middleware)
 │   │   ├── api/v1/                REST routers + Pydantic schemas
 │   │   │   ├── routers/           seasons, events, sessions, drivers, standings,
-│   │   │   │                      analytics, ai, me
+│   │   │   │                      analytics, ai, me, pipeline
 │   │   │   └── schemas/           One Pydantic file per resource
 │   │   ├── graphql/               Strawberry schema · resolvers · DataLoaders
-│   │   ├── db/                    SQLAlchemy 2.0 models · repositories (one file per aggregate)
-│   │   ├── etl/                   hydrate_session.py · refresh_driver_stats.py · CLI
-│   │   ├── services/              DB → DataFrame adapters for src/race_engine
+│   │   ├── db/                    SQLAlchemy 2.0 models · repositories
+│   │   │                          (laps · telemetry · sessions · drivers)
+│   │   ├── etl/                   hydrate_session.py · fetch_telemetry.py ·
+│   │   │                          seed_circuits.py · seed_circuit_corners.py ·
+│   │   │                          refresh_driver_stats.py · CLI (__main__.py)
+│   │   ├── services/              compare_service (cache-first) · telemetry_compute ·
+│   │   │                          corner_service (orchestration) · corner_compute (pure computation) ·
+│   │   │                          analytics_service
 │   │   └── llm/                   5 feature services · SSE race chat · audit
-│   ├── alembic/versions/          5 migrations
+│   ├── alembic/versions/          8 migrations
 │   ├── scripts/                   seed_demo.sql · hydrate_initial_data.sh
-│   ├── tests/                     119 tests across 11 files
+│   ├── tests/                     148 tests across 13 files
 │   ├── docs/query_plans.md        EXPLAIN ANALYZE output before/after indexes
 │   ├── Dockerfile · railway.json  Cloud deploy config
 │   └── pyproject.toml
@@ -177,14 +393,18 @@ driver-dna/
 │   │   ├── race/[sessionId]/              Leaderboard + tyre deg + SSE chat
 │   │   ├── radar/[sessionId]/             Driver compare (Plotly client island)
 │   │   ├── mystery-driver/                XAI explainer (client)
-│   │   └── pipeline/                      Link to legacy Streamlit
-│   ├── components/                charts/PlotlyChart · chat/RaceChatStream · ui/*
-│   ├── lib/                       api (RSC + cookies) · api-client (browser) · env
+│   │   └── pipeline/                      Pipeline admin (GP schedule dropdown · hydrate · telemetry fetch · train)
+│   ├── components/                charts/PlotlyChart · chat/RaceChatStream ·
+│   │                              race/TelemetryCompare · race/CornerPerformance ·
+│   │                              race/Leaderboard · race/SessionTypeSync ·
+│   │                              race/AnalyticsSections · ui/*
+│   ├── lib/                       api (RSC + cookies) · api-client (browser) ·
+│   │                              preferences (chart visibility + session-type gating) · env
 │   └── package.json
 ├── src/                           SHARED Python library — UNCHANGED, reused by all
 │   ├── race_engine.py             rolling pace · gap-to-leader · undercut · tyre deg
 │   ├── llm_layer.py               Streamlit-era 5 agentic patterns (still in use)
-│   ├── viz.py                     Plotly figure builders
+│   ├── viz.py                     Plotly figure builders (compare · track map · sector times)
 │   ├── openf1.py                  OpenF1 sync client (used by ETL + MCP)
 │   ├── model.py · pipeline.py     XGBoost classifier + telemetry features
 │   └── drive_sync.py              Google Drive OAuth/upload (Streamlit only)
@@ -202,7 +422,7 @@ driver-dna/
 
 ## Feature tour
 
-The seven things most worth pointing at.
+The nine things most worth pointing at.
 
 ### 1. REST API — `/api/v1`
 
@@ -219,24 +439,29 @@ Every endpoint inherits four contracts:
 - **Request tracing** — `X-Request-ID` is minted (or echoed) on every
   request and bound to a structlog contextvar.
 
-23 endpoints in production (4 sentinel `_ping*` routes excluded):
+35 endpoints in production (4 sentinel `_ping*` routes excluded):
 
 | Area | Method | Path | Returns |
 |---|---|---|---|
-| **Reads (9)** | GET | `/seasons` | `Page[SeasonOut]` |
+| **Reads (10)** | GET | `/seasons` | `Page[SeasonOut]` |
 | | GET | `/seasons/{year}/events` | `Page[EventOut]` |
 | | GET | `/events/{event_id}/sessions` | `list[SessionOut]` |
 | | GET | `/sessions/{session_id}` | `SessionOut` |
 | | GET | `/sessions/{session_id}/results` | `list[RaceResultOut]` (leaderboard) |
 | | GET | `/sessions/{session_id}/laps` | `Page[LapOut]` — filterable by driver/from-lap/to-lap |
+| | GET | `/sessions/{session_id}/teams` | `list[SessionTeamOut]` — teams participating in session |
 | | GET | `/drivers` | `Page[DriverOut]` — filterable by season/team |
 | | GET | `/drivers/{driver_id}/stats?season=` | `DriverStatsOut` |
 | | GET | `/standings?season=` | `list[StandingRowOut]` |
-| **Analytics (5)** | GET | `/sessions/{id}/analytics/rolling-pace?window=` | `list[RollingPaceRow]` |
+| **Analytics (9)** | GET | `/sessions/{id}/analytics/rolling-pace?window=` | `list[RollingPaceRow]` |
 | | GET | `/sessions/{id}/analytics/gap-to-leader` | `list[GapRow]` |
 | | GET | `/sessions/{id}/analytics/undercuts` | `list[UndercutEvent]` |
 | | GET | `/sessions/{id}/analytics/tyre-degradation` | `list[DegradationRow]` |
 | | GET | `/sessions/{id}/compare?driver_a&driver_b&channel=` | `ComparePayload` (Plotly JSON) |
+| | GET | `/sessions/{id}/compare/sectors?driver_a&driver_b` | `SectorTimesPayload` |
+| | GET | `/sessions/{id}/compare/track-map?driver_a&driver_b` | `TrackMapPayload` |
+| | GET | `/sessions/{id}/sector-times` | `SectorTimesPayload` (all drivers) |
+| | GET | `/sessions/{id}/corner-performance?team_a&team_b` | `CornerPerformancePayload` — slow/medium/high corner metrics + 3 Plotly figures |
 | **AI (5)** | POST | `/ai/style-analyst` | Reflexion narrative |
 | | POST | `/ai/dna-match` | RAG historical match |
 | | POST | `/ai/report-card` | Structured JSON report |
@@ -246,6 +471,13 @@ Every endpoint inherits four contracts:
 | | POST | `/me/saved-analyses` | Persist analysis (cap=100) |
 | | GET | `/me/saved-analyses` | `Page[SavedAnalysisOut]` |
 | | DELETE | `/me/saved-analyses/{id}` | 204 |
+| **Pipeline (7)** | GET | `/pipeline/stats` | Dataset row/driver/session counts |
+| | GET | `/pipeline/model-metrics` | Latest CV + train accuracy from `models/metrics.json` |
+| | GET | `/pipeline/gp-schedule?year=` | Grand Prix list for a year (live from OpenF1) |
+| | GET | `/pipeline/hydrate?year&gp&session=` | **SSE** — hydrate one or all sessions; `session` optional |
+| | GET | `/pipeline/fetch-telemetry?session_id=` | **SSE** — pre-download all car telemetry |
+| | GET | `/pipeline/telemetry-status?session_id=` | Cache timestamp or null |
+| | GET | `/pipeline/train` | **SSE** — run XGBoost model training |
 
 Live OpenAPI 3.1 spec served at `GET /openapi.json`; Swagger UI at
 `GET /docs`.
@@ -322,8 +554,8 @@ GraphiQL is served at `GET /graphql` when `ENV=local`.
 
 ### 3. Postgres schema
 
-11 application tables in 3NF + 2 audit tables, 3 ENUM types, 17 indexes
-(9 query-path + 8 unique-constraint), pgcrypto for UUID defaults.
+12 application tables in 3NF + 2 audit tables, 3 ENUM types, 18 indexes
+(10 query-path + 8 unique-constraint), pgcrypto for UUID defaults.
 
 **Migrations:**
 
@@ -334,6 +566,9 @@ GraphiQL is served at `GET /graphql` when `ENV=local`.
 | 0003 | [`0003_circuits_unique_name.py`](backend/alembic/versions/0003_circuits_unique_name.py) | UNIQUE on `circuits.name` (ETL upsert target) |
 | 0004 | [`0004_llm_audit.py`](backend/alembic/versions/0004_llm_audit.py) | `llm_audit` table + per-feature index |
 | 0005 | [`0005_user_sessions.py`](backend/alembic/versions/0005_user_sessions.py) | `user_sessions` + `saved_analyses` + FK on `llm_audit` + `analysis_kind` ENUM |
+| 0006 | [`0006_circuit_geometry.py`](backend/alembic/versions/0006_circuit_geometry.py) | `circuits.x` + `circuits.y` — JSONB coordinate arrays for track-map overlays |
+| 0007 | [`0007_car_telemetry.py`](backend/alembic/versions/0007_car_telemetry.py) | `car_telemetry` table (composite PK · JSONB samples · lap cache) + `sessions.telemetry_fetched_at` |
+| 0008 | [`0008_circuit_corners.py`](backend/alembic/versions/0008_circuit_corners.py) | `circuits.corners` JSONB + `circuits.length_km` — authoritative FastF1 turn positions (distance from S/F line) used for corner-performance analysis |
 
 **Indexed query-plan baseline** — captured before and after each
 migration, see [backend/docs/query_plans.md](backend/docs/query_plans.md).
@@ -432,25 +667,28 @@ endpoint's request/response typed).
 |---|---|---|---|
 | `/` | RSC | `/seasons` + `/events` | none |
 | `/event/[eventId]` | RSC | `/sessions` | none |
-| `/race/[sessionId]` | RSC + island | `/results` + `/tyre-degradation` | `RaceChatStream` (SSE) |
-| `/radar/[sessionId]` | RSC + island | `/results` | `CompareIsland` + `PlotlyChart` |
+| `/race/[sessionId]` | RSC + island | `/results` + `/tyre-degradation` + `/teams` | `Leaderboard` (session-type-aware columns) · `RaceChatStream` (SSE) · `TelemetryCompare` · `CornerPerformance` · `SessionTypeSync` (chart gating) |
+| `/radar/[sessionId]` | RSC + island | `/results` | `TelemetryCompare` + `PlotlyChart` |
 | `/mystery-driver` | client only | `POST /ai/xai-explain` | full page |
-| `/pipeline` | static | — | link to Streamlit |
+| `/pipeline` | client | `GET /pipeline/stats` · `GET /pipeline/gp-schedule` | GP dropdown (live OpenF1) · hydrate · fetch-telemetry · train (SSE) |
 
 Plotly (~3 MB minified) is lazy-loaded via `next/dynamic` with
 `ssr: false` — the landing page ships under 90 kB of JS.
 
 ### 6. ETL pipeline
 
-One CLI, two subcommands, true-idempotent upserts inside a single
+One CLI, **six subcommands**, true-idempotent upserts inside a single
 transaction. The OpenF1 client is reused verbatim from `src/openf1.py`
 — no re-implementation.
 
 ```bash
-# Hydrate one session
+# Hydrate one session (lap times, results, session drivers)
 python -m app.etl hydrate --year 2024 --gp "Monaco Grand Prix" --session R
 
-# Hydrate every session in a weekend
+# Session types: R · Q · FP1 · FP2 · FP3 · S (Sprint) · SQ (Sprint Qualifying)
+python -m app.etl hydrate --year 2024 --gp "Chinese Grand Prix" --session S
+
+# Hydrate every session in a weekend (omit --session)
 python -m app.etl hydrate --year 2024 --gp "Monaco Grand Prix"
 
 # Dry-run (rollback before commit)
@@ -458,6 +696,18 @@ python -m app.etl hydrate --year 2024 --gp "Monaco Grand Prix" --dry-run
 
 # Recompute driver_stats aggregates for a season
 python -m app.etl refresh-stats --season 2024
+
+# Seed circuit track-map geometry (x/y coordinate arrays) from data/circuits.json
+python -m app.etl seed-circuits
+python -m app.etl seed-circuits --path /custom/path/circuits.json  # optional override
+
+# Seed authoritative corner positions (FastF1 turn numbers + distance from S/F line)
+# Required for the corner-performance feature; run once after seeding circuits
+python -m app.etl seed-circuit-corners            # uses 2024 season by default
+python -m app.etl seed-circuit-corners --year 2023
+
+# Pre-download and cache all car telemetry for a session
+python -m app.etl fetch-telemetry --session-id 73
 ```
 
 Real output from a Monaco 2024 hydrate:
@@ -481,7 +731,133 @@ For initial prod seeding, use
 [backend/scripts/hydrate_initial_data.sh](backend/scripts/hydrate_initial_data.sh)
 — hydrates 5 representative race weekends + refreshes stats.
 
-### 7. Anonymous-session layer
+### 7. Corner performance — team-vs-team analysis
+
+The `/race/[sessionId]` page includes a **Corner Performance** section that
+answers: "How does Team A's car handle slow, medium, and high-speed corners
+compared to Team B?"
+
+**How it works end-to-end:**
+
+1. **Authoritative corner positions** — `python -m app.etl seed-circuit-corners`
+   calls FastF1's `session.get_circuit_info()` (metadata-only load, no
+   telemetry) and stores each turn's `{number, letter, distance_m}` in
+   `circuits.corners` (JSONB). Distance from the Start/Finish line is the
+   key: it maps directly onto the 200-point telemetry distance grid.
+
+2. **Corner classification** — corners are tagged slow / medium / high based
+   on the reference driver's apex speed (< 100 km/h · 100–180 · > 180).
+   Falls back to speed-minima detection for unseeded circuits.
+
+3. **Per-driver metrics** — for each corner: minimum speed through the apex
+   (`v_min`), exit speed (halfway between apex and exit), throttle-open
+   fraction, and brake-point fraction. Extracted from the cached 200-pt
+   telemetry arrays — zero extra OpenF1 calls.
+
+4. **Team aggregation** — with two drivers per team, metrics are median-
+   aggregated. Single-driver teams work too (warning logged, no error).
+
+5. **Three Plotly figures** returned in one API call:
+   - **Track map** — circuit outline with apex markers coloured by whichever
+     team is faster at that corner; size proportional to speed delta
+   - **Per-corner** — stat cards with team-colour tints; faster team gets a
+     subtle background hue
+   - **Summary** — `DeltaPill` stat cards grouped by corner class
+
+**Session-type-aware chart gating.** `SessionTypeSync` (a zero-render RSC
+client component) fires a `dna_session_type_change` custom event on mount.
+`SidebarClient` listens and filters the toggle list to only the charts
+relevant for the current session type — e.g. qualifying sessions show only
+Telemetry compare and Corner performance; practice sessions also include
+Tyre degradation. Disallowed charts are unchecked in localStorage before
+being hidden so they don't persist as checked into future sessions.
+
+| Session type | Available charts |
+|---|---|
+| Race (R) · Sprint (S) | All six |
+| Practice (FP1/FP2/FP3) | Tyre degradation · Telemetry compare · Corner performance |
+| Qualifying (Q · SQ) | Telemetry compare · Corner performance |
+
+Pure computation lives in
+[backend/app/services/corner_compute.py](backend/app/services/corner_compute.py);
+DB orchestration in
+[backend/app/services/corner_service.py](backend/app/services/corner_service.py);
+UI in [web/components/race/CornerPerformance.tsx](web/components/race/CornerPerformance.tsx).
+
+### 8. Telemetry caching — Postgres-backed compare
+
+Every compare chart (Speed, Throttle, Brake, RPM, DRS, Time-Delta,
+Sector Times, Track Map) needs the fastest lap's raw car-data samples for
+two drivers. Without a cache, each request triggers three live OpenF1 HTTP
+calls: one `get_laps()` to identify the fastest lap, then one
+`get_car_data()` per driver — 1–2 s of network latency on every page load.
+
+The fix: store the raw high-frequency telemetry samples
+(`date, speed, throttle, brake, rpm, n_gear, drs`) per lap per driver in
+Postgres on first download. Subsequent requests read from the DB and skip
+OpenF1 entirely.
+
+**Storage shape** — `car_telemetry` table:
+
+```
+car_telemetry
+  session_id   INTEGER  PK (FK → sessions)
+  driver_id    INTEGER  PK (FK → drivers)
+  lap_number   SMALLINT PK
+  lap_duration FLOAT    (seconds)
+  samples      JSONB    — columnar parallel arrays (see below)
+  fetched_at   TIMESTAMPTZ DEFAULT NOW()
+  INDEX idx_car_telemetry_session (session_id)
+```
+
+`samples` stores parallel arrays — one entry per telemetry sample —
+reconstructed into a DataFrame in a single call:
+
+```json
+{
+  "dates":    ["2024-05-26T15:00:00.027Z", ...],
+  "speed":    [152.3, 154.1, ...],
+  "throttle": [100, 98, ...],
+  "brake":    [0, 0, ...],
+  "rpm":      [11400, 11500, ...],
+  "n_gear":   [6, 6, ...],
+  "drs":      [1, 1, ...]
+}
+```
+
+**Cache-first request path** (zero OpenF1 calls on a cache hit):
+
+```
+compare request arrives
+        │
+        ├─ fastest lap? ──► LapTime DB table (no OpenF1)
+        │
+        ├─ cache hit? ──────► reconstruct DataFrame from JSONB ──► respond (~50 ms)
+        │
+        └─ cache miss ──────► get_car_data() from OpenF1
+                              └─ write-through to car_telemetry ──► respond (~1.4 s)
+                                                        ↑ next request: cache hit
+```
+
+**Proactive warm-up** — the Pipeline admin page lets operators
+pre-download an entire session (21 API calls: 1 `get_laps` + 20
+`get_car_data`, one per driver) before any user opens the compare view.
+An SSE log stream shows per-driver progress in real time:
+
+```bash
+python -m app.etl fetch-telemetry --session-id 73
+# → [1/20] HAM (driver_id=4) — 847 samples across 77 laps
+# → [2/20] VER (driver_id=1) — 902 samples across 78 laps
+# → ...
+# → [done] 20 drivers · 1547 laps stored
+```
+
+**Measured result:** compare endpoint latency ~50 ms (cached) vs ~1 400 ms
+(live OpenF1) — **28× speedup** on repeat loads. A `telemetry_fetched_at`
+timestamp on the `sessions` row drives a non-blocking info banner in the
+UI when telemetry hasn't been pre-warmed yet.
+
+### 9. Anonymous-session layer
 
 No auth, no sign-up. Every browser gets a UUID cookie on first hit;
 saved analyses + LLM audit rows attribute back to it.
@@ -564,7 +940,11 @@ make db              # docker compose up -d postgres pgadmin (:5432 + :5050)
 make backend-install # python -m venv backend/.venv && pip install -e backend[dev]
 make backend         # uvicorn dev server on :8000
 make backend-test    # full pytest suite
-make migrate         # alembic upgrade head
+make migrate         # alembic upgrade head + seed circuit corners (YEAR=2024 optional)
+make seed-circuits   # upsert circuit x/y geometry from data/circuits.json
+make seed-corners    # seed FastF1 corner data (YEAR=2024 optional)
+make refresh-stats SEASON=2024          # recompute driver_stats aggregates
+make fetch-telemetry SESSION_ID=73      # pre-warm telemetry cache for a session
 make hydrate YEAR=2024 GP='Monaco Grand Prix' SESSION=R
 make web-install     # pnpm install in web/
 make web             # next dev on :3000
@@ -607,12 +987,17 @@ curl -s 'localhost:8000/api/v1/standings?season=2024' | jq '.[0].driver.code'
 
 # 5. Cookie issued?
 curl -is localhost:8000/api/v1/me | grep -i set-cookie        # dna_sid=...
+
+# 6. Telemetry cache status?
+curl -s 'localhost:8000/api/v1/pipeline/telemetry-status?session_id=73'
+# {"session_id":73,"fetched_at":"2024-05-26T15:00:00Z"} or {"fetched_at":null}
 ```
 
 Then in the browser:
 
 - <http://localhost:3000> — landing should list event cards
 - <http://localhost:3000/race/1> — leaderboard renders + chat input visible
+- <http://localhost:3000/pipeline> — Pipeline admin: hydrate, fetch telemetry, train
 - <http://localhost:8000/docs> — Swagger UI for every endpoint
 - <http://localhost:8000/graphql> — GraphiQL (local only)
 - <http://localhost:5050> — pgAdmin (login: `admin@example.com` / `admin`; add server with host `postgres`, port `5432`, user/pass `dna`)
@@ -670,7 +1055,13 @@ The recommended portfolio setup. Free tiers cover small demo traffic.
    railway run bash backend/scripts/hydrate_initial_data.sh
    ```
 
-6. **(Optional) Schedule the stats refresh.** Add a Railway cron service:
+6. **(Optional) Pre-warm telemetry cache** for faster compare loads:
+   ```bash
+   railway run python -m app.etl fetch-telemetry --session-id 73
+   ```
+   Or use the Pipeline admin page at `/pipeline` after deploy.
+
+7. **(Optional) Schedule the stats refresh.** Add a Railway cron service:
    ```
    schedule: 0 4 * * 1            # weekly Monday 04:00 UTC
    command:  python -m app.etl refresh-stats --season 2024
@@ -821,13 +1212,15 @@ generation, model training) live in
 
 ## CI / quality bar
 
-Three GitHub Actions workflows, each path-filtered to its area.
+Five GitHub Actions workflows, each path-filtered or event-scoped.
 
 | Workflow | Triggers on changes to | Steps | Typical duration |
 |---|---|---|---|
 | [`ci.yml`](.github/workflows/ci.yml) | `src/**`, `tests/**` | ruff · mypy · pytest · LLM eval · docker build → GHCR | ~4 min |
 | [`backend-ci.yml`](.github/workflows/backend-ci.yml) | `backend/**`, `src/**` | Postgres service container · ruff · `alembic upgrade head` · pytest with coverage · OpenAPI 3.1 snapshot assertion | ~3 min |
 | [`web-ci.yml`](.github/workflows/web-ci.yml) | `web/**` | `npm ci` · `tsc --noEmit` · `next lint` · `next build` | ~2 min |
+| [`docker.yml`](.github/workflows/docker.yml) | push to `main` | multi-stage Docker build · publish to GHCR with `latest` + SHA tags | ~3 min |
+| [`eval.yml`](.github/workflows/eval.yml) | push to `main` + PRs | offline LLM evals (RAG self-match + retrieval margin + cost dashboard) · uploads `eval_*.json` artifacts · posts summary as PR comment | ~2 min |
 
 **Backend quality bar:**
 - **ruff** subset `E F I B UP SIM` — 9 noisy rules explicitly ignored
@@ -856,8 +1249,8 @@ one unused import, one OpenAPI field rename
 
 ## Testing
 
-**119 backend tests** across 11 files + **163 legacy tests** for `src/` +
-the Streamlit app = **282 tests total**. All required to pass before
+**148 backend tests** across 13 files + **163 legacy tests** for `src/` +
+the Streamlit app = **311 tests total**. All required to pass before
 merge.
 
 | Suite | File | # | What it covers |
@@ -867,13 +1260,15 @@ merge.
 | OpenAPI | [`test_openapi.py`](backend/tests/test_openapi.py) | 4 | 3.1 conformance · `ErrorEnvelope` referenced by every 4xx/5xx |
 | Schema | [`test_schema.py`](backend/tests/test_schema.py) | 10 | Table presence · FK CASCADE/RESTRICT semantics · ENUM types · unique + check constraints |
 | Query plans | [`test_query_plans.py`](backend/tests/test_query_plans.py) | 4 | `EXPLAIN (FORMAT JSON)` asserts `Index Scan` for the 3 hot queries + all indexes present |
-| ETL | [`tests/etl/*.py`](backend/tests/etl/) | 11 | Mocked OpenF1 via `responses` · idempotency proven (run twice = identical rows) · dry-run rollback · compound normalisation |
+| ETL — hydrate | [`tests/etl/test_hydrate_session.py`](backend/tests/etl/test_hydrate_session.py) | 11 | Mocked OpenF1 via `responses` · idempotency proven (run twice = identical rows) · dry-run rollback · compound normalisation |
+| ETL — circuits | [`tests/etl/test_seed_circuits.py`](backend/tests/etl/test_seed_circuits.py) | 6 | Circuit geometry seed · upsert idempotency · missing session handling |
 | REST reads | [`test_v1_*.py`](backend/tests/api/) | 32 | Happy + 404 envelope + invalid cursor + season/team filters + per-driver lap walk |
-| Analytics | [`test_v1_analytics.py`](backend/tests/api/test_v1_analytics.py) | 12 | All 4 analytics endpoints + compare endpoint with mocked OpenAPI car_data |
+| Analytics | [`test_v1_analytics.py`](backend/tests/api/test_v1_analytics.py) | 16 | All 4 analytics + compare (all 9 channels) + sector-times + track-map with mocked OpenF1 / cached JSONB |
+| Services | [`tests/services/test_telemetry_compute.py`](backend/tests/services/test_telemetry_compute.py) | 8 | Cache-first fetch · JSONB round-trip · write-through on cache miss · lap reconstruction from columnar arrays |
 | GraphQL | [`tests/graphql/*.py`](backend/tests/graphql/) | 8 | Introspection · REST↔GraphQL parity for leaderboards · **N+1 regression guard** |
 | LLM | [`tests/llm/*.py`](backend/tests/llm/) | 11 | OpenAI mocked via queue-fake · all 5 patterns · SSE event sequence asserted |
 | /me | [`test_v1_me.py`](backend/tests/api/test_v1_me.py) | 10 | Cookie issuance · 2-client isolation · 100-row cap → 409 · ownership-check deletes |
-| **Total backend** | | **119** | |
+| **Total backend** | | **148** | |
 
 ### Test infrastructure highlights
 
@@ -897,9 +1292,10 @@ merge.
 
 ```bash
 cd backend
-pytest -v                                  # all 119
+pytest -v                                  # all 148
 pytest tests/api -v                        # just REST
 pytest tests/llm -v                        # just LLM (mocked OpenAI)
+pytest tests/services -v                   # telemetry cache + compute
 pytest --cov=app --cov-report=term-missing # with coverage
 ```
 
@@ -939,6 +1335,27 @@ GROUP  BY feature
 ORDER  BY usd DESC;
 ```
 
+### Telemetry cache queries
+
+Check which sessions are pre-warmed:
+
+```sql
+SELECT id, telemetry_fetched_at
+FROM   sessions
+WHERE  telemetry_fetched_at IS NOT NULL
+ORDER  BY telemetry_fetched_at DESC;
+```
+
+Inspect cached lap counts per driver:
+
+```sql
+SELECT driver_id, COUNT(*) AS laps_cached
+FROM   car_telemetry
+WHERE  session_id = 73
+GROUP  BY driver_id
+ORDER  BY driver_id;
+```
+
 ### Common failure modes
 
 | Symptom | Cause | Fix |
@@ -948,19 +1365,21 @@ ORDER  BY usd DESC;
 | SSE chat stalls in browser | Vercel buffers responses through its proxy | Set `NEXT_PUBLIC_API_BASE` directly to Railway domain so client hits backend, not Vercel |
 | `alembic upgrade head` errors "relation already exists" | DB has hand-created tables | `docker compose down -v` to drop volume, then up + migrate |
 | Empty leaderboard | Session not hydrated | `python -m app.etl hydrate --year 2024 --gp "..." --session R` |
+| Compare chart blank, "503 Service Unavailable" | Session hydrated with synthetic session_key | Re-hydrate against real OpenF1: `python -m app.etl hydrate --year 2024 --gp "..." --session Q` |
+| Compare slow (1–2 s) despite data present | Telemetry not pre-cached | `python -m app.etl fetch-telemetry --session-id <id>` or use Pipeline page |
 
 ### Migration runbook
 
-Add migration #6:
+Add the next migration (#9):
 
 ```bash
 cd backend
-alembic revision -m "add_telemetry_traces_table"
-# Edit the new file in alembic/versions/0006_*.py
+alembic revision -m "add_new_feature"
+# Edit the new file in alembic/versions/0009_*.py
 alembic upgrade head                       # apply locally
 pytest tests/test_schema.py -v             # verify table shape
-git add alembic/versions/0006_*.py app/db/models.py
-git commit -m "feat(db): cache telemetry traces"
+git add alembic/versions/0009_*.py app/db/models.py
+git commit -m "feat(db): add new feature"
 ```
 
 Postgres ENUM gotcha (the trap that hit us in 0005): when a new
@@ -977,6 +1396,8 @@ railway run bash backend/scripts/hydrate_initial_data.sh
 # or one race
 railway run python -m app.etl hydrate --year 2024 --gp "Bahrain Grand Prix" --session R
 railway run python -m app.etl refresh-stats --season 2024
+# pre-warm telemetry cache
+railway run python -m app.etl fetch-telemetry --session-id 73
 ```
 
 ---
@@ -991,13 +1412,6 @@ Honest disclosure so reviewers know what's deferred, not broken.
   CI relies on `next build` succeeding as the smoke.
 - **Rate limiter is in-memory** — adequate for one Railway dyno; a Redis
   backend would unblock multi-instance scaling.
-- **Compare endpoint channels** — supports Speed / Throttle / Brake;
-  Time-Delta + Track-Map builders exist in
-  [src/viz.py](src/viz.py) but aren't wired into REST yet.
-- **Telemetry trace cache** — `/compare` hits OpenF1 live every call.
-  A `telemetry_traces` cache table keyed on
-  `(session_key, driver_number, channel)` would cut compare latency
-  ~5×.
 - **Streaming GraphQL subscriptions** — race chat uses SSE on REST;
   could move to GraphQL subscriptions when we have a second
   streaming use case.

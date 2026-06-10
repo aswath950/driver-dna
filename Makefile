@@ -7,7 +7,7 @@ PYTEST  := .venv/bin/pytest
 .PHONY: help install-dev lint type-check test ci \
         db backend-install backend backend-test backend-lint \
         web-install web web-build web-typecheck \
-        dev hydrate migrate
+        dev hydrate migrate seed-corners seed-circuits refresh-stats fetch-telemetry
 
 help:
 	@echo "=== Legacy (src/ + Streamlit) ==="
@@ -23,8 +23,12 @@ help:
 	@echo "  backend          Run uvicorn dev server on :8000"
 	@echo "  backend-test     pytest the backend test suite"
 	@echo "  backend-lint     ruff backend"
-	@echo "  migrate          alembic upgrade head (Phase 2+)"
-	@echo "  hydrate          ETL one race weekend into Postgres (Phase 5+)"
+	@echo "  migrate          alembic upgrade head + seed circuit corners (Phase 2+)"
+	@echo "  seed-circuits    Upsert circuit geometry from data/circuits.json (PATH= optional)"
+	@echo "  seed-corners     Seed FastF1 corner data only (YEAR=2024)"
+	@echo "  refresh-stats    Recompute driver_stats (SEASON=2024 or ALL_SEASONS=1)"
+	@echo "  fetch-telemetry  Download + cache car telemetry for a session (SESSION_ID=required)"
+	@echo "  hydrate          ETL one race weekend into Postgres (YEAR= GP= SESSION=)"
 	@echo ""
 	@echo "=== Web (Next.js) ==="
 	@echo "  web-install      pnpm install in web/"
@@ -81,10 +85,28 @@ migrate:
 	@echo "Waiting for Postgres to be ready..."
 	@until docker compose exec postgres pg_isready -U dna -d driver_dna > /dev/null 2>&1; do sleep 1; done
 	cd backend && .venv/bin/alembic upgrade head
+	@echo "Seeding circuit corner data from FastF1 (year=$(or $(YEAR),2024))..."
+	cd backend && .venv/bin/python -m app.etl seed-circuit-corners --year $(or $(YEAR),2024)
+
+seed-corners:
+	@echo "Seeding circuit corner data from FastF1 (year=$(or $(YEAR),2024))..."
+	cd backend && .venv/bin/python -m app.etl seed-circuit-corners --year $(or $(YEAR),2024)
 
 hydrate:
-	@echo "Phase 5+ — usage: make hydrate YEAR=2024 GP='Monaco' SESSION=R"
+	@echo "Usage: make hydrate YEAR=2024 GP='Monaco' SESSION=R"
 	cd backend && .venv/bin/python -m app.etl hydrate --year $(YEAR) --gp "$(GP)" --session $(SESSION)
+
+seed-circuits:
+	@echo "Seeding circuit geometry from data/circuits.json..."
+	cd backend && .venv/bin/python -m app.etl seed-circuits $(if $(PATH),--path "$(PATH)",)
+
+refresh-stats:
+	@echo "Refreshing driver stats..."
+	cd backend && .venv/bin/python -m app.etl refresh-stats $(if $(ALL_SEASONS),--all-seasons,--season $(SEASON))
+
+fetch-telemetry:
+	@echo "Fetching telemetry for session $(SESSION_ID)..."
+	cd backend && .venv/bin/python -m app.etl fetch-telemetry --session-id $(SESSION_ID)
 
 # ---------------------------------------------------------------------------
 # Web (Next.js)

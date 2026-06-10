@@ -12,10 +12,11 @@
 
 set -euo pipefail
 
-YEAR="${YEAR:-2024}"
+YEAR="${YEAR:-2025}"
 
 RACES=(
   "Bahrain Grand Prix"
+  "Saudi Arabian Grand Prix"
   "Monaco Grand Prix"
   "British Grand Prix"
   "Italian Grand Prix"
