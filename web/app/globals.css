@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --f1-red: #e8002d;
+  --bg-1: #111111;
+  --bg-2: #1a1a1a;
+  --fg: #ffffff;
+}
+
+html,
+body {
+  background-color: var(--bg-1);
+  color: var(--fg);
+  font-family: "Space Grotesk", system-ui, sans-serif;
+}

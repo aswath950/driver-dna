@@ -44,3 +44,19 @@ Thumbs.db
 
 # Claude Code local settings (contain absolute user paths)
 .claude/
+
+# Monorepo: backend (FastAPI)
+backend/.venv/
+backend/.env
+backend/.pytest_cache/
+backend/.ruff_cache/
+backend/.mypy_cache/
+backend/.coverage
+
+# Monorepo: web (Next.js)
+web/node_modules/
+web/.next/
+web/out/
+web/.env.local
+web/.env*.local
+web/.vercel

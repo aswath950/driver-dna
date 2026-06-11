@@ -4,15 +4,40 @@ RUFF    := .venv/bin/ruff
 MYPY    := .venv/bin/mypy
 PYTEST  := .venv/bin/pytest
 
-.PHONY: help install-dev lint type-check test ci
+.PHONY: help install-dev lint type-check test ci \
+        db backend-install backend backend-test backend-lint \
+        web-install web web-build web-typecheck \
+        dev hydrate migrate seed-corners seed-circuits refresh-stats fetch-telemetry
 
 help:
-	@echo "Available targets:"
-	@echo "  install-dev   Install all dev dependencies into .venv"
-	@echo "  lint          Run ruff on src/ and tests/"
-	@echo "  type-check    Run mypy on race_engine.py and openf1.py"
-	@echo "  test          Run pytest with coverage"
-	@echo "  ci            Run lint, type-check, and test in sequence"
+	@echo "=== Legacy (src/ + Streamlit) ==="
+	@echo "  install-dev      Install src/ dev dependencies into .venv"
+	@echo "  lint             Run ruff on src/ and tests/"
+	@echo "  type-check       Run mypy on race_engine.py and openf1.py"
+	@echo "  test             Run pytest with coverage"
+	@echo "  ci               lint + type-check + test"
+	@echo ""
+	@echo "=== Backend (FastAPI + Postgres) ==="
+	@echo "  db               Start Postgres + pgAdmin via docker compose (detached)"
+	@echo "  backend-install  pip install -e backend[dev] into backend/.venv"
+	@echo "  backend          Run uvicorn dev server on :8000"
+	@echo "  backend-test     pytest the backend test suite"
+	@echo "  backend-lint     ruff backend"
+	@echo "  migrate          alembic upgrade head + seed circuit corners (Phase 2+)"
+	@echo "  seed-circuits    Upsert circuit geometry from data/circuits.json (PATH= optional)"
+	@echo "  seed-corners     Seed FastF1 corner data only (YEAR=2024)"
+	@echo "  refresh-stats    Recompute driver_stats (SEASON=2024 or ALL_SEASONS=1)"
+	@echo "  fetch-telemetry  Download + cache car telemetry for a session (SESSION_ID=required)"
+	@echo "  hydrate          ETL one race weekend into Postgres (YEAR= GP= SESSION=)"
+	@echo ""
+	@echo "=== Web (Next.js) ==="
+	@echo "  web-install      pnpm install in web/"
+	@echo "  web              pnpm dev (localhost:3000)"
+	@echo "  web-build        pnpm build"
+	@echo "  web-typecheck    tsc --noEmit"
+	@echo ""
+	@echo "=== Full stack ==="
+	@echo "  dev              db + pgAdmin + backend + web in one command"
 
 install-dev:
 	$(PIP) install -r requirements.txt
@@ -34,3 +59,81 @@ test:
 		-v
 
 ci: lint type-check test
+
+# ---------------------------------------------------------------------------
+# Backend (FastAPI)
+# ---------------------------------------------------------------------------
+
+BACKEND_VENV := backend/.venv
+
+db:
+	docker compose up -d postgres pgadmin
+
+backend-install:
+	cd backend && python -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install -e ".[dev]"
+
+backend:
+	cd backend && .venv/bin/uvicorn app.main:app --reload --reload-include="*.env" --port 8000
+
+backend-test:
+	cd backend && .venv/bin/pytest -v
+
+backend-lint:
+	cd backend && .venv/bin/ruff check app tests
+
+migrate:
+	@echo "Waiting for Postgres to be ready..."
+	@until docker compose exec postgres pg_isready -U dna -d driver_dna > /dev/null 2>&1; do sleep 1; done
+	cd backend && .venv/bin/alembic upgrade head
+	@echo "Seeding circuit corner data from FastF1 (year=$(or $(YEAR),2024))..."
+	cd backend && .venv/bin/python -m app.etl seed-circuit-corners --year $(or $(YEAR),2024)
+
+seed-corners:
+	@echo "Seeding circuit corner data from FastF1 (year=$(or $(YEAR),2024))..."
+	cd backend && .venv/bin/python -m app.etl seed-circuit-corners --year $(or $(YEAR),2024)
+
+hydrate:
+	@echo "Usage: make hydrate YEAR=2024 GP='Monaco' SESSION=R"
+	cd backend && .venv/bin/python -m app.etl hydrate --year $(YEAR) --gp "$(GP)" --session $(SESSION)
+
+seed-circuits:
+	@echo "Seeding circuit geometry from data/circuits.json..."
+	cd backend && .venv/bin/python -m app.etl seed-circuits $(if $(PATH),--path "$(PATH)",)
+
+refresh-stats:
+	@echo "Refreshing driver stats..."
+	cd backend && .venv/bin/python -m app.etl refresh-stats $(if $(ALL_SEASONS),--all-seasons,--season $(SEASON))
+
+fetch-telemetry:
+	@echo "Fetching telemetry for session $(SESSION_ID)..."
+	cd backend && .venv/bin/python -m app.etl fetch-telemetry --session-id $(SESSION_ID)
+
+# ---------------------------------------------------------------------------
+# Web (Next.js)
+# ---------------------------------------------------------------------------
+
+web-install:
+	cd web && pnpm install
+
+web:
+	cd web && pnpm dev
+
+web-build:
+	cd web && pnpm build
+
+web-typecheck:
+	cd web && pnpm typecheck
+
+# ---------------------------------------------------------------------------
+# Full stack (best-effort; prefer 3 terminals during real dev)
+# ---------------------------------------------------------------------------
+
+dev:
+	@echo "Starting Postgres + pgAdmin..."
+	docker compose up -d postgres pgadmin
+	@echo "Waiting for Postgres to be healthy..."
+	@until docker compose exec postgres pg_isready -U dna -d driver_dna > /dev/null 2>&1; do sleep 1; done
+	@echo "Starting FastAPI backend (background)..."
+	cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000 &
+	@echo "Starting Next.js web (foreground — Ctrl-C stops all)..."
+	cd web && pnpm dev

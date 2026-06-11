@@ -1,0 +1,50 @@
+name: Web CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - ".github/workflows/web-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "web/**"
+      - ".github/workflows/web-ci.yml"
+
+jobs:
+  build:
+    name: typecheck + lint + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    env:
+      # The build never hits a real backend; landing/race/radar/event are
+      # dynamic routes so they're not pre-rendered. Pages that DO pre-render
+      # (e.g. /pipeline) don't make API calls.
+      API_BASE_INTERNAL: http://localhost:8000
+      NEXT_PUBLIC_API_BASE: http://localhost:8000
+      NEXT_PUBLIC_GRAPHQL_URL: http://localhost:8000/graphql
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install (frozen lockfile)
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build

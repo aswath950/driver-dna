@@ -241,18 +241,18 @@ def _fetch_fastest_lap_all_openf1(
             return np.full(N_POINTS, np.nan)
         return np.interp(dist_grid, dist, car[col].to_numpy(dtype=float))
 
-    # Resample cumtime using raw sample index as the independent variable, not dist.
-    # dist can be flat (non-increasing) in slow/stopped sections which makes it an
-    # invalid xp for np.interp and produces incorrect interpolated cumtime values.
-    # The sample index is always strictly increasing, so interpolation is well-defined.
-    raw_idx = np.linspace(0.0, 1.0, len(cumtime_raw))
-    grid_idx = np.linspace(0.0, 1.0, N_POINTS)
+    # Resample cumtime over track distance so that delta = cumtime_B(d) - cumtime_A(d)
+    # represents the true time gap when both cars are at the same point on track.
+    # dist can have flat (non-increasing) segments near zero speed; deduplicate to
+    # guarantee a strictly-increasing xp for np.interp.
+    dist_unique, unique_idx = np.unique(dist, return_index=True)
+    cumtime_unique = cumtime_raw[unique_idx]
 
     return {
         "speed": _resample("speed"),
         "throttle": _resample("throttle"),
         "brake": _resample("brake"),
-        "cumtime": np.interp(grid_idx, raw_idx, cumtime_raw),  # elapsed seconds at each distance point
+        "cumtime": np.interp(dist_grid, dist_unique, cumtime_unique),  # elapsed seconds at each distance point
         "x": None,   # not available from OpenF1 car_data; Track Map uses dataset.parquet
         "y": None,
         "lap_time": lap_time,
@@ -377,6 +377,7 @@ def _build_track_map_fig(
 def _build_time_delta_fig(
     data_a: dict, acronym_a: str, color_a: str,
     data_b: dict, acronym_b: str, color_b: str,
+    sector_fractions: list[float] | None = None,
 ) -> go.Figure:
     """
     Redesigned time-delta chart.
@@ -531,6 +532,31 @@ def _build_time_delta_fig(
         xanchor="left",
     )
 
+    # --- Sector start markers ---
+    if sector_fractions and len(sector_fractions) == 2:
+        s1_frac, s2_frac = sector_fractions
+        sector_starts = [
+            (0.0,           "S1"),
+            (s1_frac * 100, "S2"),
+            (s2_frac * 100, "S3"),
+        ]
+        for x_pos, label in sector_starts:
+            fig.add_vline(
+                x=x_pos,
+                line=dict(color="rgba(255,255,255,0.45)", width=1.5, dash="dot"),
+                layer="below",
+            )
+            fig.add_annotation(
+                x=x_pos, y=1.0,
+                xref="x", yref="paper",
+                text=f"<b>{label}</b>",
+                showarrow=False,
+                xanchor="left",
+                yanchor="top",
+                font=dict(color="rgba(255,255,255,0.7)", size=10),
+                xshift=4,
+            )
+
     # --- Title with subtitle ---
     lap_a_num = data_a.get("lap_number")
     lap_b_num = data_b.get("lap_number")
@@ -629,7 +655,7 @@ def _build_sector_times_fig(
         total_text, total_color = f"{acronym_b} ahead {abs(total_delta):.3f}s overall", color_b
     fig.add_annotation(
         text=f"<b>{total_text}</b>",
-        xref="paper", yref="paper", x=0.5, y=-0.13,
+        xref="paper", yref="paper", x=0.5, y=-0.18,
         xanchor="center", yanchor="top",
         showarrow=False,
         font=dict(color=total_color, size=13),

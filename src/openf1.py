@@ -34,11 +34,12 @@ _STINT_COLS = [
     "tyre_age_at_start", "lap_start", "lap_end", "session_key",
 ]
 _POSITION_COLS = [
-    "driver_number", "position", "date", "session_key",
+    "driver_number", "position", "date", "session_key", "x", "y",
 ]
+_LOCATION_COLS = ["driver_number", "date", "x", "y", "z", "session_key"]
 _CAR_DATA_COLS = [
     "driver_number", "date", "speed", "throttle", "brake",
-    "n_gear", "rpm", "session_key",
+    "n_gear", "rpm", "drs", "session_key",
 ]
 
 
@@ -287,6 +288,33 @@ class OpenF1Client:
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
         return validate_dataframe(df, _POSITION_COLS, "get_position")
+
+    def get_location(
+        self,
+        session_key: int,
+        driver_number: int | None = None,
+        date_gte: str | None = None,
+        date_lte: str | None = None,
+    ) -> pd.DataFrame:
+        """Return car track coordinates (x/y/z) from /v1/location.
+
+        Returns
+        -------
+        DataFrame with at least: ``driver_number``, ``date``, ``x``, ``y``,
+        ``z``, ``session_key``.
+        """
+        params: dict = {"session_key": session_key}
+        if driver_number is not None:
+            params["driver_number"] = driver_number
+        if date_gte is not None:
+            params["date>"] = date_gte
+        if date_lte is not None:
+            params["date<"] = date_lte
+        df = self._get("location", params)
+        df = self._clean(df, _LOCATION_COLS)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        return validate_dataframe(df, _LOCATION_COLS, "get_location")
 
     # ------------------------------------------------------------------
     # Live mode

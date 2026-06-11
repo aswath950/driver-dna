@@ -1955,9 +1955,13 @@ if _active_tab == "Race Dashboard":
                             if _special_fig is not None:
                                 st.plotly_chart(_special_fig, width="stretch", key="tab3_track_map_hist")
                     elif _tel_channel == "Time Delta":
+                        _gp_name = st.session_state.get("rp_gp", "")
+                        _circuit = circuits.get(_gp_name)
+                        _sf = _circuit.get("sector_fractions") if _circuit else None
                         _special_fig = _build_time_delta_fig(
                             _data_a, _dlabel(_drv_a_int), _col_a,
                             _data_b, _dlabel(_drv_b_int), _col_b,
+                            sector_fractions=_sf,
                         )
                         st.plotly_chart(_special_fig, width="stretch", key="tab3_time_delta_hist")
                     elif _tel_channel == "Sector Times":
@@ -2163,9 +2167,13 @@ if _active_tab == "Race Dashboard":
                                     if _lspecial_fig is not None:
                                         st.plotly_chart(_lspecial_fig, width="stretch", key="tab3_track_map_live")
                             elif _ltel_channel == "Time Delta":
+                                _live_gp = st.session_state.get("rp_live_meeting_name", "")
+                                _lcircuit = circuits.get(_live_gp) if _live_gp else None
+                                _lsf = _lcircuit.get("sector_fractions") if _lcircuit else None
                                 _lspecial_fig = _build_time_delta_fig(
                                     _ldata_a, _live_dlabel(_ldrv_a_int), _lcol_a,
                                     _ldata_b, _live_dlabel(_ldrv_b_int), _lcol_b,
+                                    sector_fractions=_lsf,
                                 )
                                 st.plotly_chart(_lspecial_fig, width="stretch", key="tab3_time_delta_live")
                             elif _ltel_channel == "Sector Times":

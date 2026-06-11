@@ -1,0 +1,75 @@
+[project]
+name = "driver-dna-backend"
+version = "0.1.0"
+description = "Driver DNA backend — FastAPI + Strawberry GraphQL + SQLAlchemy"
+requires-python = ">=3.13"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "strawberry-graphql[fastapi]>=0.220",
+  "sqlalchemy[asyncio]>=2.0",
+  "asyncpg>=0.29",
+  "psycopg[binary]>=3.2",
+  "alembic>=1.13",
+  "pydantic>=2.8",
+  "pydantic-settings>=2.4",
+  "structlog>=24.4",
+  "httpx>=0.27",
+  "python-multipart>=0.0.9",
+  "python-ulid>=3.0",
+  # ETL (Phase 5) — required by ../src/openf1.py which we reuse directly.
+  "pandas>=2.2",
+  "requests>=2.32",
+  # ETL corner seeding — FastF1 provides official turn numbers + distances.
+  "fastf1>=3.8",
+  # Compute endpoints (Phase 7) — analytics adapter + Plotly figure builder.
+  "numpy>=1.26",
+  "scipy>=1.13",
+  "plotly>=5.20",
+  # LLM endpoints (Phase 9)
+  "openai>=1.50",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=5.0",
+  "responses>=0.25",
+  "ruff>=0.6",
+  "mypy>=1.11",
+  "types-requests",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+# Stylistic noise that doesn't catch bugs — keep CI focused on real defects.
+# E501  line length (formatter's job)
+# E741  ambiguous one-letter names
+# B007  unused loop var
+# B008  function call in default (FastAPI Depends/Query require this)
+# B905  zip without strict=
+# SIM105 try/except/pass → contextlib.suppress (often less readable)
+# UP042/UP046/UP047 PEP-695 syntax (optional modernisation)
+ignore = ["E501", "E741", "B007", "B008", "B905", "SIM105", "UP042", "UP046", "UP047"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
