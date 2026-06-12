@@ -19,7 +19,13 @@ import logging
 import sys
 from pathlib import Path
 
-from app.etl import fetch_telemetry, hydrate_session, refresh_driver_stats, seed_circuit_corners, seed_circuits
+from app.etl import (
+    fetch_telemetry,
+    hydrate_session,
+    refresh_driver_stats,
+    seed_circuit_corners,
+    seed_circuits,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -57,8 +63,11 @@ def _build_parser() -> argparse.ArgumentParser:
     scc.add_argument(
         "--year",
         type=int,
-        default=2024,
-        help="Season year to look up representative events for each circuit (default: 2024).",
+        default=None,
+        help=(
+            "Preferred season year for FastF1 lookups. Defaults to each "
+            "circuit's most recent completed event."
+        ),
     )
 
     ft = sub.add_parser(
