@@ -34,6 +34,7 @@ from app.db.models import (
     Team,
 )
 from app.db.models import Session as SessionRow
+from app.etl import seed_circuit_corners
 from app.etl.upserts import upsert_many, upsert_one
 
 logger = logging.getLogger(__name__)
@@ -556,4 +557,15 @@ def run(
         except Exception:
             db.rollback()
             raise
+
+        # Opportunistic corner seed for newly hydrated circuits (after the
+        # hydrate transaction commits — a corner-seed failure must never undo
+        # it). No-op when the circuit already has corner data.
+        if not dry_run and result.event_id is not None:
+            try:
+                seed_circuit_corners.seed_for_event(db, result.event_id)
+            except Exception as exc:
+                logger.warning(
+                    "corner seed failed for event_id=%s: %s", result.event_id, exc
+                )
     return result

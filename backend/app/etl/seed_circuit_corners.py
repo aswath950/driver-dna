@@ -147,6 +147,61 @@ def _get_schedule_map(
     return cache[year]
 
 
+def _enable_cache() -> None:
+    """Point FastF1 at a stable cache dir so re-runs don't re-download."""
+    cache_dir = Path(tempfile.gettempdir()) / "fastf1_etl_cache"
+    cache_dir.mkdir(exist_ok=True)
+    fastf1.Cache.enable_cache(str(cache_dir))
+
+
+def _build_candidates(
+    event_pairs: list[tuple[int, str]],
+    preferred_year: int | None = None,
+) -> list[tuple[int, str]]:
+    """Order (year, event_name) lookup candidates for one circuit.
+
+    ``event_pairs`` must be newest-first.  Earlier seasons of the newest
+    event name are appended as last-resort fallbacks — corner layouts rarely
+    change between years.  A preferred year, when given, is tried first.
+    """
+    newest_year, newest_name = event_pairs[0]
+    candidates = list(event_pairs)
+    for back in range(1, _FALLBACK_YEARS + 1):
+        pair = (newest_year - back, newest_name)
+        if pair not in candidates:
+            candidates.append(pair)
+    if preferred_year is not None:
+        candidates = [(preferred_year, name) for _, name in event_pairs] + candidates
+    return candidates
+
+
+def _store_circuit_corners(
+    db: Session,
+    circuit_name: str,
+    corners: list[dict],
+    total_m: float | None,
+) -> None:
+    """Upsert corners (and the paired length_km) onto a circuit row.
+
+    length_km divides distance_m into apex fractions at runtime, so it must
+    always be stored from the same FastF1 lap that produced the corner
+    distances — never a stale value.
+    """
+    values: dict[str, Any] = {
+        "name": circuit_name,
+        "corners": corners,
+    }
+    if total_m is not None:
+        values["length_km"] = round(total_m / 1000, 3)
+    upsert_one(
+        db,
+        Circuit.__table__,
+        values=values,
+        conflict_cols=["name"],
+        update_cols=[k for k in values if k != "name"],
+    )
+
+
 def _resolve_and_fetch(
     candidates: list[tuple[int, str]],
     schedule_cache: dict[int, dict[str, tuple[int, pd.Timestamp | None]] | None],
@@ -190,6 +245,61 @@ def _resolve_and_fetch(
     return None
 
 
+def seed_for_event(db: Session, event_id: int) -> bool:
+    """Targeted corner seed for one hydrated event's circuit.
+
+    Used by the hydrate ETL so a newly downloaded GP gets corner data
+    without re-running the full batch.  No-op when the circuit already has
+    corners.  Commits on success; FastF1 failures are logged and swallowed
+    (corner data is an enhancement, never a reason to fail a hydrate).
+
+    Returns True when corner data was stored.
+    """
+    row = db.execute(
+        select(Circuit.id, Circuit.name, Circuit.corners)
+        .join(Event, Event.circuit_id == Circuit.id)
+        .where(Event.id == event_id)
+    ).first()
+    if row is None or row.corners is not None:
+        return False
+    circuit_id, circuit_name = int(row.id), str(row.name)
+
+    current_year = pd.Timestamp.now().year
+    pairs = db.execute(
+        select(Season.year, Event.name)
+        .join(Event, Event.season_id == Season.id)
+        .where(
+            Event.circuit_id == circuit_id,
+            Season.year.between(_MIN_YEAR, current_year),
+        )
+        .order_by(Season.year.desc())
+    ).all()
+    event_pairs: list[tuple[int, str]] = []
+    for event_year, event_name in pairs:
+        pair = (int(event_year), str(event_name))
+        if pair not in event_pairs:
+            event_pairs.append(pair)
+    if not event_pairs:
+        return False
+
+    _enable_cache()
+    resolved = _resolve_and_fetch(_build_candidates(event_pairs), {})
+    if resolved is None:
+        logger.warning(
+            "Corner seed skipped for circuit=%r — no FastF1 match", circuit_name
+        )
+        return False
+
+    resolved_year, corners, total_m = resolved
+    _store_circuit_corners(db, circuit_name, corners, total_m)
+    db.commit()
+    logger.info(
+        "Stored %d corners for circuit=%r (FastF1 season %d)",
+        len(corners), circuit_name, resolved_year,
+    )
+    return True
+
+
 def run(*, year: int | None = None) -> SeedCornersResult:
     """Fetch and store corner data for every circuit that hosts an event.
 
@@ -197,10 +307,7 @@ def run(*, year: int | None = None) -> SeedCornersResult:
         year: Optional preferred season — tried first for each circuit before
               falling back to the circuit's own event years (newest first).
     """
-    # Stable cache dir so re-runs don't re-download session telemetry.
-    cache_dir = Path(tempfile.gettempdir()) / "fastf1_etl_cache"
-    cache_dir.mkdir(exist_ok=True)
-    fastf1.Cache.enable_cache(str(cache_dir))
+    _enable_cache()
 
     engine = create_engine(settings.DATABASE_URL_SYNC, future=True)
     result = SeedCornersResult(year=year, circuits_updated=0, circuits_skipped=0)
@@ -227,17 +334,7 @@ def run(*, year: int | None = None) -> SeedCornersResult:
 
         try:
             for circuit_name, event_pairs in circuits.values():
-                # Earlier seasons of the newest event name as last-resort
-                # fallbacks — corner layouts rarely change between years.
-                newest_year, newest_name = event_pairs[0]
-                candidates = list(event_pairs)
-                for back in range(1, _FALLBACK_YEARS + 1):
-                    pair = (newest_year - back, newest_name)
-                    if pair not in candidates:
-                        candidates.append(pair)
-                if year is not None:
-                    candidates = [(year, name) for _, name in event_pairs] + candidates
-
+                candidates = _build_candidates(event_pairs, preferred_year=year)
                 logger.info(
                     "Fetching corners  circuit=%r  candidates=%s",
                     circuit_name, candidates[:4],
@@ -255,24 +352,7 @@ def run(*, year: int | None = None) -> SeedCornersResult:
                     continue
 
                 resolved_year, corners, total_m = resolved
-
-                values: dict[str, Any] = {
-                    "name": circuit_name,
-                    "corners": corners,
-                }
-                # length_km divides distance_m into apex fractions at runtime,
-                # so it must always be stored from the same FastF1 lap that
-                # produced the corner distances — never a stale value.
-                if total_m is not None:
-                    values["length_km"] = round(total_m / 1000, 3)
-
-                upsert_one(
-                    db,
-                    Circuit.__table__,
-                    values=values,
-                    conflict_cols=["name"],
-                    update_cols=[k for k in values if k != "name"],
-                )
+                _store_circuit_corners(db, circuit_name, corners, total_m)
                 logger.info(
                     "Stored %d corners for circuit=%r (FastF1 season %d)",
                     len(corners), circuit_name, resolved_year,

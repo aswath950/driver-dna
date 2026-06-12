@@ -43,7 +43,7 @@
 - **GraphQL** schema with 12 query fields + 9 object types + 2 enums + per-request DataLoaders
 - **5 agentic-AI patterns** — Reflexion · RAG · Structured Output ·
   Single-shot XAI · SSE-streamed ReAct
-- **317 tests** — 154 backend (modern stack) + 163 legacy (`src/` + Streamlit)
+- **320 tests** — 157 backend (modern stack) + 163 legacy (`src/` + Streamlit)
 - **5 GitHub Actions** workflows (legacy CI · backend CI · web CI ·
   Docker build → GHCR · LLM eval with PR comment)
 - **4 documented deploy paths** — local dev · Vercel+Railway · self-host VPS · Streamlit Cloud
@@ -180,7 +180,7 @@ in the code. Every claim links to the file that proves it.
 
 ### Testing strategy
 
-- **317 tests across two suites** — 154 backend (pytest 8) + 163
+- **320 tests across two suites** — 157 backend (pytest 8) + 163
   legacy (`src/` + Streamlit); both required to pass before merge
 - **Mocking without flakes** — OpenAI is mocked via a queue-fake
   fixture (tests enqueue canned responses including streaming
@@ -382,7 +382,7 @@ driver-dna/
 │   │   └── llm/                   5 feature services · SSE race chat · audit
 │   ├── alembic/versions/          8 migrations
 │   ├── scripts/                   seed_demo.sql · hydrate_initial_data.sh
-│   ├── tests/                     154 tests across 14 files
+│   ├── tests/                     157 tests across 14 files
 │   ├── docs/query_plans.md        EXPLAIN ANALYZE output before/after indexes
 │   ├── Dockerfile · railway.json  Cloud deploy config
 │   └── pyproject.toml
@@ -704,7 +704,9 @@ python -m app.etl seed-circuits --path /custom/path/circuits.json  # optional ov
 # Seed authoritative corner positions (FastF1 turn numbers + distance from S/F line)
 # Required for the corner-performance feature; run once after seeding circuits.
 # Resolves FastF1 weekends by event-name match against the season schedule,
-# trying each circuit's most recent completed event first.
+# trying each circuit's most recent completed event first. `hydrate` also
+# auto-seeds corners for its event's circuit when missing, so newly
+# downloaded GPs get corner data without re-running the batch.
 python -m app.etl seed-circuit-corners            # per-circuit year resolution
 python -m app.etl seed-circuit-corners --year 2024  # prefer 2024 data
 
@@ -749,7 +751,9 @@ compared to Team B?"
    distance — and stores `{number, letter, distance_m}` in `circuits.corners`
    (JSONB) plus the lap's total length in `circuits.length_km`. Distance from
    the Start/Finish line over that same lap length maps directly onto the
-   200-point telemetry distance grid.
+   200-point telemetry distance grid. `hydrate` runs the same seed
+   opportunistically for its event's circuit (post-commit, failure-isolated),
+   so freshly downloaded GPs are covered without a manual re-run.
 
 2. **Corner classification** — corners are tagged slow / medium / high based
    on the reference driver's apex speed (< 100 km/h · 100–180 · > 180).
@@ -1321,8 +1325,8 @@ one unused import, one OpenAPI field rename
 
 ## Testing
 
-**154 backend tests** across 14 files + **163 legacy tests** for `src/` +
-the Streamlit app = **317 tests total**. All required to pass before
+**157 backend tests** across 14 files + **163 legacy tests** for `src/` +
+the Streamlit app = **320 tests total**. All required to pass before
 merge.
 
 | Suite | File | # | What it covers |
@@ -1334,14 +1338,14 @@ merge.
 | Query plans | [`test_query_plans.py`](backend/tests/test_query_plans.py) | 4 | `EXPLAIN (FORMAT JSON)` asserts `Index Scan` for the 3 hot queries + all indexes present |
 | ETL — hydrate | [`tests/etl/test_hydrate_session.py`](backend/tests/etl/test_hydrate_session.py) | 11 | Mocked OpenF1 via `responses` · idempotency proven (run twice = identical rows) · dry-run rollback · compound normalisation |
 | ETL — circuits | [`tests/etl/test_seed_circuits.py`](backend/tests/etl/test_seed_circuits.py) | 6 | Circuit geometry seed · upsert idempotency · missing session handling |
-| ETL — corners | [`tests/etl/test_seed_circuit_corners.py`](backend/tests/etl/test_seed_circuit_corners.py) | 6 | FastF1 mocked · round resolved by event name (never the OpenF1 meeting_key) · future-event year fallback · preferred-year flag · idempotent overwrite |
+| ETL — corners | [`tests/etl/test_seed_circuit_corners.py`](backend/tests/etl/test_seed_circuit_corners.py) | 9 | FastF1 mocked · round resolved by event name (never the OpenF1 meeting_key) · future-event year fallback · preferred-year flag · idempotent overwrite · hydrate auto-seed hook (stores, no-ops when seeded, survives FastF1 failure) |
 | REST reads | [`test_v1_*.py`](backend/tests/api/) | 32 | Happy + 404 envelope + invalid cursor + season/team filters + per-driver lap walk |
 | Analytics | [`test_v1_analytics.py`](backend/tests/api/test_v1_analytics.py) | 16 | All 4 analytics + compare (all 9 channels) + sector-times + track-map with mocked OpenF1 / cached JSONB |
 | Services | [`tests/services/test_telemetry_compute.py`](backend/tests/services/test_telemetry_compute.py) | 8 | Cache-first fetch · JSONB round-trip · write-through on cache miss · lap reconstruction from columnar arrays |
 | GraphQL | [`tests/graphql/*.py`](backend/tests/graphql/) | 8 | Introspection · REST↔GraphQL parity for leaderboards · **N+1 regression guard** |
 | LLM | [`tests/llm/*.py`](backend/tests/llm/) | 11 | OpenAI mocked via queue-fake · all 5 patterns · SSE event sequence asserted |
 | /me | [`test_v1_me.py`](backend/tests/api/test_v1_me.py) | 10 | Cookie issuance · 2-client isolation · 100-row cap → 409 · ownership-check deletes |
-| **Total backend** | | **154** | |
+| **Total backend** | | **157** | |
 
 ### Test infrastructure highlights
 
@@ -1365,7 +1369,7 @@ merge.
 
 ```bash
 cd backend
-pytest -v                                  # all 154
+pytest -v                                  # all 157
 pytest tests/api -v                        # just REST
 pytest tests/llm -v                        # just LLM (mocked OpenAI)
 pytest tests/services -v                   # telemetry cache + compute

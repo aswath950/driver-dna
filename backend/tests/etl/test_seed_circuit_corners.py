@@ -92,7 +92,8 @@ def _seed_event(
     year: int,
     round_: int,
     length_km: float | None = None,
-) -> None:
+    corners: list[dict] | None = None,
+) -> int:
     season = db.query(Season).filter_by(year=year).first()
     if season is None:
         season = Season(year=year)
@@ -100,11 +101,13 @@ def _seed_event(
         db.flush()
     circuit = db.query(Circuit).filter_by(name=circuit_name).first()
     if circuit is None:
-        circuit = Circuit(name=circuit_name, length_km=length_km)
+        circuit = Circuit(name=circuit_name, length_km=length_km, corners=corners)
         db.add(circuit)
         db.flush()
-    db.add(Event(season_id=season.id, circuit_id=circuit.id, round=round_, name=event_name))
+    event = Event(season_id=season.id, circuit_id=circuit.id, round=round_, name=event_name)
+    db.add(event)
     db.commit()
+    return event.id
 
 
 def _read_circuit(engine: sa.Engine, name: str) -> dict:
@@ -219,6 +222,55 @@ def test_rerun_overwrites_cleanly(
     assert first == second
     assert second["corners"] == _CORNERS
     assert float(second["length_km"]) == round(_TOTAL_M / 1000, 3)
+
+
+def test_seed_for_event_stores_corners(
+    clean_db: sa.Engine, db: Session, fake_fastf1: dict
+) -> None:
+    # The hydrate hook: a newly hydrated event's circuit gets corner data.
+    event_id = _seed_event(
+        db, circuit_name="Dutch Grand Prix", event_name="Dutch Grand Prix",
+        year=2025, round_=1271,
+    )
+    fake_fastf1["schedules"][2025] = _schedule_df([("Dutch Grand Prix", 15, "2025-08-31")])
+
+    stored = seed_circuit_corners.seed_for_event(db, event_id)
+
+    assert stored is True
+    assert fake_fastf1["calls"] == [(2025, 15)]
+    assert _read_circuit(clean_db, "Dutch Grand Prix")["corners"] == _CORNERS
+
+
+def test_seed_for_event_noop_when_already_seeded(
+    clean_db: sa.Engine, db: Session, fake_fastf1: dict
+) -> None:
+    existing = [{"number": 1, "letter": "", "distance_m": 99.0}]
+    event_id = _seed_event(
+        db, circuit_name="Dutch Grand Prix", event_name="Dutch Grand Prix",
+        year=2025, round_=1271, corners=existing,
+    )
+
+    stored = seed_circuit_corners.seed_for_event(db, event_id)
+
+    assert stored is False
+    assert fake_fastf1["calls"] == []
+    assert _read_circuit(clean_db, "Dutch Grand Prix")["corners"] == existing
+
+
+def test_seed_for_event_survives_fastf1_failure(
+    clean_db: sa.Engine, db: Session, fake_fastf1: dict
+) -> None:
+    # No schedule registered for any year → every lookup raises inside
+    # FastF1; seed_for_event must swallow it and report False.
+    event_id = _seed_event(
+        db, circuit_name="Dutch Grand Prix", event_name="Dutch Grand Prix",
+        year=2025, round_=1271,
+    )
+
+    stored = seed_circuit_corners.seed_for_event(db, event_id)
+
+    assert stored is False
+    assert _read_circuit(clean_db, "Dutch Grand Prix")["corners"] is None
 
 
 def test_sentinel_years_are_excluded(
