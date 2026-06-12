@@ -636,7 +636,7 @@ def build_corner_track_map_figure(
         x=cx.tolist(),
         y=cy.tolist(),
         mode="lines",
-        line={"color": "rgba(255,255,255,0.15)", "width": 2},
+        line={"color": "rgba(255,255,255,0.25)", "width": 5},
         name="Circuit",
         hoverinfo="skip",
         showlegend=False,
@@ -664,7 +664,7 @@ def build_corner_track_map_figure(
             else:
                 color = "#ffffff"
                 faster = "Equal"
-            size = int(np.clip(8 + abs(delta) * 0.3, 8, 18))
+            size = int(np.clip(13 + abs(delta) * 0.4, 13, 26))
             hover = (
                 f"C{cn} ({c['corner_class']})<br>"
                 f"{team_a_name}: {va:.1f} km/h<br>"
@@ -673,7 +673,7 @@ def build_corner_track_map_figure(
             )
         else:
             color = "#888888"
-            size = 8
+            size = 13
             hover = f"C{cn} — no data"
 
         marker_x.append(mx)

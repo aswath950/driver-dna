@@ -43,7 +43,7 @@
 - **GraphQL** schema with 12 query fields + 9 object types + 2 enums + per-request DataLoaders
 - **5 agentic-AI patterns** — Reflexion · RAG · Structured Output ·
   Single-shot XAI · SSE-streamed ReAct
-- **311 tests** — 148 backend (modern stack) + 163 legacy (`src/` + Streamlit)
+- **317 tests** — 154 backend (modern stack) + 163 legacy (`src/` + Streamlit)
 - **5 GitHub Actions** workflows (legacy CI · backend CI · web CI ·
   Docker build → GHCR · LLM eval with PR comment)
 - **4 documented deploy paths** — local dev · Vercel+Railway · self-host VPS · Streamlit Cloud
@@ -180,7 +180,7 @@ in the code. Every claim links to the file that proves it.
 
 ### Testing strategy
 
-- **311 tests across two suites** — 148 backend (pytest 8) + 163
+- **317 tests across two suites** — 154 backend (pytest 8) + 163
   legacy (`src/` + Streamlit); both required to pass before merge
 - **Mocking without flakes** — OpenAI is mocked via a queue-fake
   fixture (tests enqueue canned responses including streaming
@@ -382,7 +382,7 @@ driver-dna/
 │   │   └── llm/                   5 feature services · SSE race chat · audit
 │   ├── alembic/versions/          8 migrations
 │   ├── scripts/                   seed_demo.sql · hydrate_initial_data.sh
-│   ├── tests/                     148 tests across 13 files
+│   ├── tests/                     154 tests across 14 files
 │   ├── docs/query_plans.md        EXPLAIN ANALYZE output before/after indexes
 │   ├── Dockerfile · railway.json  Cloud deploy config
 │   └── pyproject.toml
@@ -702,9 +702,11 @@ python -m app.etl seed-circuits
 python -m app.etl seed-circuits --path /custom/path/circuits.json  # optional override
 
 # Seed authoritative corner positions (FastF1 turn numbers + distance from S/F line)
-# Required for the corner-performance feature; run once after seeding circuits
-python -m app.etl seed-circuit-corners            # uses 2024 season by default
-python -m app.etl seed-circuit-corners --year 2023
+# Required for the corner-performance feature; run once after seeding circuits.
+# Resolves FastF1 weekends by event-name match against the season schedule,
+# trying each circuit's most recent completed event first.
+python -m app.etl seed-circuit-corners            # per-circuit year resolution
+python -m app.etl seed-circuit-corners --year 2024  # prefer 2024 data
 
 # Pre-download and cache all car telemetry for a session
 python -m app.etl fetch-telemetry --session-id 73
@@ -740,10 +742,14 @@ compared to Team B?"
 **How it works end-to-end:**
 
 1. **Authoritative corner positions** — `python -m app.etl seed-circuit-corners`
-   calls FastF1's `session.get_circuit_info()` (metadata-only load, no
-   telemetry) and stores each turn's `{number, letter, distance_m}` in
-   `circuits.corners` (JSONB). Distance from the Start/Finish line is the
-   key: it maps directly onto the 200-point telemetry distance grid.
+   resolves each circuit's FastF1 race weekend by event-name match against
+   the season schedule (DB `events.round` holds OpenF1 meeting_keys, which
+   FastF1 can't use), loads a reference lap with telemetry — FastF1 fits each
+   turn's x/y position against the lap's position data to compute its
+   distance — and stores `{number, letter, distance_m}` in `circuits.corners`
+   (JSONB) plus the lap's total length in `circuits.length_km`. Distance from
+   the Start/Finish line over that same lap length maps directly onto the
+   200-point telemetry distance grid.
 
 2. **Corner classification** — corners are tagged slow / medium / high based
    on the reference driver's apex speed (< 100 km/h · 100–180 · > 180).
@@ -905,26 +911,92 @@ One-shot verification:
 
 ### Three-terminal local dev
 
-```bash
-# Terminal 1 — Postgres + pgAdmin (monitoring dashboard)
-make db                                           # → postgres :5432, pgAdmin :5050
+#### Terminal 1 — Postgres + pgAdmin
 
-# Terminal 2 — Backend
+```bash
+make db
+```
+
+Starts Postgres on `:5432` and pgAdmin on `:5050`. Wait until the command returns to
+the prompt, then run migrations (first time only, or after pulling new changes):
+
+```bash
+make migrate
+```
+
+This runs `alembic upgrade head` and seeds circuit corner data from FastF1.
+
+To inspect the database later: open `http://localhost:5050` (login:
+`admin@example.com` / `admin`), add a server with host `postgres`, port `5432`,
+username `dna`, password `dna`.
+
+#### Terminal 2 — FastAPI Backend
+
+```bash
 cd backend
+
+# First time only: create virtualenv and install deps
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env                              # add OPENAI_API_KEY if testing AI
-alembic upgrade head
-bash scripts/hydrate_initial_data.sh              # seed a few real race weekends
-uvicorn app.main:app --reload --port 8000         # → http://localhost:8000
 
-# Terminal 3 — Web
+# First time only: copy env file and add your OpenAI key (required for /ai/* endpoints)
+cp .env.example .env
+# Edit .env and set OPENAI_API_KEY=sk-...
+
+# First time only: seed real race data
+bash scripts/hydrate_initial_data.sh
+
+# Start the server (every time)
+.venv/bin/uvicorn app.main:app --reload --reload-include="*.env" --port 8000
+```
+
+Confirm the server is up:
+
+```bash
+curl localhost:8000/healthz   # → {"status":"ok","env":"local","version":"1.0.0"}
+```
+
+Swagger UI is at `http://localhost:8000/docs`.
+
+> **Note** — `hydrate_initial_data.sh` seeds a handful of real race weekends so
+> the Race Dashboard has data to show. Skip it and the GP dropdowns will list all
+> races from the OpenF1 calendar but mark them "hasn't been downloaded yet". Use
+> the Pipeline → Download Dataset page to hydrate individual races later.
+
+#### Terminal 3 — Next.js Web
+
+```bash
 cd web
+
+# First time only: install dependencies and copy env file
 pnpm install
 cp .env.example .env.local
-pnpm dev                                          # → http://localhost:3000
+# .env.local defaults already point to localhost:8000 — no edits needed for local dev
 
-# (Optional) Terminal 4 — legacy Streamlit
+# Start the dev server (every time)
+pnpm dev
+```
+
+The web app is ready at `http://localhost:3000`.
+
+#### Smoke-check after startup
+
+```bash
+curl localhost:8000/healthz                          # backend alive
+curl localhost:8000/api/v1/seasons | jq '.data[0]'   # DB has data
+```
+
+Then in the browser:
+
+- `http://localhost:3000` — landing page shows event cards
+- `http://localhost:3000/race` — Race Dashboard: select a year, pick a GP, pick a
+  session, click Load
+- `http://localhost:3000/pipeline` — Pipeline admin: Download Dataset, Fetch
+  Telemetry, Train
+
+#### (Optional) Terminal 4 — legacy Streamlit
+
+```bash
 streamlit run streamlit_app.py                    # → http://localhost:8501
 ```
 
@@ -940,9 +1012,9 @@ make db              # docker compose up -d postgres pgadmin (:5432 + :5050)
 make backend-install # python -m venv backend/.venv && pip install -e backend[dev]
 make backend         # uvicorn dev server on :8000
 make backend-test    # full pytest suite
-make migrate         # alembic upgrade head + seed circuit corners (YEAR=2024 optional)
+make migrate         # alembic upgrade head + seed circuit corners (YEAR= optional)
 make seed-circuits   # upsert circuit x/y geometry from data/circuits.json
-make seed-corners    # seed FastF1 corner data (YEAR=2024 optional)
+make seed-corners    # seed FastF1 corner data (YEAR= optional preferred year)
 make refresh-stats SEASON=2024          # recompute driver_stats aggregates
 make fetch-telemetry SESSION_ID=73      # pre-warm telemetry cache for a session
 make hydrate YEAR=2024 GP='Monaco Grand Prix' SESSION=R
@@ -1249,8 +1321,8 @@ one unused import, one OpenAPI field rename
 
 ## Testing
 
-**148 backend tests** across 13 files + **163 legacy tests** for `src/` +
-the Streamlit app = **311 tests total**. All required to pass before
+**154 backend tests** across 14 files + **163 legacy tests** for `src/` +
+the Streamlit app = **317 tests total**. All required to pass before
 merge.
 
 | Suite | File | # | What it covers |
@@ -1262,13 +1334,14 @@ merge.
 | Query plans | [`test_query_plans.py`](backend/tests/test_query_plans.py) | 4 | `EXPLAIN (FORMAT JSON)` asserts `Index Scan` for the 3 hot queries + all indexes present |
 | ETL — hydrate | [`tests/etl/test_hydrate_session.py`](backend/tests/etl/test_hydrate_session.py) | 11 | Mocked OpenF1 via `responses` · idempotency proven (run twice = identical rows) · dry-run rollback · compound normalisation |
 | ETL — circuits | [`tests/etl/test_seed_circuits.py`](backend/tests/etl/test_seed_circuits.py) | 6 | Circuit geometry seed · upsert idempotency · missing session handling |
+| ETL — corners | [`tests/etl/test_seed_circuit_corners.py`](backend/tests/etl/test_seed_circuit_corners.py) | 6 | FastF1 mocked · round resolved by event name (never the OpenF1 meeting_key) · future-event year fallback · preferred-year flag · idempotent overwrite |
 | REST reads | [`test_v1_*.py`](backend/tests/api/) | 32 | Happy + 404 envelope + invalid cursor + season/team filters + per-driver lap walk |
 | Analytics | [`test_v1_analytics.py`](backend/tests/api/test_v1_analytics.py) | 16 | All 4 analytics + compare (all 9 channels) + sector-times + track-map with mocked OpenF1 / cached JSONB |
 | Services | [`tests/services/test_telemetry_compute.py`](backend/tests/services/test_telemetry_compute.py) | 8 | Cache-first fetch · JSONB round-trip · write-through on cache miss · lap reconstruction from columnar arrays |
 | GraphQL | [`tests/graphql/*.py`](backend/tests/graphql/) | 8 | Introspection · REST↔GraphQL parity for leaderboards · **N+1 regression guard** |
 | LLM | [`tests/llm/*.py`](backend/tests/llm/) | 11 | OpenAI mocked via queue-fake · all 5 patterns · SSE event sequence asserted |
 | /me | [`test_v1_me.py`](backend/tests/api/test_v1_me.py) | 10 | Cookie issuance · 2-client isolation · 100-row cap → 409 · ownership-check deletes |
-| **Total backend** | | **148** | |
+| **Total backend** | | **154** | |
 
 ### Test infrastructure highlights
 
@@ -1292,7 +1365,7 @@ merge.
 
 ```bash
 cd backend
-pytest -v                                  # all 148
+pytest -v                                  # all 154
 pytest tests/api -v                        # just REST
 pytest tests/llm -v                        # just LLM (mocked OpenAI)
 pytest tests/services -v                   # telemetry cache + compute
@@ -1367,6 +1440,7 @@ ORDER  BY driver_id;
 | Empty leaderboard | Session not hydrated | `python -m app.etl hydrate --year 2024 --gp "..." --session R` |
 | Compare chart blank, "503 Service Unavailable" | Session hydrated with synthetic session_key | Re-hydrate against real OpenF1: `python -m app.etl hydrate --year 2024 --gp "..." --session Q` |
 | Compare slow (1–2 s) despite data present | Telemetry not pre-cached | `python -m app.etl fetch-telemetry --session-id <id>` or use Pipeline page |
+| Corner Performance shows only 5–6 corners | `circuits.corners` not seeded — runtime fell back to speed-minima detection | `make seed-corners` (or `python -m app.etl seed-circuit-corners`) |
 
 ### Migration runbook
 

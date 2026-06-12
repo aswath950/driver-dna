@@ -153,6 +153,11 @@ function FetchTelemetryPanel({ base }: { base: string }) {
               <option key={ev.id} value={ev.id}>{ev.name}</option>
             ))}
           </select>
+          {!eventsLoading && events.length === 0 && (
+            <p className="mt-1 text-xs text-white/40">
+              No {year} sessions in database — hydrate them with Download Dataset first.
+            </p>
+          )}
         </div>
 
         {/* Session */}
@@ -350,7 +355,7 @@ export default function PipelinePage() {
                   <option value="">No events found</option>
                 )}
                 {events.map((ev) => (
-                  <option key={ev.id} value={ev.name}>
+                  <option key={ev.round} value={ev.name}>
                     R{ev.round} — {ev.name}
                   </option>
                 ))}

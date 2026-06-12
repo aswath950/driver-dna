@@ -25,7 +25,7 @@ help:
 	@echo "  backend-lint     ruff backend"
 	@echo "  migrate          alembic upgrade head + seed circuit corners (Phase 2+)"
 	@echo "  seed-circuits    Upsert circuit geometry from data/circuits.json (PATH= optional)"
-	@echo "  seed-corners     Seed FastF1 corner data only (YEAR=2024)"
+	@echo "  seed-corners     Seed FastF1 corner data only (YEAR= optional preferred year)"
 	@echo "  refresh-stats    Recompute driver_stats (SEASON=2024 or ALL_SEASONS=1)"
 	@echo "  fetch-telemetry  Download + cache car telemetry for a session (SESSION_ID=required)"
 	@echo "  hydrate          ETL one race weekend into Postgres (YEAR= GP= SESSION=)"
@@ -85,12 +85,12 @@ migrate:
 	@echo "Waiting for Postgres to be ready..."
 	@until docker compose exec postgres pg_isready -U dna -d driver_dna > /dev/null 2>&1; do sleep 1; done
 	cd backend && .venv/bin/alembic upgrade head
-	@echo "Seeding circuit corner data from FastF1 (year=$(or $(YEAR),2024))..."
-	cd backend && .venv/bin/python -m app.etl seed-circuit-corners --year $(or $(YEAR),2024)
+	@echo "Seeding circuit corner data from FastF1$(if $(YEAR), (preferred year=$(YEAR)),)..."
+	cd backend && .venv/bin/python -m app.etl seed-circuit-corners $(if $(YEAR),--year $(YEAR),)
 
 seed-corners:
-	@echo "Seeding circuit corner data from FastF1 (year=$(or $(YEAR),2024))..."
-	cd backend && .venv/bin/python -m app.etl seed-circuit-corners --year $(or $(YEAR),2024)
+	@echo "Seeding circuit corner data from FastF1$(if $(YEAR), (preferred year=$(YEAR)),)..."
+	cd backend && .venv/bin/python -m app.etl seed-circuit-corners $(if $(YEAR),--year $(YEAR),)
 
 hydrate:
 	@echo "Usage: make hydrate YEAR=2024 GP='Monaco' SESSION=R"
