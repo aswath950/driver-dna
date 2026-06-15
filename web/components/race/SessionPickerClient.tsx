@@ -5,17 +5,14 @@ import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { Button } from "@/components/ui/Button";
 import { apiClient, type EventOut, type SessionOut, type GpScheduleItem } from "@/lib/api-client";
+import {
+  LAST_SESSION_KEY,
+  parseStoredSession,
+  decideStoredSessionAction,
+} from "@/lib/session-nav";
 
 // Years for which OpenF1 has real race data.
 const AVAILABLE_YEARS = [2026, 2025, 2024, 2023];
-
-const LAST_SESSION_KEY = "dna_last_session";
-
-interface LastSession {
-  year: number;
-  dbEventId: number;
-  sessionId: number;
-}
 
 // Each entry in the GP dropdown: OpenF1-canonical name + round, and the DB
 // event ID if that GP has been hydrated into the database (null = not yet).
@@ -24,15 +21,6 @@ interface EventItem {
   name: string;           // OpenF1 canonical name
   dbId: number | null;    // null → not hydrated; set → sessions can be loaded
   start_date: string | null;
-}
-
-function readLastSession(): LastSession | null {
-  try {
-    const raw = localStorage.getItem(LAST_SESSION_KEY);
-    return raw ? (JSON.parse(raw) as LastSession) : null;
-  } catch {
-    return null;
-  }
 }
 
 const SELECT_CLASS =
@@ -62,20 +50,47 @@ export function SessionPickerClient() {
   const dbEventId     = selectedEvent?.dbId ?? null;
   const notHydrated   = selectedRound !== null && selectedEvent !== null && dbEventId === null;
 
-  // On mount: auto-redirect to last session, or restore picker state when ?pick=1
+  // On mount: validate the stored session, then auto-redirect to it (or restore
+  // picker state when ?pick=1). A stale stored session — one whose ID no longer
+  // exists after a DB re-hydrate — would otherwise redirect into a 404, so we
+  // verify it exists first and clear the key + stay on the picker if it's gone.
   useEffect(() => {
-    const stored = readLastSession();
+    const stored = parseStoredSession(localStorage.getItem(LAST_SESSION_KEY));
     if (!stored) return;
 
-    if (!forcePickerMode) {
-      router.replace(`/race/${stored.sessionId}`);
-      return;
-    }
+    let cancelled = false;
+    apiClient
+      .getSession(stored.sessionId)
+      .then(() => true)
+      .catch(() => false)
+      .then((sessionExists) => {
+        if (cancelled) return;
+        const action = decideStoredSessionAction({
+          stored,
+          forcePicker: forcePickerMode,
+          sessionExists,
+        });
+        switch (action.kind) {
+          case "clearStorage":
+            try {
+              localStorage.removeItem(LAST_SESSION_KEY);
+            } catch {}
+            break;
+          case "redirect":
+            router.replace(action.path);
+            break;
+          case "restore":
+            // Restore dropdowns to the last-viewed selection.
+            restoreDbEventId.current = stored.dbEventId;
+            restoreSessionId.current = stored.sessionId;
+            setYear(stored.year); // triggers year effect → cascades restore
+            break;
+          case "none":
+            break;
+        }
+      });
 
-    // ?pick=1 — restore dropdowns to the last-viewed selection
-    restoreDbEventId.current = stored.dbEventId;
-    restoreSessionId.current  = stored.sessionId;
-    setYear(stored.year); // triggers year effect → cascades restore
+    return () => { cancelled = true; };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Populate the GP list whenever year changes.
