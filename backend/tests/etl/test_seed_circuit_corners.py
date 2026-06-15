@@ -143,6 +143,32 @@ def test_resolves_round_by_name_and_stores_corners(
     assert float(row["length_km"]) == round(_TOTAL_M / 1000, 3)
 
 
+def test_aliased_event_name_resolves_via_canonical(
+    clean_db: sa.Engine, db: Session, fake_fastf1: dict
+) -> None:
+    # OpenF1 names this weekend "Barcelona Grand Prix"; FastF1's schedule only
+    # carries the canonical "Spanish Grand Prix". The alias must bridge the gap
+    # so corners are still resolved and stored on the (canonical) circuit row.
+    _seed_event(
+        db, circuit_name="Spanish Grand Prix", event_name="Barcelona Grand Prix",
+        year=2025, round_=1290,
+    )
+    fake_fastf1["schedules"][2025] = _schedule_df(
+        [("Spanish Grand Prix", 9, "2025-06-01")]
+    )
+
+    result = seed_circuit_corners.run()
+
+    assert result.circuits_updated == 1
+    assert result.errors == []
+    # Resolved via the canonical schedule entry, not the OpenF1 event name.
+    assert fake_fastf1["calls"] == [(2025, 9)]
+
+    row = _read_circuit(clean_db, "Spanish Grand Prix")
+    assert row["corners"] == _CORNERS
+    assert float(row["length_km"]) == round(_TOTAL_M / 1000, 3)
+
+
 def test_unmatched_event_name_is_skipped(
     clean_db: sa.Engine, db: Session, fake_fastf1: dict
 ) -> None:
