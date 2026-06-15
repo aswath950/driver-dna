@@ -38,8 +38,11 @@ from app.db.models import Driver, SessionDriver
 from app.db.repositories import laps as laps_repo
 from app.db.repositories import sessions as sessions_repo
 from app.services import analytics_service, compare_service, corner_service
+from src.openf1 import OpenF1AuthError
 
 router = APIRouter(tags=["analytics"])
+
+_OPENF1_401_MSG = "OpenF1 API returned 401 Unauthorized. The API may now require authentication."
 
 _NOT_FOUND = {404: {"model": ErrorEnvelope}}
 _NOT_READY = {503: {"model": ErrorEnvelope}}
@@ -141,13 +144,16 @@ async def compare(
         ),
     ),
 ) -> ComparePayload:
-    payload = await compare_service.build_compare_payload(
-        db,
-        session_id=session_id,
-        driver_a_id=driver_a,
-        driver_b_id=driver_b,
-        channel=channel,
-    )
+    try:
+        payload = await compare_service.build_compare_payload(
+            db,
+            session_id=session_id,
+            driver_a_id=driver_a,
+            driver_b_id=driver_b,
+            channel=channel,
+        )
+    except OpenF1AuthError as exc:
+        raise UpstreamError(_OPENF1_401_MSG) from exc
     return ComparePayload.model_validate(payload)
 
 
@@ -169,12 +175,15 @@ async def compare_sectors(
     driver_b: int = Query(..., description="Driver B internal id."),
 ) -> SectorTimesPayload:
     await _ensure_session(db, session_id)
-    payload = await compare_service.build_sector_times_payload(
-        db,
-        session_id=session_id,
-        driver_a_id=driver_a,
-        driver_b_id=driver_b,
-    )
+    try:
+        payload = await compare_service.build_sector_times_payload(
+            db,
+            session_id=session_id,
+            driver_a_id=driver_a,
+            driver_b_id=driver_b,
+        )
+    except OpenF1AuthError as exc:
+        raise UpstreamError(_OPENF1_401_MSG) from exc
     return SectorTimesPayload.model_validate(payload)
 
 
@@ -195,12 +204,15 @@ async def compare_track_map(
     driver_a: int = Query(..., description="Driver A internal id."),
     driver_b: int = Query(..., description="Driver B internal id."),
 ) -> TrackMapPayload:
-    payload = await compare_service.build_track_map_payload(
-        db,
-        session_id=session_id,
-        driver_a_id=driver_a,
-        driver_b_id=driver_b,
-    )
+    try:
+        payload = await compare_service.build_track_map_payload(
+            db,
+            session_id=session_id,
+            driver_a_id=driver_a,
+            driver_b_id=driver_b,
+        )
+    except OpenF1AuthError as exc:
+        raise UpstreamError(_OPENF1_401_MSG) from exc
     return TrackMapPayload.model_validate(payload)
 
 
@@ -314,10 +326,13 @@ async def corner_performance(
     team_a: int = Query(..., description="Team A internal id."),
     team_b: int = Query(..., description="Team B internal id."),
 ) -> CornerPerformancePayload:
-    payload = await corner_service.build_corner_performance_payload(
-        db,
-        session_id=session_id,
-        team_a_id=team_a,
-        team_b_id=team_b,
-    )
+    try:
+        payload = await corner_service.build_corner_performance_payload(
+            db,
+            session_id=session_id,
+            team_a_id=team_a,
+            team_b_id=team_b,
+        )
+    except OpenF1AuthError as exc:
+        raise UpstreamError(_OPENF1_401_MSG) from exc
     return CornerPerformancePayload.model_validate(payload)

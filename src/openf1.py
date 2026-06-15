@@ -43,6 +43,10 @@ _CAR_DATA_COLS = [
 ]
 
 
+class OpenF1AuthError(Exception):
+    """Raised when the OpenF1 API returns 401 Unauthorized."""
+
+
 def validate_dataframe(df: pd.DataFrame, required_cols: list[str], context: str = "") -> pd.DataFrame:
     """Check that *df* contains all *required_cols*.
 
@@ -121,6 +125,24 @@ class OpenF1Client:
                 if not data:
                     return pd.DataFrame()
                 return pd.DataFrame(data)
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 401:
+                    raise OpenF1AuthError(
+                        "OpenF1 API returned 401 Unauthorized. "
+                        "The API may now require authentication."
+                    ) from exc
+                if attempt < retries:
+                    delay = backoff ** attempt
+                    logger.warning(
+                        "OpenF1 %s attempt %d/%d failed (%s), retrying in %.1fs",
+                        endpoint, attempt, retries, exc, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.warning(
+                        "OpenF1 %s failed after %d attempts: %s",
+                        endpoint, retries, exc,
+                    )
             except (requests.RequestException, ValueError) as exc:
                 if attempt < retries:
                     delay = backoff ** attempt
