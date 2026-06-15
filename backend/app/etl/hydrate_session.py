@@ -12,8 +12,10 @@ Returns a summary dict with row counts per table; the CLI prints it.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -35,9 +37,21 @@ from app.db.models import (
 )
 from app.db.models import Session as SessionRow
 from app.etl import seed_circuit_corners
+from app.etl.circuit_aliases import canonical_circuit_name
 from app.etl.upserts import upsert_many, upsert_one
 
 logger = logging.getLogger(__name__)
+
+_CIRCUITS_JSON_PATH = Path(__file__).resolve().parents[3] / "data" / "circuits.json"
+
+
+def _load_circuits_json() -> dict[str, dict]:
+    try:
+        with _CIRCUITS_JSON_PATH.open() as fh:
+            return json.load(fh)
+    except Exception as exc:
+        logger.warning("Could not load circuits.json: %s", exc)
+        return {}
 
 
 # F1 points table (top 10). Index 0 = 1st place.
@@ -104,6 +118,7 @@ class SessionHydrator:
     def __init__(self, db: Session, client: OpenF1Client | None = None) -> None:
         self.db = db
         self.client = client or OpenF1Client(mode="historical")
+        self._circuits_geo: dict[str, dict] = _load_circuits_json()
 
     # ------------------------------------------------------------------
     # Reference data
@@ -122,24 +137,51 @@ class SessionHydrator:
     def _resolve_circuit_id(self, meeting_name: str | None) -> int:
         """Resolve the FK target for ``events.circuit_id``.
 
-        Prefers an existing ``circuits`` row matching ``meeting_name`` (the
-        natural key shared with ``data/circuits.json`` — e.g. "Australian
-        Grand Prix"). Falls back to a sentinel "Unknown" row if the circuit
-        has not been seeded yet — logged as a warning so unseeded weekends
-        are visible. Run ``python -m app.etl seed-circuits`` to populate
-        circuit geometry and sector fractions.
+        Looks up an existing ``circuits`` row by canonical name, creating it
+        from ``data/circuits.json`` (with full geometry) when missing.  If the
+        row exists but has no geometry, backfills it from the same JSON file so
+        TimeDelta / SectorTimes / TrackMap never 503 on a freshly hydrated race.
+
+        Falls back to a sentinel "Unknown" row only when the canonical name has
+        no entry in ``circuits.json`` either (e.g. a brand-new venue not yet
+        added to the file).
         """
         from app.db.models import Circuit  # local import — avoids cycles
         if meeting_name:
+            canonical = canonical_circuit_name(meeting_name) or meeting_name
             existing = self.db.execute(
-                Circuit.__table__.select().where(Circuit.name == meeting_name)
+                Circuit.__table__.select().where(Circuit.name == canonical)
             ).first()
             if existing is not None:
+                # Backfill geometry inline when it wasn't seeded previously.
+                if existing.sector_fractions is None or existing.x is None or existing.y is None:
+                    self._patch_circuit_geometry(canonical)
                 return int(existing.id)
+
+            # Row missing — create it with geometry from circuits.json if available.
+            geo = self._circuits_geo.get(canonical, {})
+            if geo:
+                row = upsert_one(
+                    self.db,
+                    Circuit.__table__,
+                    values={
+                        "name": canonical,
+                        "x": geo.get("x"),
+                        "y": geo.get("y"),
+                        "sector_fractions": geo.get("sector_fractions"),
+                    },
+                    conflict_cols=["name"],
+                    update_cols=["x", "y", "sector_fractions"],
+                )
+                logger.info("Created circuit row for %r with geometry from circuits.json", canonical)
+                return int(row["id"])
+
             logger.warning(
-                "circuits row missing for meeting_name=%r — falling back to 'Unknown' "
-                "(run `python -m app.etl seed-circuits` to seed geometry)",
+                "circuits row missing for meeting_name=%r (canonical=%r) and not found "
+                "in circuits.json — falling back to 'Unknown' (add an alias to "
+                "CIRCUIT_NAME_ALIASES or add the circuit to data/circuits.json)",
                 meeting_name,
+                canonical,
             )
         row = upsert_one(
             self.db,
@@ -150,6 +192,23 @@ class SessionHydrator:
             returning_cols=("id",),
         )
         return int(row["id"])
+
+    def _patch_circuit_geometry(self, canonical_name: str) -> None:
+        """Backfill x/y/sector_fractions from circuits.json onto an existing row."""
+        from app.db.models import Circuit  # local import — avoids cycles
+        geo = self._circuits_geo.get(canonical_name, {})
+        if not geo:
+            return
+        self.db.execute(
+            Circuit.__table__.update()
+            .where(Circuit.__table__.c.name == canonical_name)
+            .values(
+                x=geo.get("x"),
+                y=geo.get("y"),
+                sector_fractions=geo.get("sector_fractions"),
+            )
+        )
+        logger.info("Backfilled geometry for circuit %r from circuits.json", canonical_name)
 
     def _upsert_event(
         self,
