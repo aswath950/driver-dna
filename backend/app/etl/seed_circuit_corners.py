@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.models import Circuit, Event, Season
+from app.etl.circuit_aliases import canonical_circuit_name
 from app.etl.upserts import upsert_one
 
 logger = logging.getLogger(__name__)
@@ -217,11 +218,15 @@ def _resolve_and_fetch(
         schedule = _get_schedule_map(year, schedule_cache)
         if schedule is None:
             continue
-        match = schedule.get(event_name.strip().lower())
+        # OpenF1 event names can differ from FastF1's canonical schedule name
+        # (e.g. "Barcelona Grand Prix" → "Spanish Grand Prix"); normalise before
+        # matching so aliased weekends still resolve.
+        lookup_name = canonical_circuit_name(event_name) or event_name
+        match = schedule.get(lookup_name.strip().lower())
         if match is None:
             logger.info(
-                "No schedule match for event=%r year=%d — trying next candidate",
-                event_name, year,
+                "No schedule match for event=%r (lookup=%r) year=%d — trying next candidate",
+                event_name, lookup_name, year,
             )
             continue
         round_num, event_date = match

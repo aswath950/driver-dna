@@ -165,6 +165,9 @@ export const apiClient = {
   sessions: (eventId: number) =>
     clientFetch<SessionOut[]>(`/api/v1/events/${eventId}/sessions`),
 
+  getSession: (sessionId: number) =>
+    clientFetch<SessionOut>(`/api/v1/sessions/${sessionId}`),
+
   compare: (sessionId: number, driverA: number, driverB: number, channel: string) =>
     clientFetch<ComparePayload>(
       `/api/v1/sessions/${sessionId}/compare?driver_a=${driverA}&driver_b=${driverB}&channel=${channel}`,

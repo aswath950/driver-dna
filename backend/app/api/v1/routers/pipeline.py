@@ -91,7 +91,15 @@ async def gp_schedule(year: int = Query(..., description="Season year, e.g. 2024
     url = f"{settings.OPENF1_BASE_URL}/meetings?year={year}"
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(url)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 401:
+                raise HTTPException(
+                    status_code=503,
+                    detail="OpenF1 API returned 401 Unauthorized. The API may now require authentication.",
+                ) from exc
+            raise
         meetings = resp.json()
     races = [
         {"name": m["meeting_name"], "date": m.get("date_start", "")[:10]}

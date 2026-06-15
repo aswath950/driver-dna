@@ -1,5 +1,6 @@
-import { notFound } from "next/navigation";
+import { redirect } from "next/navigation";
 import Link from "next/link";
+import { RACE_PICKER_PATH } from "@/lib/session-nav";
 import {
   apiServer,
   type RollingPaceRow,
@@ -124,7 +125,9 @@ export default async function RaceSessionPage({
       apiServer.listTeamsForSession(sid).catch(() => [] as TeamOut[]),
     ]);
 
-  if (!session) return notFound();
+  // Stale/dead session URL (e.g. a bookmark after a DB re-hydrate) — fall back
+  // to the picker instead of a 404.
+  if (!session) redirect(RACE_PICKER_PATH);
 
   // Build driver code map from leaderboard (id → code)
   const driverCodeMap: Record<string, string> = {};
