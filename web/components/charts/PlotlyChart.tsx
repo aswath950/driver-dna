@@ -36,6 +36,16 @@ export function PlotlyChart({
         paper_bgcolor: "rgba(0,0,0,0)",
         plot_bgcolor: "rgba(0,0,0,0)",
         font: { color: "#fff", family: "Space Grotesk, system-ui" },
+        // Default hover styling: a light box with dark text so the hover data
+        // stays legible against the dark dashboard (otherwise Plotly's default
+        // light box + the white global font above renders white-on-white).
+        // Charts that set their own hoverlabel keep it via the spread below.
+        hoverlabel: {
+          bgcolor: "rgba(230, 230, 235, 0.97)",
+          bordercolor: "rgba(190, 190, 200, 0.9)",
+          font: { color: "rgba(15, 15, 20, 1)", size: 12, family: "Space Grotesk, system-ui" },
+          ...(fig.layout?.hoverlabel as Record<string, unknown> | undefined),
+        },
         margin: margin ?? { l: 50, r: 20, t: 40, b: 40 },
       }}
       useResizeHandler
