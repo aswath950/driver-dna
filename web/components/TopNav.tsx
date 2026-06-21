@@ -3,13 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import clsx from "clsx";
-
-const TABS = [
-  { label: "Driver Radar", href: "/radar" },
-  { label: "Mystery Driver", href: "/mystery-driver" },
-  { label: "Race Dashboard", href: "/race" },
-  { label: "Pipeline", href: "/pipeline" },
-] as const;
+import { enabledFeatures } from "@/lib/features";
 
 interface TopNavProps {
   onMenuOpen?: () => void;
@@ -17,6 +11,7 @@ interface TopNavProps {
 
 export function TopNav({ onMenuOpen }: TopNavProps) {
   const pathname = usePathname();
+  const tabs = enabledFeatures();
 
   return (
     <nav className="flex items-stretch border-b border-white/10 bg-[var(--bg-2)]">
@@ -35,7 +30,7 @@ export function TopNav({ onMenuOpen }: TopNavProps) {
 
       {/* Tabs — horizontally scrollable on narrow viewports */}
       <div className="flex min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-        {TABS.map((tab) => {
+        {tabs.map((tab) => {
           const active =
             pathname === tab.href || pathname.startsWith(tab.href + "/");
           return (
