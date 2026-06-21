@@ -247,6 +247,19 @@ export default async function RaceSessionPage({
         <Leaderboard rows={leaderboardRows} sessionType={sessionType} />
       </Card>
 
+      {/* Race chat */}
+      <section>
+        <h3 className="mb-1 text-base font-semibold">
+          Race Intelligence (Beta) — Ask me anything about this race
+        </h3>
+        <Card>
+          <p className="mb-2 text-xs text-white/50">
+            The model calls analytics tools as needed; tool decisions stream live.
+          </p>
+          <RaceChatStream sessionId={session.id} />
+        </Card>
+      </section>
+
       {/* Telemetry compare */}
       <section>
         <h3 className="mb-1 text-base font-semibold">
@@ -275,19 +288,6 @@ export default async function RaceSessionPage({
         tyreDegFigJson={tyreDegFigJson}
         driverCodeMap={driverCodeMap}
       />
-
-      {/* Race chat */}
-      <section>
-        <h3 className="mb-1 text-base font-semibold">
-          Race Intelligence (Beta) — Ask me anything about this race
-        </h3>
-        <Card>
-          <p className="mb-2 text-xs text-white/50">
-            The model calls analytics tools as needed; tool decisions stream live.
-          </p>
-          <RaceChatStream sessionId={session.id} />
-        </Card>
-      </section>
     </div>
   );
 }
