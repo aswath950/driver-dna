@@ -1,43 +1,53 @@
-PYTHON  := .venv/bin/python
 PIP     := .venv/bin/pip
 RUFF    := .venv/bin/ruff
 MYPY    := .venv/bin/mypy
 PYTEST  := .venv/bin/pytest
 
-.PHONY: help install-dev lint type-check test ci \
-        db backend-install backend backend-test backend-lint \
+.PHONY: help \
+        install-dev lint type-check test ci \
+        backend-install backend backend-test backend-lint \
         web-install web web-build web-typecheck \
-        dev hydrate migrate seed-corners seed-circuits refresh-stats fetch-telemetry
+        db migrate seed-circuits seed-corners refresh-stats fetch-telemetry hydrate \
+        dev
 
 help:
-	@echo "=== Legacy (src/ + Streamlit) ==="
-	@echo "  install-dev      Install src/ dev dependencies into .venv"
+	@echo "DriverDNA runs as one of two apps — pick an option:"
+	@echo ""
+	@echo "=== OPTION 1 · Legacy Streamlit (standalone dashboard) ==="
+	@echo "  Run manually:  streamlit run streamlit_app.py   (-> :8501)"
+	@echo "  Deploy:        Streamlit Cloud, or the root Dockerfile"
+	@echo "  install-dev      Install src/ (Streamlit) deps into .venv"
 	@echo "  lint             Run ruff on src/ and tests/"
 	@echo "  type-check       Run mypy on race_engine.py and openf1.py"
 	@echo "  test             Run pytest with coverage"
 	@echo "  ci               lint + type-check + test"
 	@echo ""
-	@echo "=== Backend (FastAPI + Postgres) ==="
-	@echo "  db               Start Postgres + pgAdmin via docker compose (detached)"
+	@echo "=== OPTION 2 · Full-stack (FastAPI + Next.js + Postgres) ==="
+	@echo "  Deploy:        Vercel (web) + Railway (backend), or docker compose"
+	@echo "  - Backend (FastAPI):"
 	@echo "  backend-install  pip install -e backend[dev] into backend/.venv"
 	@echo "  backend          Run uvicorn dev server on :8000"
 	@echo "  backend-test     pytest the backend test suite"
 	@echo "  backend-lint     ruff backend"
-	@echo "  migrate          alembic upgrade head + seed circuit corners (Phase 2+)"
-	@echo "  seed-circuits    Upsert circuit geometry from data/circuits.json (PATH= optional)"
-	@echo "  seed-corners     Seed FastF1 corner data only (YEAR= optional preferred year)"
-	@echo "  refresh-stats    Recompute driver_stats (SEASON=2024 or ALL_SEASONS=1)"
-	@echo "  fetch-telemetry  Download + cache car telemetry for a session (SESSION_ID=required)"
-	@echo "  hydrate          ETL one race weekend into Postgres (YEAR= GP= SESSION=)"
-	@echo ""
-	@echo "=== Web (Next.js) ==="
+	@echo "  - Web (Next.js):"
 	@echo "  web-install      pnpm install in web/"
 	@echo "  web              pnpm dev (localhost:3000)"
 	@echo "  web-build        pnpm build"
 	@echo "  web-typecheck    tsc --noEmit"
-	@echo ""
-	@echo "=== Full stack ==="
+	@echo "  - Database & ETL:"
+	@echo "  db               Start Postgres + pgAdmin via docker compose (detached)"
+	@echo "  migrate          alembic upgrade head + seed circuit corners"
+	@echo "  seed-circuits    Upsert circuit geometry (CIRCUITS_PATH= optional)"
+	@echo "  seed-corners     Seed FastF1 corner data only (YEAR= optional)"
+	@echo "  refresh-stats    Recompute driver_stats (SEASON=2024 or ALL_SEASONS=1)"
+	@echo "  fetch-telemetry  Download + cache telemetry (SESSION_ID= required)"
+	@echo "  hydrate          ETL one race weekend into Postgres (YEAR= GP= SESSION=)"
+	@echo "  - Run it all:"
 	@echo "  dev              db + pgAdmin + backend + web in one command"
+
+# ---------------------------------------------------------------------------
+# OPTION 1 — Legacy Streamlit (standalone)
+# ---------------------------------------------------------------------------
 
 install-dev:
 	$(PIP) install -r requirements.txt
@@ -61,10 +71,8 @@ test:
 ci: lint type-check test
 
 # ---------------------------------------------------------------------------
-# Backend (FastAPI)
+# OPTION 2 — Full-stack · Backend (FastAPI + Postgres)
 # ---------------------------------------------------------------------------
-
-BACKEND_VENV := backend/.venv
 
 db:
 	docker compose up -d postgres pgadmin
@@ -81,6 +89,7 @@ backend-test:
 backend-lint:
 	cd backend && .venv/bin/ruff check app tests
 
+# OPTION 2 — Full-stack · Database & ETL
 migrate:
 	@echo "Waiting for Postgres to be ready..."
 	@until docker compose exec postgres pg_isready -U dna -d driver_dna > /dev/null 2>&1; do sleep 1; done
@@ -98,7 +107,7 @@ hydrate:
 
 seed-circuits:
 	@echo "Seeding circuit geometry from data/circuits.json..."
-	cd backend && .venv/bin/python -m app.etl seed-circuits $(if $(PATH),--path "$(PATH)",)
+	cd backend && .venv/bin/python -m app.etl seed-circuits $(if $(CIRCUITS_PATH),--path "$(CIRCUITS_PATH)",)
 
 refresh-stats:
 	@echo "Refreshing driver stats..."
@@ -109,7 +118,7 @@ fetch-telemetry:
 	cd backend && .venv/bin/python -m app.etl fetch-telemetry --session-id $(SESSION_ID)
 
 # ---------------------------------------------------------------------------
-# Web (Next.js)
+# OPTION 2 — Full-stack · Web (Next.js)
 # ---------------------------------------------------------------------------
 
 web-install:
@@ -125,7 +134,7 @@ web-typecheck:
 	cd web && pnpm typecheck
 
 # ---------------------------------------------------------------------------
-# Full stack (best-effort; prefer 3 terminals during real dev)
+# OPTION 2 — Full-stack · Run it all (best-effort; prefer 3 terminals)
 # ---------------------------------------------------------------------------
 
 dev:
