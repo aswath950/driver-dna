@@ -2,13 +2,15 @@
  * Operator feature-flag registry — the single source of truth for which
  * top-level features (nav tabs + routes) are enabled.
  *
- * Toggling is a build-time operator kill-switch via NEXT_PUBLIC_DISABLED_FEATURES,
- * a comma-separated denylist of feature keys (e.g. "mystery-driver,pipeline").
- * Unset = every feature enabled. The NEXT_PUBLIC_ value is inlined at build time,
- * so changes require a rebuild / redeploy.
+ * Toggling is a runtime operator kill-switch via the server-only DISABLED_FEATURES
+ * env var, a comma-separated denylist of feature keys (e.g. "mystery-driver,pipeline").
+ * Unset = every feature enabled. The value is read on the server at request time
+ * (see readDisabledFeatures in lib/env.ts), so changing it takes effect on the next
+ * deploy/boot with NO rebuild.
  *
- * This module is pure (no Node-only deps) so it is safe to import from both a
- * client component (TopNav) and edge middleware (web/middleware.ts).
+ * This module is PURE: it never reads process.env. The disabled set is passed in as
+ * an argument so the same helpers are safe to use from a client component (TopNav,
+ * via a server-provided prop) and from edge middleware (web/middleware.ts).
  */
 
 export type FeatureKey = "radar" | "mystery-driver" | "race" | "pipeline";
@@ -27,27 +29,30 @@ export const FEATURES: FeatureDef[] = [
   { key: "pipeline", label: "Pipeline", href: "/pipeline" },
 ];
 
-// Parse inside the function (not at module top-level) so vitest's vi.stubEnv
-// works and the read survives NEXT_PUBLIC_ inlining.
-function disabledKeys(): Set<string> {
+/**
+ * Parse the raw DISABLED_FEATURES string (comma-separated keys) into a set.
+ * Tolerates surrounding whitespace and empty entries; undefined/"" → empty set.
+ * Pure — the caller supplies the raw value (read from env on the server).
+ */
+export function parseDisabledFeatures(raw: string | undefined): Set<string> {
   return new Set(
-    (process.env.NEXT_PUBLIC_DISABLED_FEATURES ?? "")
+    (raw ?? "")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean),
   );
 }
 
-export function isFeatureEnabled(key: FeatureKey): boolean {
-  return !disabledKeys().has(key);
+export function isFeatureEnabled(key: FeatureKey, disabled: Set<string>): boolean {
+  return !disabled.has(key);
 }
 
-export function enabledFeatures(): FeatureDef[] {
-  return FEATURES.filter((f) => isFeatureEnabled(f.key));
+export function enabledFeatures(disabled: Set<string>): FeatureDef[] {
+  return FEATURES.filter((f) => isFeatureEnabled(f.key, disabled));
 }
 
-export function firstEnabledFeature(): FeatureDef | null {
-  return enabledFeatures()[0] ?? null;
+export function firstEnabledFeature(disabled: Set<string>): FeatureDef | null {
+  return enabledFeatures(disabled)[0] ?? null;
 }
 
 /**

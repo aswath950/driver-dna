@@ -4,8 +4,15 @@ import { useState, useEffect, useCallback } from "react";
 import clsx from "clsx";
 import { Sidebar } from "./Sidebar";
 import { TopNav } from "./TopNav";
+import type { FeatureDef } from "@/lib/features";
 
-export function AppShell({ children }: { children: React.ReactNode }) {
+export function AppShell({
+  children,
+  features,
+}: {
+  children: React.ReactNode;
+  features: FeatureDef[];
+}) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const close = useCallback(() => setDrawerOpen(false), []);
 
@@ -76,7 +83,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
       {/* ── Main column ── */}
       <div className="flex min-w-0 flex-1 flex-col">
-        <TopNav onMenuOpen={() => setDrawerOpen(true)} />
+        <TopNav features={features} onMenuOpen={() => setDrawerOpen(true)} />
         <main className="flex-1 px-4 py-6 md:px-6 md:py-8">{children}</main>
       </div>
     </div>

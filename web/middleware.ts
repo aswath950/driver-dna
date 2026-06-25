@@ -4,6 +4,7 @@ import {
   isFeatureEnabled,
   firstEnabledFeature,
 } from "@/lib/features";
+import { readDisabledFeatures } from "@/lib/env";
 
 /**
  * Route-level enforcement for the operator feature kill-switch.
@@ -15,9 +16,13 @@ import {
  */
 export function middleware(req: NextRequest) {
   const key = featureForPath(req.nextUrl.pathname);
-  if (!key || isFeatureEnabled(key)) return NextResponse.next();
+  if (!key) return NextResponse.next();
 
-  const target = firstEnabledFeature();
+  // Read the runtime kill-switch once per request (server/edge env, not inlined).
+  const disabled = readDisabledFeatures();
+  if (isFeatureEnabled(key, disabled)) return NextResponse.next();
+
+  const target = firstEnabledFeature(disabled);
   // Guard against a redirect loop if literally everything is disabled.
   if (!target || req.nextUrl.pathname === target.href) return NextResponse.next();
 
