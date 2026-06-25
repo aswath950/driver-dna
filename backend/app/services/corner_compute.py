@@ -102,6 +102,78 @@ def detect_corners(
 
 
 # ---------------------------------------------------------------------------
+# Bounded entry/exit boundaries — shared by both detection paths
+# ---------------------------------------------------------------------------
+
+
+def _territory_bounds(apex_indices: list[int], n: int) -> list[tuple[int, int]]:
+    """Split the speed grid into disjoint per-corner territories.
+
+    Each corner owns the span up to the midpoint between its apex and each
+    neighbour, so no two corners' entry/exit windows can overlap (the cause of
+    duplicate v_min values when corners are close together — chicanes, esses).
+
+    Args:
+        apex_indices: Apex grid indices, ascending. May contain equal/adjacent
+                      values on long circuits where corners round to the same
+                      200-pt index.
+        n:            Length of the speed grid (N_POINTS).
+
+    Returns:
+        List of (lower, upper) bounds aligned 1-to-1 with apex_indices, each
+        guaranteed to satisfy ``lower <= apex <= upper`` (window size >= 1).
+    """
+    k = len(apex_indices)
+    bounds: list[tuple[int, int]] = []
+    for i, apex in enumerate(apex_indices):
+        lower = 0 if i == 0 else (apex_indices[i - 1] + apex) // 2 + 1
+        upper = n - 1 if i == k - 1 else (apex + apex_indices[i + 1]) // 2
+        # Guard coincident/adjacent apexes so the apex always stays inside its
+        # own territory and the window never collapses below one point.
+        lower = min(lower, apex)
+        upper = max(upper, apex)
+        bounds.append((lower, upper))
+    return bounds
+
+
+def _corner_boundaries(
+    sp_smooth: np.ndarray,
+    apex_idx: int,
+    lower: int,
+    upper: int,
+) -> tuple[int, int]:
+    """Find entry/exit indices around an apex, clamped to a territory.
+
+    Walks outward from the apex while speed stays within 30% recovery of the
+    surrounding approach/exit rise, but never past ``lower`` (entry) or
+    ``upper`` (exit) — both the walk and the rise reference are confined to the
+    corner's own territory.
+
+    Returns:
+        (entry_idx, exit_idx) with ``lower <= entry_idx <= apex_idx <= exit_idx <= upper``.
+    """
+    v_apex = sp_smooth[apex_idx]
+
+    # Entry: walk backward while still within 30% recovery of approach drop.
+    # The 50-pt rise reference is clamped to the territory (lower instead of 0)
+    # so it never reaches across into a neighbouring corner.
+    approach_max = float(sp_smooth[max(lower, apex_idx - 50) : apex_idx + 1].max())
+    entry_threshold = v_apex + 0.3 * (approach_max - v_apex)
+    entry_idx = int(apex_idx)
+    while entry_idx > lower and sp_smooth[entry_idx] < entry_threshold:
+        entry_idx -= 1
+
+    # Exit: walk forward while still within 30% recovery of exit rise.
+    exit_max = float(sp_smooth[apex_idx : min(upper + 1, apex_idx + 50)].max())
+    exit_threshold = v_apex + 0.3 * (exit_max - v_apex)
+    exit_idx = int(apex_idx)
+    while exit_idx < upper and sp_smooth[exit_idx] < exit_threshold:
+        exit_idx += 1
+
+    return entry_idx, exit_idx
+
+
+# ---------------------------------------------------------------------------
 # Preloaded-corner mapping (FastF1 authoritative data)
 # ---------------------------------------------------------------------------
 
@@ -135,27 +207,20 @@ def corners_from_preloaded(
     n = len(sp)
     sp_smooth = gaussian_filter1d(sp, sigma=3)
 
+    ordered = sorted(preloaded, key=lambda r: r["distance_m"])
+    apex_fracs = [
+        float(np.clip(c["distance_m"] / circuit_length_m, 0.0, 1.0)) for c in ordered
+    ]
+    apex_indices = [int(np.clip(round(f * (n - 1)), 0, n - 1)) for f in apex_fracs]
+    # Disjoint per-corner territories keep each entry/exit walk off its
+    # neighbours, so close corners (chicanes) no longer share a v_min.
+    bounds = _territory_bounds(apex_indices, n)
+
     corners: list[dict] = []
-    for c in sorted(preloaded, key=lambda r: r["distance_m"]):
-        apex_frac = float(np.clip(c["distance_m"] / circuit_length_m, 0.0, 1.0))
-        apex_idx = int(np.clip(round(apex_frac * (n - 1)), 0, n - 1))
-
-        v_apex = sp_smooth[apex_idx]
-
-        # Entry: walk backward while still within 30% recovery of approach drop.
-        approach_max = float(sp_smooth[max(0, apex_idx - 50) : apex_idx + 1].max())
-        entry_threshold = v_apex + 0.3 * (approach_max - v_apex)
-        entry_idx = int(apex_idx)
-        while entry_idx > 0 and sp_smooth[entry_idx] < entry_threshold:
-            entry_idx -= 1
-
-        # Exit: walk forward while still within 30% recovery of exit rise.
-        exit_max = float(sp_smooth[apex_idx : min(n, apex_idx + 50)].max())
-        exit_threshold = v_apex + 0.3 * (exit_max - v_apex)
-        exit_idx = int(apex_idx)
-        while exit_idx < n - 1 and sp_smooth[exit_idx] < exit_threshold:
-            exit_idx += 1
-
+    for c, apex_frac, apex_idx, (lower, upper) in zip(
+        ordered, apex_fracs, apex_indices, bounds
+    ):
+        entry_idx, exit_idx = _corner_boundaries(sp_smooth, apex_idx, lower, upper)
         corners.append({
             "corner_number": int(c["number"]),
             "apex_frac":  apex_frac,
@@ -196,24 +261,14 @@ def detect_corners_from_speed(speed: list[float]) -> list[dict]:
     # distance >= 8 points (~4% of a lap) prevents double-detection of one corner.
     peaks, _ = find_peaks(-sp_smooth, prominence=15, distance=8)
 
+    apex_indices = [int(p) for p in peaks]
+    # Disjoint per-corner territories keep each entry/exit walk off its
+    # neighbours, so close corners (chicanes) no longer share a v_min.
+    bounds = _territory_bounds(apex_indices, n)
+
     corners: list[dict] = []
-    for i, apex_idx in enumerate(peaks):
-        v_apex = sp_smooth[apex_idx]
-
-        # Entry: walk backward while still within 30% recovery of approach drop.
-        approach_max = float(sp_smooth[max(0, apex_idx - 50) : apex_idx + 1].max())
-        entry_threshold = v_apex + 0.3 * (approach_max - v_apex)
-        entry_idx = int(apex_idx)
-        while entry_idx > 0 and sp_smooth[entry_idx] < entry_threshold:
-            entry_idx -= 1
-
-        # Exit: walk forward while still within 30% recovery of exit rise.
-        exit_max = float(sp_smooth[apex_idx : min(n, apex_idx + 50)].max())
-        exit_threshold = v_apex + 0.3 * (exit_max - v_apex)
-        exit_idx = int(apex_idx)
-        while exit_idx < n - 1 and sp_smooth[exit_idx] < exit_threshold:
-            exit_idx += 1
-
+    for i, (apex_idx, (lower, upper)) in enumerate(zip(apex_indices, bounds)):
+        entry_idx, exit_idx = _corner_boundaries(sp_smooth, apex_idx, lower, upper)
         corners.append({
             "corner_number": i + 1,
             "apex_frac":  float(apex_idx / (n - 1)),

@@ -3,15 +3,18 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import clsx from "clsx";
-import { enabledFeatures } from "@/lib/features";
+import type { FeatureDef } from "@/lib/features";
 
 interface TopNavProps {
+  // Enabled features are computed on the server (runtime DISABLED_FEATURES read)
+  // and passed down — this client component never touches process.env.
+  features: FeatureDef[];
   onMenuOpen?: () => void;
 }
 
-export function TopNav({ onMenuOpen }: TopNavProps) {
+export function TopNav({ features, onMenuOpen }: TopNavProps) {
   const pathname = usePathname();
-  const tabs = enabledFeatures();
+  const tabs = features;
 
   return (
     <nav className="flex items-stretch border-b border-white/10 bg-[var(--bg-2)]">

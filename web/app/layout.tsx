@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import { AppShell } from "@/components/AppShell";
+import { readDisabledFeatures } from "@/lib/env";
+import { enabledFeatures } from "@/lib/features";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -7,7 +9,14 @@ export const metadata: Metadata = {
   description: "F1 telemetry analytics dashboard",
 };
 
+// Read the operator kill-switch (DISABLED_FEATURES) at request time, not build
+// time. Without force-dynamic the layout could be statically prerendered, freezing
+// the env value into the shell and re-breaking runtime toggling of the nav.
+export const dynamic = "force-dynamic";
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  const features = enabledFeatures(readDisabledFeatures());
+
   return (
     <html lang="en">
       <head>
@@ -19,7 +28,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         />
       </head>
       <body>
-        <AppShell>{children}</AppShell>
+        <AppShell features={features}>{children}</AppShell>
       </body>
     </html>
   );
