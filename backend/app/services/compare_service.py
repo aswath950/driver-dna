@@ -33,7 +33,7 @@ from app.services import telemetry_compute as tc
 
 Channel = Literal[
     "Speed", "Throttle", "Brake", "RPM", "nGear", "DRS",
-    "TimeDelta", "TrackMap", "SectorTimes",
+    "TimeDelta", "SpeedTimeDelta", "TrackMap", "SectorTimes",
 ]
 
 # Fallback palette when a driver/team has no colour. Visually-distinct
@@ -82,7 +82,16 @@ async def _resolve_session_key(db: AsyncSession, session_id: int) -> int:
         raise UpstreamError(
             f"session {session_id} has no openf1_session_key — was it loaded by ETL?"
         )
-    return int(s.openf1_session_key)
+    session_key = int(s.openf1_session_key)
+    # Fail fast on a stale key: OpenF1 renumbered its sessions, so a key written
+    # under the old scheme 404s on every downstream call. Without this guard the
+    # live compare path returns confusing empty traces / a downstream 503.
+    if not OpenF1Client(mode="historical").session_exists(session_key):
+        raise UpstreamError(
+            f"session {session_id} openf1_session_key={session_key} is not "
+            "recognized by OpenF1 (stale key) — re-resolve and update it."
+        )
+    return session_key
 
 
 async def _resolve_driver(
@@ -321,9 +330,21 @@ async def build_compare_payload(
     car_b, code_b, color_b = await _resolve_driver(db, session_id, driver_b_id)
     color_a, color_b = _differentiate_colors(color_a, color_b)
 
-    # Only TimeDelta uses sector_fractions overlays; the car-data channels
-    # render fine without a seeded circuit, so don't gate them on it.
-    circuit = await _load_circuit(db, session_id) if channel == "TimeDelta" else None
+    # TimeDelta requires sector_fractions, so load (and validate) the circuit.
+    # The car-data channels render fine without a seeded circuit — they only
+    # use the circuit's corners to label the x-axis with turn positions — so
+    # load it leniently and tolerate a missing/unseeded row.
+    if channel == "TimeDelta":
+        circuit = await _load_circuit(db, session_id)
+    else:
+        circuit = await circuits_repo.get_for_session(db, session_id)
+
+    corners = circuit.corners if circuit else None
+    circuit_length_m = (
+        float(circuit.length_km) * 1000
+        if circuit is not None and circuit.length_km is not None
+        else None
+    )
 
     client = OpenF1Client(mode="historical")
 
@@ -374,16 +395,34 @@ async def build_compare_payload(
             data_a, code_a, color_a,
             data_b, code_b, color_b,
             sector_fractions=circuit.sector_fractions,
+            corners=corners,
+            circuit_length_m=circuit_length_m,
         )
         # The "trace" field on TimeDelta payloads carries the per-driver
         # cumtime arrays — useful for clients that want raw numbers.
         trace_a = [float(v) for v in data_a["cumtime"]]
         trace_b = [float(v) for v in data_b["cumtime"]]
+    elif channel == "SpeedTimeDelta":
+        # Stacked Speed + Time-Delta view. Renders the core speed/gap story even
+        # without a seeded circuit; turn ticks and sector overlays are added when
+        # the circuit geometry is available (hence the lenient load above).
+        fig = tc.build_speed_time_delta_figure(
+            data_a, code_a, color_a,
+            data_b, code_b, color_b,
+            sector_fractions=circuit.sector_fractions if circuit else None,
+            corners=corners,
+            circuit_length_m=circuit_length_m,
+        )
+        # The combined view is speed-led, so the "trace" field carries Speed.
+        trace_a = [float(v) for v in data_a["speed"]]
+        trace_b = [float(v) for v in data_b["speed"]]
     else:
         fig = tc.build_channel_figure(
             data_a, code_a, color_a,
             data_b, code_b, color_b,
             channel=channel,
+            corners=corners,
+            circuit_length_m=circuit_length_m,
         )
         col = tc.CHANNEL_COLUMN[channel]
         trace_a = [float(v) for v in data_a[col]]

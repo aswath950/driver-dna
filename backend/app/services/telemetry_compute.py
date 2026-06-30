@@ -141,6 +141,54 @@ def _to_rgba(color: str, alpha: float = 0.30) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
+def _lap_label(data: dict) -> str:
+    """Format a driver's fastest lap as ``"Lap N, T.TTTs"`` (time only if no number)."""
+    lap_n = data.get("lap_number")
+    if lap_n is not None:
+        return f"Lap {lap_n}, {data['lap_time']:.3f}s"
+    return f"{data['lap_time']:.3f}s"
+
+
+def corner_axis_ticks(
+    corners: list[dict] | None,
+    circuit_length_m: float | None,
+    *,
+    axis_max: float,
+) -> tuple[list[float], list[str]] | None:
+    """Map a circuit's corners to x-axis tick positions and turn labels.
+
+    ``corners`` is the ``circuits.corners`` list — each entry has
+    ``{"number", "letter", "distance_m"}`` where ``distance_m`` is metres from
+    the start/finish line.  ``axis_max`` is the largest x value on the target
+    axis (``N_POINTS - 1`` for the index-based channel charts, ``100`` for the
+    lap-distance-% delta chart), so a corner at fraction ``f`` along the lap is
+    placed at ``f * axis_max``.
+
+    Returns ``(tickvals, ticktext)`` with one entry per in-bounds corner, or
+    ``None`` when corner data is missing/unusable so callers can fall back to
+    the plain normalised axis.
+    """
+    if not corners or not circuit_length_m or circuit_length_m <= 0:
+        return None
+
+    ordered = sorted(corners, key=lambda c: c["distance_m"])
+    tickvals: list[float] = []
+    ticktext: list[str] = []
+    for c in ordered:
+        frac = c["distance_m"] / circuit_length_m
+        if not (0.0 <= frac <= 1.0):
+            continue
+        letter = str(c.get("letter", "")).strip()
+        if letter.lower() in ("", "nan", "none"):
+            letter = ""
+        tickvals.append(round(frac * axis_max, 3))
+        ticktext.append(f"T{int(c['number'])}{letter}")
+
+    if not tickvals:
+        return None
+    return tickvals, ticktext
+
+
 # ---------------------------------------------------------------------------
 # Channel figure (Speed / Throttle / Brake / RPM / nGear / DRS)
 # ---------------------------------------------------------------------------
@@ -151,12 +199,20 @@ def build_channel_figure(
     data_b: dict, acronym_b: str, color_b: str,
     *,
     channel: str,
+    corners: list[dict] | None = None,
+    circuit_length_m: float | None = None,
 ) -> go.Figure:
-    """Two-line per-channel comparison over normalised lap distance.
+    """Two-line per-channel comparison over lap distance.
 
     Mirrors the Streamlit chart at ``src/app.py:1990-2007`` — minimal,
     distance-indexed, hover-unified — but uses driver colours from the
     backend's team colour resolver.
+
+    When ``corners`` + ``circuit_length_m`` are supplied the x-axis is
+    annotated with the circuit's turn positions (T1, T2, …) instead of the raw
+    0–200 normalised point indices; the chart falls back to the plain
+    normalised axis when corner data is unavailable.  Speed is labelled in
+    km/h since that is the unit of the underlying telemetry.
     """
     col = CHANNEL_COLUMN[channel]
     trace_a = data_a[col]
@@ -175,23 +231,53 @@ def build_channel_figure(
         else f"{data_b['lap_time']:.3f}s"
     )
 
+    is_speed = channel == "Speed"
+    y_title = "Speed (km/h)" if is_speed else channel
+    # Speed values get an explicit km/h unit on hover; the driver name stays as
+    # the per-row label (the <extra> slot) so the unified tooltip is unchanged
+    # apart from the unit.
+    hovertemplate = "%{y:.0f} km/h<extra>%{fullData.name}</extra>" if is_speed else None
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=np.arange(N_POINTS), y=trace_a,
         mode="lines",
         name=f"{acronym_a} ({lap_a_str})",
         line=dict(color=color_a, width=2.5),
+        hovertemplate=hovertemplate,
     ))
     fig.add_trace(go.Scatter(
         x=np.arange(N_POINTS), y=trace_b,
         mode="lines",
         name=f"{acronym_b} ({lap_b_str})",
         line=dict(color=color_b, width=2.5),
+        hovertemplate=hovertemplate,
     ))
+
+    ticks = corner_axis_ticks(corners, circuit_length_m, axis_max=N_POINTS - 1)
+    if ticks is not None:
+        tickvals, ticktext = ticks
+        xaxis = dict(
+            title="Track Position (turn)",
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+            tickangle=0,
+        )
+        # Subtle guide line at each turn so the apex positions read at a glance.
+        for xv in tickvals:
+            fig.add_vline(
+                x=xv,
+                line=dict(color="rgba(255,255,255,0.12)", width=1),
+                layer="below",
+            )
+    else:
+        xaxis = dict(title="Normalised Distance (0–200 points)")
+
     fig.update_layout(
         title=f"Fastest Lap {channel} — {acronym_a} vs {acronym_b}",
-        xaxis_title="Normalised Distance (0–200 points)",
-        yaxis_title=channel,
+        xaxis=xaxis,
+        yaxis_title=y_title,
         legend_title="Driver",
         hovermode="x unified",
         hoverlabel=dict(
@@ -215,8 +301,16 @@ def build_time_delta_figure(
     data_b: dict, acronym_b: str, color_b: str,
     *,
     sector_fractions: list[float] | None = None,
+    corners: list[dict] | None = None,
+    circuit_length_m: float | None = None,
 ) -> go.Figure:
-    """Time delta over lap distance (0–100%) with sector-fraction overlays."""
+    """Time delta over lap distance (0–100%) with sector-fraction overlays.
+
+    When ``corners`` + ``circuit_length_m`` are supplied the x-axis ticks are
+    relabelled to the circuit's turn positions (T1, T2, …) instead of the raw
+    lap-distance percentages; the underlying x data stays in 0–100% so the
+    hover read-outs are unaffected.
+    """
     cumtime_a = data_a["cumtime"]
     cumtime_b = data_b["cumtime"]
     delta = cumtime_b - cumtime_a  # positive = A gaining
@@ -395,9 +489,19 @@ def build_time_delta_figure(
         f"<br><sup>{acronym_a}: {lap_a_str}  |  {acronym_b}: {lap_b_str}</sup>"
     )
 
+    ticks = corner_axis_ticks(corners, circuit_length_m, axis_max=100.0)
+    if ticks is not None:
+        tickvals, ticktext = ticks
+        xaxis = dict(
+            title="Track Position (turn)", range=[0, 100], zeroline=False,
+            tickmode="array", tickvals=tickvals, ticktext=ticktext, tickangle=0,
+        )
+    else:
+        xaxis = dict(title="Lap Distance (%)", range=[0, 100], zeroline=False)
+
     fig.update_layout(
         title=dict(text=title_text, font=dict(size=14)),
-        xaxis=dict(title="Lap Distance (%)", range=[0, 100], zeroline=False),
+        xaxis=xaxis,
         yaxis=dict(
             title=f"Gap (s)   ↑ {acronym_a} ahead   ·   {acronym_b} ahead ↓",
             zeroline=True,
@@ -413,6 +517,253 @@ def build_time_delta_figure(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         height=460,
         margin=dict(t=80, b=50, l=60, r=60),
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Speed + Time-delta combined figure — stacked subplots sharing the lap axis
+# ---------------------------------------------------------------------------
+
+
+def _momentum_bands(
+    delta: np.ndarray,
+    x_pct: np.ndarray,
+    *,
+    min_width_pct: float = 5.0,
+    smooth_window: int = 11,
+) -> list[tuple[float, float, str]]:
+    """Segment the lap into "who is gaining time" bands for the momentum wash.
+
+    The sign of the gap's slope says who is gaining through each stretch: a
+    rising ``delta`` (= ``cumtime_b - cumtime_a``) means A is pulling away, a
+    falling one means B is.  The raw per-sample sign flips far too often to read,
+    so the gap is smoothed and same-sign runs are greedily merged until every
+    band spans at least ``min_width_pct`` of the lap — the wash then reads as a
+    handful of momentum zones rather than a barcode.
+
+    Returns ``[(x0_pct, x1_pct, "a" | "b"), …]`` tiling ``[0, 100]`` with no
+    gaps, where the label is the driver gaining time across that stretch.
+    """
+    n = len(delta)
+    if n < 3:
+        return []
+
+    win = min(smooth_window, n if n % 2 == 1 else n - 1)
+    smoothed = delta
+    if win >= 3:
+        smoothed = np.convolve(delta, np.ones(win) / win, mode="same")
+
+    seg_gain = np.where(np.diff(smoothed) >= 0, "a", "b")  # one label per segment
+    if len(seg_gain) == 0:
+        return []
+
+    def seg_width(start: int, end: int) -> float:
+        return float(x_pct[end + 1] - x_pct[start])
+
+    # Run-length encode contiguous same-gain segments into [start, end, label].
+    runs: list[list] = []
+    for i, gain in enumerate(seg_gain):
+        if runs and runs[-1][2] == gain:
+            runs[-1][1] = i
+        else:
+            runs.append([i, i, str(gain)])
+
+    # Greedy left→right merge: absorb a thin run (or any run abutting a band
+    # that is itself still too narrow) into the band being built, keeping that
+    # band's hue, so every emitted band is wide enough to read.
+    bands: list[list] = []  # [start_seg, end_seg, label]
+    for start, end, label in runs:
+        if bands:
+            b_start, b_end, _ = bands[-1]
+            if seg_width(b_start, b_end) < min_width_pct or seg_width(start, end) < min_width_pct:
+                bands[-1][1] = end
+                continue
+        bands.append([start, end, label])
+
+    return [(float(x_pct[s]), float(x_pct[e + 1]), lab) for s, e, lab in bands]
+
+
+def build_speed_time_delta_figure(
+    data_a: dict, acronym_a: str, color_a: str,
+    data_b: dict, acronym_b: str, color_b: str,
+    *,
+    sector_fractions: list[float] | None = None,
+    corners: list[dict] | None = None,
+    circuit_length_m: float | None = None,
+) -> go.Figure:
+    """Stacked Speed (top) + cumulative Time-Delta (bottom) on a shared lap axis.
+
+    Composes the two existing fastest-lap views into one figure so the *cause*
+    (speed through a corner) sits directly above the *effect* (the gap it opens
+    or closes).  Both panels share a single 0–100 % lap-distance x-axis — Speed
+    is re-based from its native 0–``N_POINTS`` index — so features line up corner
+    for corner, and a single vertical hover spike crosses both panels.
+
+    A faint "momentum" wash on the speed panel tints each stretch by which driver
+    is gaining time through it (see :func:`_momentum_bands`), so the speed trace
+    visually explains the gap below it.  Turn ticks and sector boundaries are
+    overlaid when circuit geometry is supplied; the chart degrades to a plain
+    lap-distance axis without it.
+    """
+    speed_a = np.asarray(data_a["speed"], dtype=float)
+    speed_b = np.asarray(data_b["speed"], dtype=float)
+    delta = np.asarray(data_b["cumtime"], dtype=float) - np.asarray(
+        data_a["cumtime"], dtype=float
+    )  # positive = A ahead
+
+    n = len(delta)
+    x_pct = np.linspace(0.0, 100.0, n)
+    lap_a_str, lap_b_str = _lap_label(data_a), _lap_label(data_b)
+
+    # Both panels are placed on a SINGLE shared x-axis ("x") — speed on yaxis
+    # "y" (top), gap on yaxis "y2" (bottom) — rather than via
+    # ``make_subplots(shared_xaxes=True)``, which builds two *matched-but-
+    # separate* x-axes.  Cross-panel hover (``hoversubplots="axis"``) only fires
+    # when both panels reference the same x-axis, so a grid-"coupled" column with
+    # every trace on ``xaxis="x"`` is what makes hovering one panel surface the
+    # other's read-out at the same track position.
+    top_domain, bot_domain = [0.46, 1.0], [0.0, 0.39]
+    fig = go.Figure()
+
+    # --- Speed traces (top panel, yaxis "y") ---
+    speed_hover = "%{y:.0f} km/h<extra>%{fullData.name}</extra>"
+    fig.add_trace(go.Scatter(
+        x=x_pct, y=speed_a, mode="lines", xaxis="x", yaxis="y",
+        name=f"{acronym_a} ({lap_a_str})", legendgroup="a",
+        line=dict(color=color_a, width=2.5), hovertemplate=speed_hover,
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_pct, y=speed_b, mode="lines", xaxis="x", yaxis="y",
+        name=f"{acronym_b} ({lap_b_str})", legendgroup="b",
+        line=dict(color=color_b, width=2.5), hovertemplate=speed_hover,
+    ))
+
+    # --- Momentum wash on the speed panel (beneath the lines via layer="below") ---
+    for x0, x1, gain in _momentum_bands(delta, x_pct):
+        fig.add_shape(
+            type="rect", xref="x", yref="y domain", x0=x0, x1=x1, y0=0, y1=1,
+            fillcolor=_to_rgba(color_a if gain == "a" else color_b, 0.07),
+            line_width=0, layer="below",
+        )
+
+    # --- Time-delta (bottom panel, yaxis "y2"): fills + signed lines + lead changes ---
+    pos = np.where(delta >= 0, delta, 0.0)
+    neg = np.where(delta < 0, delta, 0.0)
+    x_fill = np.concatenate([[x_pct[0]], x_pct, [x_pct[-1]]])
+    for fill_y, color in ((pos, color_a), (neg, color_b)):
+        fig.add_trace(go.Scatter(
+            x=x_fill, y=np.concatenate([[0], fill_y, [0]]), xaxis="x", yaxis="y2",
+            mode="lines", fill="tozeroy", fillcolor=_to_rgba(color, 0.30),
+            line=dict(width=0), showlegend=False, hoverinfo="skip",
+        ))
+
+    hover_text = [
+        f"{acronym_a} ahead {abs(d):.3f}s" if d >= 0
+        else f"{acronym_b} ahead {abs(d):.3f}s"
+        for d in delta
+    ]
+    for masked, color in (
+        (np.where(delta >= 0, delta, np.nan), color_a),
+        (np.where(delta < 0, delta, np.nan), color_b),
+    ):
+        fig.add_trace(go.Scatter(
+            x=x_pct, y=masked, mode="lines", connectgaps=False, xaxis="x", yaxis="y2",
+            line=dict(color=color, width=2.5), showlegend=False,
+            customdata=hover_text,
+            hovertemplate="%{customdata}<extra></extra>",
+        ))
+
+    crossings = np.where(np.diff(np.sign(delta)) != 0)[0]
+    if len(crossings) > 0:
+        cx = x_pct[crossings]
+        fig.add_trace(go.Scatter(
+            x=cx, y=np.zeros(len(cx)), mode="markers", name="Lead change",
+            xaxis="x", yaxis="y2",
+            marker=dict(
+                color="white", size=8, symbol="circle",
+                line=dict(color="rgba(0,0,0,0.6)", width=1),
+            ),
+            hovertemplate="Lead change at %{x:.0f}%<extra></extra>",
+        ))
+
+    # Final-gap call-out — who won the lap and by how much.
+    final_gap = float(delta[-1])
+    if abs(final_gap) < DEAD_HEAT_THRESHOLD_SEC:
+        gap_text, gap_color = "Dead heat", "white"
+    elif final_gap > 0:
+        gap_text, gap_color = f"{acronym_a} +{abs(final_gap):.3f}s", color_a
+    else:
+        gap_text, gap_color = f"{acronym_b} +{abs(final_gap):.3f}s", color_b
+    fig.add_annotation(
+        xref="x", yref="y2", x=x_pct[-1], y=final_gap, text=gap_text,
+        showarrow=True, arrowhead=2, arrowcolor=gap_color, arrowwidth=1.5,
+        ax=-55, ay=-30, font=dict(color=gap_color, size=12), xanchor="right",
+        bgcolor="rgba(230, 230, 235, 0.92)", bordercolor=gap_color,
+        borderwidth=1, borderpad=4,
+    )
+
+    # --- Sector boundaries through both panels (when the circuit is seeded) ---
+    if sector_fractions and len(sector_fractions) == 2:
+        s1_frac, s2_frac = sector_fractions
+        for x_pos, label in ((0.0, "S1"), (s1_frac * 100, "S2"), (s2_frac * 100, "S3")):
+            for yref in ("y domain", "y2 domain"):
+                fig.add_shape(
+                    type="line", xref="x", yref=yref, x0=x_pos, x1=x_pos, y0=0, y1=1,
+                    line=dict(color="rgba(255,255,255,0.45)", width=1.5, dash="dot"),
+                    layer="below",
+                )
+            fig.add_annotation(
+                xref="x", yref="y domain", x=x_pos, y=1.0, text=f"<b>{label}</b>",
+                showarrow=False, xanchor="left", yanchor="top",
+                font=dict(color="rgba(255,255,255,0.7)", size=10), xshift=4,
+            )
+
+    # --- Shared x-axis: turn ticks when corners are known, else lap-distance % ---
+    ticks = corner_axis_ticks(corners, circuit_length_m, axis_max=100.0)
+    xaxis = dict(
+        domain=[0.0, 1.0], anchor="y2", range=[0, 100],
+        title=dict(text="Track Position (turn)" if ticks else "Lap Distance (%)"),
+        # Single hover spike spanning both stacked panels.
+        showspikes=True, spikemode="across", spikesnap="cursor",
+        spikethickness=1, spikecolor="rgba(255,255,255,0.35)", spikedash="solid",
+    )
+    if ticks is not None:
+        tickvals, ticktext = ticks
+        xaxis.update(tickmode="array", tickvals=tickvals, ticktext=ticktext, tickangle=0)
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                f"Speed + Time Delta — {acronym_a} vs {acronym_b}"
+                f"<br><sup>{acronym_a}: {lap_a_str}  |  {acronym_b}: {lap_b_str}"
+                "   ·   speed shading = who's gaining time</sup>"
+            ),
+            font=dict(size=14),
+        ),
+        xaxis=xaxis,
+        yaxis=dict(domain=top_domain, anchor="x", title=dict(text="Speed (km/h)")),
+        yaxis2=dict(
+            domain=bot_domain, anchor="x",
+            title=dict(text=f"Gap (s)   ↑ {acronym_a}   ·   {acronym_b} ↓"),
+            zeroline=True, zerolinecolor="rgba(255,255,255,0.6)", zerolinewidth=1.5,
+        ),
+        # Cross-panel hover: ``hoversubplots="axis"`` pulls every trace on the
+        # shared x-axis into one unified tooltip; the grid-"coupled" column is
+        # what marks the two panels as a single stack for that to take effect.
+        grid=dict(rows=2, columns=1, pattern="coupled"),
+        hovermode="x unified",
+        hoversubplots="axis",
+        hoverlabel=dict(
+            bgcolor="rgba(230, 230, 235, 0.97)",
+            font=dict(color="rgba(15, 15, 20, 1)", size=12),
+            bordercolor="rgba(190, 190, 200, 0.9)",
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        height=560,
+        margin=dict(t=90, b=50, l=70, r=60),
     )
     return fig
 

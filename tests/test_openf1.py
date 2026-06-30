@@ -216,3 +216,35 @@ class TestGetSessions:
         assert not result.empty
         assert "session_key" in result.columns
         assert result.iloc[0]["session_key"] == 9001
+
+
+# ===========================================================================
+# session_exists (stale-key detection)
+# ===========================================================================
+
+class TestSessionExists:
+    @responses_lib.activate
+    def test_valid_key_returns_true(self):
+        responses_lib.add(
+            responses_lib.GET,
+            f"{BASE_URL}/sessions",
+            json=[{"session_key": 9472, "session_name": "Race"}],
+            status=200,
+        )
+        client = OpenF1Client(mode="historical")
+        assert client.session_exists(9472) is True
+
+    @responses_lib.activate
+    @patch("openf1.time.sleep")
+    def test_stale_key_404_returns_false(self, mock_sleep):
+        # OpenF1 returns 404 for a renumbered/old session_key. _get retries
+        # (non-401 HTTPError) then swallows it into an empty DataFrame.
+        for _ in range(3):
+            responses_lib.add(
+                responses_lib.GET,
+                f"{BASE_URL}/sessions",
+                json={"detail": "No results found."},
+                status=404,
+            )
+        client = OpenF1Client(mode="historical", timeout=1)
+        assert client.session_exists(960) is False

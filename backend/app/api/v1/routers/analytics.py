@@ -6,7 +6,7 @@ Routes under ``/api/v1/sessions/{session_id}/``:
 - analytics/gap-to-leader
 - analytics/undercuts
 - analytics/tyre-degradation
-- compare                 (Speed / Throttle / Brake / RPM / nGear / DRS / TimeDelta)
+- compare                 (Speed / Throttle / Brake / RPM / nGear / DRS / TimeDelta / SpeedTimeDelta)
 - compare/sectors         (SectorTimes — DB-backed)
 - compare/track-map       (x/y position — OpenF1-backed)
 - sector-times            (legacy alias kept for backwards compat)
@@ -50,7 +50,7 @@ _NOT_READY = {503: {"model": ErrorEnvelope}}
 # Channels served by the /compare endpoint (all return ComparePayload).
 # SectorTimes and TrackMap have their own dedicated endpoints.
 _TelemetryChannel = Literal[
-    "Speed", "Throttle", "Brake", "RPM", "nGear", "DRS", "TimeDelta"
+    "Speed", "Throttle", "Brake", "RPM", "nGear", "DRS", "TimeDelta", "SpeedTimeDelta"
 ]
 
 
@@ -128,7 +128,7 @@ async def tyre_degradation(session_id: int, db: DB) -> list[DegradationRow]:
     "/sessions/{session_id}/compare",
     response_model=ComparePayload,
     responses={**_NOT_FOUND, **_NOT_READY, 400: {"model": ErrorEnvelope}},
-    summary="Compare two drivers' fastest-lap telemetry (Speed/Throttle/Brake/RPM/nGear/DRS/TimeDelta).",
+    summary="Compare two drivers' fastest-lap telemetry (Speed/Throttle/Brake/RPM/nGear/DRS/TimeDelta/SpeedTimeDelta).",
 )
 async def compare(
     session_id: int,
@@ -140,6 +140,7 @@ async def compare(
         description=(
             "Telemetry channel. Car-data channels: Speed, Throttle, Brake, RPM, nGear, DRS. "
             "TimeDelta derives cumulative time difference from Speed traces. "
+            "SpeedTimeDelta stacks the Speed and TimeDelta views on a shared lap axis. "
             "For SectorTimes use /compare/sectors; for TrackMap use /compare/track-map."
         ),
     ),
