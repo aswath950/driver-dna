@@ -13,9 +13,15 @@ interface Driver {
 
 const CHANNELS = [
   "Speed", "Throttle", "Brake", "RPM", "nGear", "DRS",
-  "TimeDelta", "Sector Times", "Track Map",
+  "TimeDelta", "SpeedTimeDelta", "Sector Times", "Track Map",
 ] as const;
 type Channel = (typeof CHANNELS)[number];
+
+// Display labels for channels whose API value isn't user-friendly. Falls back
+// to the raw channel value when no override is present.
+const CHANNEL_LABELS: Partial<Record<Channel, string>> = {
+  SpeedTimeDelta: "Speed + Time Delta",
+};
 
 interface Props {
   sessionId: number;
@@ -134,7 +140,7 @@ export function TelemetryCompare({ sessionId, drivers }: Props) {
           >
             {CHANNELS.map((c) => (
               <option key={c} value={c}>
-                {c}
+                {CHANNEL_LABELS[c] ?? c}
               </option>
             ))}
           </select>
@@ -164,8 +170,16 @@ export function TelemetryCompare({ sessionId, drivers }: Props) {
           <>
             <PlotlyChart
             figureJson={figureJson}
-            height={320}
-            margin={channel === "Track Map" ? { l: 5, r: 5, t: 30, b: 5 } : undefined}
+            // Stacked Speed + Time-Delta needs room for two panels and a
+            // two-line title; other channels fit a single 320px panel.
+            height={channel === "SpeedTimeDelta" ? 540 : 320}
+            margin={
+              channel === "Track Map"
+                ? { l: 5, r: 5, t: 30, b: 5 }
+                : channel === "SpeedTimeDelta"
+                  ? { l: 65, r: 45, t: 75, b: 45 }
+                  : undefined
+            }
           />
             {sectorPayload &&
               [sectorPayload.driver_a, sectorPayload.driver_b].some(
