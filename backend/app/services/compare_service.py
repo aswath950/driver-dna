@@ -82,7 +82,16 @@ async def _resolve_session_key(db: AsyncSession, session_id: int) -> int:
         raise UpstreamError(
             f"session {session_id} has no openf1_session_key — was it loaded by ETL?"
         )
-    return int(s.openf1_session_key)
+    session_key = int(s.openf1_session_key)
+    # Fail fast on a stale key: OpenF1 renumbered its sessions, so a key written
+    # under the old scheme 404s on every downstream call. Without this guard the
+    # live compare path returns confusing empty traces / a downstream 503.
+    if not OpenF1Client(mode="historical").session_exists(session_key):
+        raise UpstreamError(
+            f"session {session_id} openf1_session_key={session_key} is not "
+            "recognized by OpenF1 (stale key) — re-resolve and update it."
+        )
+    return session_key
 
 
 async def _resolve_driver(
