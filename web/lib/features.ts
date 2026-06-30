@@ -2,10 +2,11 @@
  * Operator feature-flag registry — the single source of truth for which
  * top-level features (nav tabs + routes) are enabled.
  *
- * Toggling is a runtime operator kill-switch via the server-only DISABLED_FEATURES
- * env var, a comma-separated denylist of feature keys (e.g. "mystery-driver,pipeline").
- * Unset = every feature enabled. The value is read on the server at request time
- * (see readDisabledFeatures in lib/env.ts), so changing it takes effect on the next
+ * Toggling is a runtime operator switch via one server-only boolean env var per
+ * feature (e.g. FEATURE_PIPELINE=FALSE). A feature is enabled unless its var is
+ * explicitly FALSE — unset/TRUE/anything-else = enabled, so a missing var never
+ * hides a section. The values are read on the server at request time (see
+ * readDisabledFeatures in lib/env.ts), so changing one takes effect on the next
  * deploy/boot with NO rebuild.
  *
  * This module is PURE: it never reads process.env. The disabled set is passed in as
@@ -19,28 +20,32 @@ export interface FeatureDef {
   key: FeatureKey;
   label: string;
   href: string;
+  /** Server-only env var (no NEXT_PUBLIC_ prefix) controlling this feature. */
+  envVar: string;
 }
 
 // Order = nav order. Also defines the "first enabled feature" used for redirects.
 export const FEATURES: FeatureDef[] = [
-  { key: "radar", label: "Driver Radar", href: "/radar" },
-  { key: "mystery-driver", label: "Mystery Driver", href: "/mystery-driver" },
-  { key: "race", label: "Race Dashboard", href: "/race" },
-  { key: "pipeline", label: "Pipeline", href: "/pipeline" },
+  { key: "radar", label: "Driver Radar", href: "/radar", envVar: "FEATURE_RADAR" },
+  { key: "mystery-driver", label: "Mystery Driver", href: "/mystery-driver", envVar: "FEATURE_MYSTERY_DRIVER" },
+  { key: "race", label: "Race Dashboard", href: "/race", envVar: "FEATURE_RACE" },
+  { key: "pipeline", label: "Pipeline", href: "/pipeline", envVar: "FEATURE_PIPELINE" },
 ];
 
 /**
- * Parse the raw DISABLED_FEATURES string (comma-separated keys) into a set.
- * Tolerates surrounding whitespace and empty entries; undefined/"" → empty set.
- * Pure — the caller supplies the raw value (read from env on the server).
+ * Resolve the set of DISABLED feature keys from per-feature flag values.
+ * A feature is disabled only when its value is exactly "FALSE" (case-insensitive,
+ * trimmed); unset / "TRUE" / anything else leaves it enabled. Pure — the caller
+ * supplies the raw values (read from env on the server).
  */
-export function parseDisabledFeatures(raw: string | undefined): Set<string> {
-  return new Set(
-    (raw ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean),
-  );
+export function disabledFromFlags(
+  flags: Partial<Record<FeatureKey, string | undefined>>,
+): Set<string> {
+  const disabled = new Set<string>();
+  for (const f of FEATURES) {
+    if ((flags[f.key] ?? "").trim().toUpperCase() === "FALSE") disabled.add(f.key);
+  }
+  return disabled;
 }
 
 export function isFeatureEnabled(key: FeatureKey, disabled: Set<string>): boolean {

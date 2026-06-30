@@ -316,3 +316,185 @@ def test_build_channel_figure_two_traces() -> None:
     )
     assert len(fig.data) == 2
     assert len(fig.data[0].y) == tc.N_POINTS
+
+
+# ---------------------------------------------------------------------------
+# Speed + Time-delta combined figure
+# ---------------------------------------------------------------------------
+
+
+def test_build_speed_time_delta_figure_stacks_both_panels() -> None:
+    a, b = _two_drivers_data()
+    fig = tc.build_speed_time_delta_figure(
+        a, "VER", "#1E40AF",
+        b, "HAM", "#06B6D4",
+    )
+    # Two stacked panels → a second y-axis exists.
+    assert fig.layout.yaxis2 is not None
+    y_titles = {fig.layout.yaxis.title.text, fig.layout.yaxis2.title.text}
+    assert "Speed (km/h)" in y_titles
+    assert any(t and t.startswith("Gap (s)") for t in y_titles)
+
+    # Top panel: one speed line per driver, named with the acronym + lap.
+    speed_traces = [t for t in fig.data if t.name and t.name.startswith(("VER (", "HAM ("))]
+    assert len(speed_traces) == 2
+    # Bottom panel: the two signed delta fills (positive / negative areas).
+    fills = [t for t in fig.data if getattr(t, "fill", None) == "tozeroy"]
+    assert len(fills) == 2
+
+    # Momentum wash → at least one background rectangle on the speed panel.
+    rects = [s for s in (fig.layout.shapes or ()) if s.type == "rect"]
+    assert len(rects) >= 1
+
+    # Hovering either panel must surface BOTH panels' data at the same x. That
+    # only works when both panels live on one *shared* x-axis (a grid-"coupled"
+    # column), not the matched-but-separate axes make_subplots would create —
+    # plus unified hover and axis-wide hoversubplots. This is the exact config
+    # verified to cross panels; regressing any part silently breaks the hover.
+    assert fig.layout.hovermode == "x unified"
+    assert fig.layout.hoversubplots == "axis"
+    assert (fig.layout.grid.rows, fig.layout.grid.columns) == (2, 1)
+    assert fig.layout.grid.pattern == "coupled"
+    # Every trace is on the single shared x-axis; speed on "y", gap fills on "y2".
+    assert {t.xaxis for t in fig.data} == {"x"}
+    assert fig.data[0].yaxis == "y"
+    assert {t.yaxis for t in fig.data if getattr(t, "fill", None) == "tozeroy"} == {"y2"}
+
+
+def test_build_speed_time_delta_figure_overlays_sectors_and_turns() -> None:
+    a, b = _two_drivers_data()
+    fig = tc.build_speed_time_delta_figure(
+        a, "VER", "#1E40AF",
+        b, "HAM", "#06B6D4",
+        sector_fractions=[0.33, 0.66],
+        corners=_sample_corners(),
+        circuit_length_m=4000.0,
+    )
+    # Three sector boundaries drawn through both panels → ≥6 dotted vlines.
+    vlines = [s for s in (fig.layout.shapes or ()) if s.type == "line"]
+    assert len(vlines) >= 6, f"expected ≥6 sector vlines, got {len(vlines)}"
+
+    # Turn ticks land on the single shared x-axis, relabelled T1/T2A/T3.
+    assert fig.layout.xaxis.ticktext == ("T1", "T2A", "T3")
+    assert fig.layout.xaxis.title.text == "Track Position (turn)"
+
+
+def test_momentum_bands_tile_lap_and_merge_noise() -> None:
+    x_pct = np.linspace(0.0, 100.0, tc.N_POINTS)
+    # Gap rises (A gaining) over the first half then falls (B gaining), with
+    # rapid low-amplitude wiggles that must be smoothed and merged away.
+    half = tc.N_POINTS // 2
+    base = np.concatenate([
+        np.linspace(0.0, 0.8, half),
+        np.linspace(0.8, -0.8, tc.N_POINTS - half),
+    ])
+    noisy = base + 0.02 * np.sin(np.linspace(0.0, 80.0, tc.N_POINTS))
+    bands = tc._momentum_bands(noisy, x_pct)
+
+    # Bands tile [0, 100] contiguously with no gaps or overlaps.
+    assert bands[0][0] == pytest.approx(0.0)
+    assert bands[-1][1] == pytest.approx(100.0)
+    for (_, x1, _), (x0_next, _, _) in zip(bands, bands[1:]):
+        assert x1 == pytest.approx(x0_next)
+    # Both drivers' momentum is represented and labels are valid.
+    labels = [lab for *_, lab in bands]
+    assert set(labels) <= {"a", "b"}
+    assert "a" in labels and "b" in labels
+    # No barcode: every emitted band is wide enough to read.
+    assert all((x1 - x0) >= 4.0 for x0, x1, _ in bands), bands
+
+
+# ---------------------------------------------------------------------------
+# Corner axis ticks + km/h labelling
+# ---------------------------------------------------------------------------
+
+
+def _sample_corners() -> list[dict]:
+    # 4000 m lap with turns at 0%, 25%, 50% and (out-of-range) past the line.
+    return [
+        {"number": 1, "letter": "", "distance_m": 0.0},
+        {"number": 2, "letter": "A", "distance_m": 1000.0},
+        {"number": 3, "letter": "nan", "distance_m": 2000.0},
+    ]
+
+
+def test_corner_axis_ticks_maps_to_axis_max() -> None:
+    ticks = tc.corner_axis_ticks(_sample_corners(), 4000.0, axis_max=tc.N_POINTS - 1)
+    assert ticks is not None
+    tickvals, ticktext = ticks
+    # 0% → 0, 25% → 0.25*199, 50% → 0.5*199
+    assert tickvals == [0.0, round(0.25 * 199, 3), round(0.5 * 199, 3)]
+    # Real letters are kept; "nan"/empty letters are dropped.
+    assert ticktext == ["T1", "T2A", "T3"]
+
+
+def test_corner_axis_ticks_returns_none_without_data() -> None:
+    assert tc.corner_axis_ticks(None, 4000.0, axis_max=199) is None
+    assert tc.corner_axis_ticks(_sample_corners(), None, axis_max=199) is None
+    assert tc.corner_axis_ticks([], 4000.0, axis_max=199) is None
+
+
+def test_corner_axis_ticks_skips_out_of_range_corners() -> None:
+    corners = [{"number": 9, "letter": "", "distance_m": 5000.0}]  # past S/F
+    assert tc.corner_axis_ticks(corners, 4000.0, axis_max=199) is None
+
+
+def test_build_channel_figure_speed_labels_kmh() -> None:
+    a, b = _two_drivers_data()
+    fig = tc.build_channel_figure(
+        a, "VER", "#1E40AF",
+        b, "HAM", "#06B6D4",
+        channel="Speed",
+    )
+    assert fig.layout.yaxis.title.text == "Speed (km/h)"
+    assert all("km/h" in (t.hovertemplate or "") for t in fig.data)
+
+
+def test_build_channel_figure_non_speed_has_no_kmh() -> None:
+    a, b = _two_drivers_data()
+    fig = tc.build_channel_figure(
+        a, "VER", "#1E40AF",
+        b, "HAM", "#06B6D4",
+        channel="Throttle",
+    )
+    assert fig.layout.yaxis.title.text == "Throttle"
+    assert all(t.hovertemplate is None for t in fig.data)
+
+
+def test_build_channel_figure_uses_turn_ticks_when_corners_given() -> None:
+    a, b = _two_drivers_data()
+    fig = tc.build_channel_figure(
+        a, "VER", "#1E40AF",
+        b, "HAM", "#06B6D4",
+        channel="Speed",
+        corners=_sample_corners(),
+        circuit_length_m=4000.0,
+    )
+    assert fig.layout.xaxis.title.text == "Track Position (turn)"
+    assert list(fig.layout.xaxis.ticktext) == ["T1", "T2A", "T3"]
+    # One guide vline per turn.
+    vlines = [s for s in (fig.layout.shapes or ()) if getattr(s, "type", None) == "line"]
+    assert len(vlines) == 3
+
+
+def test_build_channel_figure_falls_back_without_corners() -> None:
+    a, b = _two_drivers_data()
+    fig = tc.build_channel_figure(
+        a, "VER", "#1E40AF",
+        b, "HAM", "#06B6D4",
+        channel="Speed",
+    )
+    assert fig.layout.xaxis.title.text == "Normalised Distance (0–200 points)"
+
+
+def test_build_time_delta_figure_uses_turn_ticks_when_corners_given() -> None:
+    a, b = _two_drivers_data()
+    fig = tc.build_time_delta_figure(
+        a, "VER", "#1E40AF",
+        b, "HAM", "#06B6D4",
+        sector_fractions=[0.33, 0.66],
+        corners=_sample_corners(),
+        circuit_length_m=4000.0,
+    )
+    assert fig.layout.xaxis.title.text == "Track Position (turn)"
+    assert list(fig.layout.xaxis.ticktext) == ["T1", "T2A", "T3"]

@@ -209,6 +209,19 @@ class OpenF1Client:
             df["date_end"] = pd.to_datetime(df["date_end"], errors="coerce")
         return df
 
+    def session_exists(self, session_key: int) -> bool:
+        """Return True if OpenF1 still recognizes this ``session_key``.
+
+        Queries ``/v1/sessions?session_key=X``: a valid key returns one row, a
+        stale/renumbered key returns 404. Because :meth:`_get` swallows every
+        non-401 status (including 404) and any transport failure into an empty
+        DataFrame, a ``False`` here means "could not confirm present" — usually a
+        stale key, but possibly a transient network failure — not hard proof the
+        session was deleted. Callers should phrase diagnostics accordingly.
+        """
+        df = self._get("sessions", {"session_key": session_key})
+        return not df.empty
+
     def get_drivers(self, session_key: int) -> pd.DataFrame:
         """
         Return driver info for a session, including 3-letter acronyms.

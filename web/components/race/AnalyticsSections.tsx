@@ -1,6 +1,6 @@
 "use client";
 
-import { useVisibleCharts } from "@/lib/preferences";
+import { chartAllowedForSession } from "@/lib/preferences";
 import { Card } from "@/components/ui/Card";
 import { PlotlyChart } from "@/components/charts/PlotlyChart";
 
@@ -12,6 +12,7 @@ interface UndercutEvent {
 }
 
 interface Props {
+  sessionType: string;
   rollingPaceFigJson: string;
   gapToLeaderFigJson: string;
   undercutEvents: UndercutEvent[];
@@ -24,18 +25,17 @@ function NoData() {
 }
 
 export function AnalyticsSections({
+  sessionType,
   rollingPaceFigJson,
   gapToLeaderFigJson,
   undercutEvents,
   tyreDegFigJson,
   driverCodeMap,
 }: Props) {
-  const { charts } = useVisibleCharts();
-
   return (
     <>
       {/* Rolling Pace */}
-      {charts["Rolling pace"] && (
+      {chartAllowedForSession("Rolling pace", sessionType) && (
         <section>
           <h3 className="mb-1 text-base font-semibold">Rolling Pace</h3>
           <p className="mb-3 text-sm text-white/50">
@@ -52,7 +52,7 @@ export function AnalyticsSections({
       )}
 
       {/* Gap to Leader */}
-      {charts["Gap to leader"] && (
+      {chartAllowedForSession("Gap to leader", sessionType) && (
         <section>
           <h3 className="mb-1 text-base font-semibold">Gap to Leader</h3>
           <p className="mb-3 text-sm text-white/50">
@@ -69,7 +69,7 @@ export function AnalyticsSections({
       )}
 
       {/* Undercut Opportunities */}
-      {charts["Undercuts"] && (
+      {chartAllowedForSession("Undercuts", sessionType) && (
         <section>
           <h3 className="mb-1 text-base font-semibold">Undercut Opportunities</h3>
           <p className="mb-3 text-sm text-white/50">
@@ -121,7 +121,7 @@ export function AnalyticsSections({
       )}
 
       {/* Tyre Degradation */}
-      {charts["Tyre degradation"] && (
+      {chartAllowedForSession("Tyre degradation", sessionType) && (
         <section>
           <h3 className="mb-1 text-base font-semibold">Tyre Degradation</h3>
           <p className="mb-3 text-sm text-white/50">

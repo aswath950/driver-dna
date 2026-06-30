@@ -15,7 +15,6 @@ import { TelemetryCompare } from "@/components/race/TelemetryCompare";
 import { CornerPerformance } from "@/components/race/CornerPerformance";
 import { AnalyticsSections } from "@/components/race/AnalyticsSections";
 import { Leaderboard, type LeaderboardRow, type LeaderboardSessionType } from "@/components/race/Leaderboard";
-import { SessionTypeSync } from "@/components/race/SessionTypeSync";
 
 // ── Server-side Plotly figure builders ────────────────────────────────────
 
@@ -220,7 +219,6 @@ export default async function RaceSessionPage({
 
   return (
     <div className="flex flex-col gap-6">
-      <SessionTypeSync sessionType={session.type} />
       {/* Session header */}
       <header>
         <div className="mb-2">
@@ -280,8 +278,9 @@ export default async function RaceSessionPage({
         <CornerPerformance sessionId={session.id} teams={teams} />
       </section>
 
-      {/* Analytics sections (gated by Visible Charts toggles) */}
+      {/* Analytics sections (gated by session-type applicability) */}
       <AnalyticsSections
+        sessionType={session.type}
         rollingPaceFigJson={rollingPaceFigJson}
         gapToLeaderFigJson={gapToLeaderFigJson}
         undercutEvents={undercuts}

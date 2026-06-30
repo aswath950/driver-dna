@@ -20,23 +20,24 @@ first (see `backend/README.md`).
 
 ## Feature toggles
 
-The four top-level features can be switched off per environment with a single
-server-side env var — an operator kill-switch. Set `DISABLED_FEATURES`
-in `.env.local` (or your Vercel project) to a comma-separated list of feature
-keys to **hide them from the nav and block their routes**. Unset means every
-feature is enabled.
+Each top-level feature has its own server-side boolean env var — an operator
+switch. Set a feature's var to `FALSE` in `.env.local` (or your Vercel project) to
+**hide it from the nav and block its routes**. A feature is shown unless its var is
+`FALSE` (unset / `TRUE` / anything else = shown), so a missing var never blanks a
+section.
 
 ```bash
 # .env.local — hide Mystery Driver and Pipeline
-DISABLED_FEATURES=mystery-driver,pipeline
+FEATURE_MYSTERY_DRIVER=FALSE
+FEATURE_PIPELINE=FALSE
 ```
 
-| Key | Tab |
+| Env var | Tab |
 |---|---|
-| `radar` | Driver Radar |
-| `mystery-driver` | Mystery Driver |
-| `race` | Race Dashboard |
-| `pipeline` | Pipeline |
+| `FEATURE_RADAR` | Driver Radar |
+| `FEATURE_MYSTERY_DRIVER` | Mystery Driver |
+| `FEATURE_RACE` | Race Dashboard |
+| `FEATURE_PIPELINE` | Pipeline |
 
 Notes:
 
@@ -45,18 +46,19 @@ Notes:
   `.env.local` (not `.env.example`, which is only a template Next.js never loads)
   and restart the dev server, since env changes are not hot-reloaded.
 - Visiting a disabled feature's URL directly redirects to the first enabled
-  feature instead of serving the page. Disabling `race` also redirects the `/`
-  landing (it belongs to the Race Dashboard) to the first enabled feature.
+  feature instead of serving the page. Setting `FEATURE_RACE=FALSE` also redirects
+  the `/` landing (it belongs to the Race Dashboard) to the first enabled feature.
 - How it flows through the code:
   - [`lib/features.ts`](lib/features.ts) — pure registry + helpers (`enabledFeatures`,
     `firstEnabledFeature`, `featureForPath`); it never reads `process.env`.
   - [`lib/env.ts`](lib/env.ts) — `readDisabledFeatures()` does the runtime,
-    server-only read of `DISABLED_FEATURES`.
+    server-only read of each `FEATURE_*` var (static access so the values are
+    available in the Edge/middleware runtime).
   - [`app/layout.tsx`](app/layout.tsx) — a `force-dynamic` Server Component that
     computes the enabled list per request and passes it as a prop down to the nav,
     so the client never touches the env var.
   - [`components/TopNav.tsx`](components/TopNav.tsx) — renders the nav from that prop.
-  - [`middleware.ts`](middleware.ts) — reads the same var per request to enforce the
+  - [`middleware.ts`](middleware.ts) — reads the same vars per request to enforce the
     route redirects.
 
 ## Real pages

@@ -396,10 +396,9 @@ driver-dna/
 │   │   └── pipeline/                      Pipeline admin (GP schedule dropdown · hydrate · telemetry fetch · train)
 │   ├── components/                charts/PlotlyChart · chat/RaceChatStream ·
 │   │                              race/TelemetryCompare · race/CornerPerformance ·
-│   │                              race/Leaderboard · race/SessionTypeSync ·
-│   │                              race/AnalyticsSections · ui/*
+│   │                              race/Leaderboard · race/AnalyticsSections · ui/*
 │   ├── lib/                       api (RSC + cookies) · api-client (browser) ·
-│   │                              preferences (chart visibility + session-type gating) · env
+│   │                              features (operator section switches) · preferences (session-type chart gating + AI mode) · env
 │   └── package.json
 ├── src/                           SHARED Python library — UNCHANGED, reused by all
 │   ├── race_engine.py             rolling pace · gap-to-leader · undercut · tyre deg
@@ -667,7 +666,7 @@ endpoint's request/response typed).
 |---|---|---|---|
 | `/` | RSC | `/seasons` + `/events` | none |
 | `/event/[eventId]` | RSC | `/sessions` | none |
-| `/race/[sessionId]` | RSC + island | `/results` + `/tyre-degradation` + `/teams` | `Leaderboard` (session-type-aware columns) · `RaceChatStream` (SSE) · `TelemetryCompare` · `CornerPerformance` · `SessionTypeSync` (chart gating) |
+| `/race/[sessionId]` | RSC + island | `/results` + `/tyre-degradation` + `/teams` | `Leaderboard` (session-type-aware columns) · `RaceChatStream` (SSE) · `TelemetryCompare` · `CornerPerformance` · `AnalyticsSections` (session-type chart gating) |
 | `/radar/[sessionId]` | RSC + island | `/results` | `TelemetryCompare` + `PlotlyChart` |
 | `/mystery-driver` | client only | `POST /ai/xai-explain` | full page |
 | `/pipeline` | client | `GET /pipeline/stats` · `GET /pipeline/gp-schedule` | GP dropdown (live OpenF1) · hydrate · fetch-telemetry · train (SSE) |
@@ -774,13 +773,15 @@ compared to Team B?"
      subtle background hue
    - **Summary** — `DeltaPill` stat cards grouped by corner class
 
-**Session-type-aware chart gating.** `SessionTypeSync` (a zero-render RSC
-client component) fires a `dna_session_type_change` custom event on mount.
-`SidebarClient` listens and filters the toggle list to only the charts
-relevant for the current session type — e.g. qualifying sessions show only
-Telemetry compare and Corner performance; practice sessions also include
-Tyre degradation. Disallowed charts are unchecked in localStorage before
-being hidden so they don't persist as checked into future sessions.
+**Session-type-aware chart gating.** The race page passes the server-known
+`session.type` to `AnalyticsSections`, which gates each chart at render time via
+the pure `chartAllowedForSession(label, sessionType)` helper in
+[web/lib/preferences.ts](web/lib/preferences.ts). Charts that don't apply to a
+session type are simply not rendered — e.g. qualifying sessions show only
+Telemetry compare and Corner performance; practice sessions also include Tyre
+degradation. This is a domain-correctness rule, distinct from the operator
+section switches (see [Feature toggles](web/README.md#feature-toggles)); there is
+no per-user chart visibility setting.
 
 | Session type | Available charts |
 |---|---|
@@ -1042,7 +1043,7 @@ make web-typecheck   # tsc --noEmit
 | `web/.env.local` | `NEXT_PUBLIC_API_BASE` | `http://localhost:8000` | Browser-visible API URL (SSE chat) |
 | `web/.env.local` | `API_BASE_INTERNAL` | `http://localhost:8000` | Server-side RSC fetch URL |
 | `web/.env.local` | `NEXT_PUBLIC_GRAPHQL_URL` | `http://localhost:8000/graphql` | GraphQL endpoint |
-| `web/.env.local` | `DISABLED_FEATURES` | _empty_ | Comma-sep feature keys to hide: `radar`, `mystery-driver`, `race`, `pipeline`. Unset = all enabled. Server-side, read at runtime (set at deploy/boot — no rebuild). |
+| `web/.env.local` | `FEATURE_RADAR` · `FEATURE_MYSTERY_DRIVER` · `FEATURE_RACE` · `FEATURE_PIPELINE` | _unset_ | One operator switch per top-level section. Set to `FALSE` to hide a section from the nav and block its routes; shown unless `FALSE` (unset/`TRUE` = shown). Server-side, read at runtime (takes effect at deploy/boot — no rebuild). |
 
 ### Smoke-check checklist
 
@@ -1156,10 +1157,10 @@ The recommended portfolio setup. Free tiers cover small demo traffic.
    | `API_BASE_INTERNAL` | `https://<railway-domain>` (Railway has no internal-only DNS for Vercel; use the public domain) |
    | `NEXT_PUBLIC_GRAPHQL_URL` | `https://<railway-domain>/graphql` |
 
-   Optionally set `DISABLED_FEATURES` here to control which tabs ship
-   in production (comma-separated keys; see the env-var table above). It is a
-   server-side var read at runtime, so changing it takes effect on the next
-   deploy/boot — no rebuild required.
+   Optionally set the `FEATURE_*` switches here to control which tabs ship
+   in production (set any to `FALSE` to hide it; see the env-var table above).
+   They are server-side vars read at runtime, so changing one takes effect on the
+   next deploy/boot — no rebuild required.
 
 3. **First deploy** creates a preview URL. Promote to prod once smoke
    tests pass.
