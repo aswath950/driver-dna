@@ -16,11 +16,12 @@ def test_list_drivers_default(client: TestClient) -> None:
 
 
 def test_list_drivers_filtered_by_season(client: TestClient) -> None:
-    r = client.get("/api/v1/drivers?season=2024&limit=50")
+    # Seeded race_results live in the two most-recent seasons (2025/2026); filter
+    # by one that actually has results so the season join returns rows.
+    r = client.get("/api/v1/drivers?season=2025&limit=50")
     assert r.status_code == 200
     body = r.json()
     assert len(body["data"]) > 0
-    # All seeded drivers raced in 2024, so this should still return rows.
 
 
 def test_list_drivers_filtered_by_team(client: TestClient) -> None:

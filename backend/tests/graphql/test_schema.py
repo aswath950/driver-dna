@@ -69,11 +69,22 @@ def test_introspection_lists_all_types(client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_seasons_query_returns_ten_rows_desc(client: TestClient) -> None:
-    body = _post(client, "{ seasons(first: 20) { year } }")
+def test_seasons_query_orders_desc_and_limits(client: TestClient) -> None:
+    # `first` is honoured and rows come back newest-year-first. We deliberately
+    # avoid asserting a fixed total: the seed spans 2015..2026 (12 seasons) and
+    # the ETL tests transiently insert future-year sentinel seasons (e.g. 2099),
+    # so an exact count is brittle in a full-suite run.
+    body = _post(client, "{ seasons(first: 5) { year } }")
     years = [s["year"] for s in body["data"]["seasons"]]
+    assert len(years) == 5
     assert years == sorted(years, reverse=True)
-    assert len(years) == 10
+    assert len(set(years)) == 5  # no duplicates
+
+    # The current seed's most-recent real seasons are present.
+    all_years = {
+        s["year"] for s in _post(client, "{ seasons(first: 50) { year } }")["data"]["seasons"]
+    }
+    assert {2024, 2025, 2026}.issubset(all_years)
 
 
 def test_session_lookup_404_returns_null(client: TestClient) -> None:
