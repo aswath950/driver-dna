@@ -1042,7 +1042,7 @@ make web-typecheck   # tsc --noEmit
 | `web/.env.local` | `NEXT_PUBLIC_API_BASE` | `http://localhost:8000` | Browser-visible API URL (SSE chat) |
 | `web/.env.local` | `API_BASE_INTERNAL` | `http://localhost:8000` | Server-side RSC fetch URL |
 | `web/.env.local` | `NEXT_PUBLIC_GRAPHQL_URL` | `http://localhost:8000/graphql` | GraphQL endpoint |
-| `web/.env.local` | `DISABLED_FEATURES` | _empty_ | Comma-sep feature keys to hide: `radar`, `mystery-driver`, `race`, `pipeline`. Unset = all enabled. Server-side, read at runtime (set at deploy/boot — no rebuild). |
+| `web/.env.local` | `FEATURE_RADAR` · `FEATURE_MYSTERY_DRIVER` · `FEATURE_RACE` · `FEATURE_PIPELINE` | _unset_ | One operator switch per top-level section. Set to `FALSE` to hide a section from the nav and block its routes; shown unless `FALSE` (unset/`TRUE` = shown). Server-side, read at runtime (takes effect at deploy/boot — no rebuild). |
 
 ### Smoke-check checklist
 
@@ -1156,10 +1156,10 @@ The recommended portfolio setup. Free tiers cover small demo traffic.
    | `API_BASE_INTERNAL` | `https://<railway-domain>` (Railway has no internal-only DNS for Vercel; use the public domain) |
    | `NEXT_PUBLIC_GRAPHQL_URL` | `https://<railway-domain>/graphql` |
 
-   Optionally set `DISABLED_FEATURES` here to control which tabs ship
-   in production (comma-separated keys; see the env-var table above). It is a
-   server-side var read at runtime, so changing it takes effect on the next
-   deploy/boot — no rebuild required.
+   Optionally set the `FEATURE_*` switches here to control which tabs ship
+   in production (set any to `FALSE` to hide it; see the env-var table above).
+   They are server-side vars read at runtime, so changing one takes effect on the
+   next deploy/boot — no rebuild required.
 
 3. **First deploy** creates a preview URL. Promote to prod once smoke
    tests pass.

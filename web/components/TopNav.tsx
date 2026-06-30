@@ -6,7 +6,7 @@ import clsx from "clsx";
 import type { FeatureDef } from "@/lib/features";
 
 interface TopNavProps {
-  // Enabled features are computed on the server (runtime DISABLED_FEATURES read)
+  // Enabled features are computed on the server (runtime FEATURE_* env reads)
   // and passed down — this client component never touches process.env.
   features: FeatureDef[];
   onMenuOpen?: () => void;

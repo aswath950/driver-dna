@@ -9,9 +9,9 @@ export const metadata: Metadata = {
   description: "F1 telemetry analytics dashboard",
 };
 
-// Read the operator kill-switch (DISABLED_FEATURES) at request time, not build
+// Read the operator section switches (FEATURE_* env vars) at request time, not build
 // time. Without force-dynamic the layout could be statically prerendered, freezing
-// the env value into the shell and re-breaking runtime toggling of the nav.
+// the env values into the shell and re-breaking runtime toggling of the nav.
 export const dynamic = "force-dynamic";
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

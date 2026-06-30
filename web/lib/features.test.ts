@@ -5,7 +5,7 @@ import {
   enabledFeatures,
   firstEnabledFeature,
   featureForPath,
-  parseDisabledFeatures,
+  disabledFromFlags,
 } from "./features";
 import { readDisabledFeatures } from "./env";
 
@@ -13,30 +13,36 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-describe("parseDisabledFeatures", () => {
-  it("returns an empty set for undefined / empty", () => {
-    expect(parseDisabledFeatures(undefined).size).toBe(0);
-    expect(parseDisabledFeatures("").size).toBe(0);
+describe("disabledFromFlags", () => {
+  it("returns an empty set when nothing is FALSE (unset/TRUE/other = enabled)", () => {
+    expect(disabledFromFlags({}).size).toBe(0);
+    expect(
+      disabledFromFlags({
+        radar: "TRUE",
+        "mystery-driver": undefined,
+        race: "",
+        pipeline: "anything",
+      }).size,
+    ).toBe(0);
   });
 
-  it("parses multiple keys and tolerates whitespace / empty entries", () => {
-    expect([...parseDisabledFeatures(" mystery-driver , pipeline , ")]).toEqual([
-      "mystery-driver",
-      "pipeline",
-    ]);
+  it("disables only features whose flag is FALSE (case-insensitive, trimmed)", () => {
+    expect([
+      ...disabledFromFlags({ "mystery-driver": "FALSE", pipeline: " false " }),
+    ]).toEqual(["mystery-driver", "pipeline"]);
   });
 });
 
 describe("enabledFeatures / isFeatureEnabled", () => {
   it("enables all features when nothing is disabled", () => {
-    const disabled = parseDisabledFeatures("");
+    const disabled = disabledFromFlags({});
     expect(enabledFeatures(disabled)).toEqual(FEATURES);
     expect(isFeatureEnabled("radar", disabled)).toBe(true);
     expect(isFeatureEnabled("pipeline", disabled)).toBe(true);
   });
 
   it("hides a disabled feature and keeps the rest", () => {
-    const disabled = parseDisabledFeatures("mystery-driver");
+    const disabled = disabledFromFlags({ "mystery-driver": "FALSE" });
     expect(isFeatureEnabled("mystery-driver", disabled)).toBe(false);
     expect(enabledFeatures(disabled).map((f) => f.key)).toEqual([
       "radar",
@@ -46,14 +52,14 @@ describe("enabledFeatures / isFeatureEnabled", () => {
   });
 
   it("hides multiple disabled features", () => {
-    const disabled = parseDisabledFeatures("mystery-driver,pipeline");
+    const disabled = disabledFromFlags({ "mystery-driver": "FALSE", pipeline: "FALSE" });
     expect(enabledFeatures(disabled).map((f) => f.key)).toEqual(["radar", "race"]);
   });
 });
 
 describe("firstEnabledFeature", () => {
   it("returns the first non-disabled feature in registry order", () => {
-    expect(firstEnabledFeature(parseDisabledFeatures("radar"))?.key).toBe(
+    expect(firstEnabledFeature(disabledFromFlags({ radar: "FALSE" }))?.key).toBe(
       "mystery-driver",
     );
   });
@@ -61,20 +67,26 @@ describe("firstEnabledFeature", () => {
   it("returns null when everything is disabled", () => {
     expect(
       firstEnabledFeature(
-        parseDisabledFeatures("radar,mystery-driver,race,pipeline"),
+        disabledFromFlags({
+          radar: "FALSE",
+          "mystery-driver": "FALSE",
+          race: "FALSE",
+          pipeline: "FALSE",
+        }),
       ),
     ).toBeNull();
   });
 });
 
 describe("readDisabledFeatures (server, runtime env)", () => {
-  it("reads DISABLED_FEATURES from the environment at call time", () => {
-    vi.stubEnv("DISABLED_FEATURES", "mystery-driver, pipeline");
+  it("reads the per-feature FEATURE_* vars at call time", () => {
+    vi.stubEnv("FEATURE_MYSTERY_DRIVER", "FALSE");
+    vi.stubEnv("FEATURE_PIPELINE", "FALSE");
     expect([...readDisabledFeatures()]).toEqual(["mystery-driver", "pipeline"]);
   });
 
-  it("treats an unset var as no features disabled", () => {
-    vi.stubEnv("DISABLED_FEATURES", "");
+  it("treats unset / TRUE vars as enabled", () => {
+    vi.stubEnv("FEATURE_RADAR", "TRUE");
     expect(readDisabledFeatures().size).toBe(0);
   });
 });
