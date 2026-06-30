@@ -23,6 +23,7 @@ from app.etl import (
     fetch_telemetry,
     hydrate_session,
     refresh_driver_stats,
+    refresh_session_key,
     seed_circuit_corners,
     seed_circuits,
 )
@@ -81,6 +82,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Database session ID (e.g. 73).",
     )
 
+    rsk = sub.add_parser(
+        "refresh-session-key",
+        help="Re-resolve a session's current OpenF1 session_key and update it in place "
+             "(fixes stale keys after OpenF1 renumbering).",
+    )
+    rsk_grp = rsk.add_mutually_exclusive_group(required=True)
+    rsk_grp.add_argument(
+        "--session-id", type=int, help="Database session ID to refresh."
+    )
+    rsk_grp.add_argument(
+        "--all", action="store_true",
+        help="Scan every session and refresh any whose stored key no longer resolves.",
+    )
+
     return p
 
 
@@ -122,7 +137,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "fetch-telemetry":
         result = fetch_telemetry.run(session_id=args.session_id)
         print(json.dumps(result.as_dict(), indent=2))
-        return 0
+        # Non-zero exit when anything went wrong, so cron/CI and shell callers
+        # actually notice (a silent exit 0 is what masked the stale-key failure).
+        return 1 if result.errors else 0
+
+    if args.command == "refresh-session-key":
+        results = refresh_session_key.run(
+            session_id=args.session_id, all_sessions=args.all
+        )
+        print(json.dumps([r.as_dict() for r in results], indent=2))
+        return 1 if any(
+            r.status in refresh_session_key._FAILURE_STATUSES for r in results
+        ) else 0
 
     parser.error(f"unknown command: {args.command}")
     return 2
