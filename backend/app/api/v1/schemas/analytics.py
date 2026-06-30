@@ -38,7 +38,7 @@ class DegradationRow(ORMModel):
 
 Channel = Literal[
     "Speed", "Throttle", "Brake", "RPM", "nGear", "DRS",
-    "TimeDelta", "TrackMap", "SectorTimes",
+    "TimeDelta", "SpeedTimeDelta", "TrackMap", "SectorTimes",
 ]
 
 

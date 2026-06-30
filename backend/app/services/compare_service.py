@@ -33,7 +33,7 @@ from app.services import telemetry_compute as tc
 
 Channel = Literal[
     "Speed", "Throttle", "Brake", "RPM", "nGear", "DRS",
-    "TimeDelta", "TrackMap", "SectorTimes",
+    "TimeDelta", "SpeedTimeDelta", "TrackMap", "SectorTimes",
 ]
 
 # Fallback palette when a driver/team has no colour. Visually-distinct
@@ -330,9 +330,21 @@ async def build_compare_payload(
     car_b, code_b, color_b = await _resolve_driver(db, session_id, driver_b_id)
     color_a, color_b = _differentiate_colors(color_a, color_b)
 
-    # Only TimeDelta uses sector_fractions overlays; the car-data channels
-    # render fine without a seeded circuit, so don't gate them on it.
-    circuit = await _load_circuit(db, session_id) if channel == "TimeDelta" else None
+    # TimeDelta requires sector_fractions, so load (and validate) the circuit.
+    # The car-data channels render fine without a seeded circuit — they only
+    # use the circuit's corners to label the x-axis with turn positions — so
+    # load it leniently and tolerate a missing/unseeded row.
+    if channel == "TimeDelta":
+        circuit = await _load_circuit(db, session_id)
+    else:
+        circuit = await circuits_repo.get_for_session(db, session_id)
+
+    corners = circuit.corners if circuit else None
+    circuit_length_m = (
+        float(circuit.length_km) * 1000
+        if circuit is not None and circuit.length_km is not None
+        else None
+    )
 
     client = OpenF1Client(mode="historical")
 
@@ -383,16 +395,34 @@ async def build_compare_payload(
             data_a, code_a, color_a,
             data_b, code_b, color_b,
             sector_fractions=circuit.sector_fractions,
+            corners=corners,
+            circuit_length_m=circuit_length_m,
         )
         # The "trace" field on TimeDelta payloads carries the per-driver
         # cumtime arrays — useful for clients that want raw numbers.
         trace_a = [float(v) for v in data_a["cumtime"]]
         trace_b = [float(v) for v in data_b["cumtime"]]
+    elif channel == "SpeedTimeDelta":
+        # Stacked Speed + Time-Delta view. Renders the core speed/gap story even
+        # without a seeded circuit; turn ticks and sector overlays are added when
+        # the circuit geometry is available (hence the lenient load above).
+        fig = tc.build_speed_time_delta_figure(
+            data_a, code_a, color_a,
+            data_b, code_b, color_b,
+            sector_fractions=circuit.sector_fractions if circuit else None,
+            corners=corners,
+            circuit_length_m=circuit_length_m,
+        )
+        # The combined view is speed-led, so the "trace" field carries Speed.
+        trace_a = [float(v) for v in data_a["speed"]]
+        trace_b = [float(v) for v in data_b["speed"]]
     else:
         fig = tc.build_channel_figure(
             data_a, code_a, color_a,
             data_b, code_b, color_b,
             channel=channel,
+            corners=corners,
+            circuit_length_m=circuit_length_m,
         )
         col = tc.CHANNEL_COLUMN[channel]
         trace_a = [float(v) for v in data_a[col]]
