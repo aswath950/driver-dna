@@ -25,6 +25,10 @@ _DRV_A_ID = 1
 _DRV_B_ID = 5
 _CAR_A = 901
 _CAR_B = 905
+# Row returned by the stale-key guard's session_exists() check
+# (_resolve_session_key → GET /v1/sessions?session_key=...). A non-empty list
+# means "key still valid" so compare requests proceed to laps/car_data.
+_SESSIONS_PAYLOAD = [{"session_key": _FAKE_OPENF1_KEY}]
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +287,7 @@ def test_compare_happy(client: TestClient, compare_session: tuple[int, int, int]
         # responses pops registrations FIFO; we register each endpoint twice
         # (laps once, car_data once per driver) plus some headroom.
         for _ in range(3):
+            rsps.add(responses.GET, f"{OPENF1}/sessions", json=_SESSIONS_PAYLOAD)
             rsps.add(responses.GET, f"{OPENF1}/laps", json=laps_payload)
             rsps.add(responses.GET, f"{OPENF1}/car_data", json=_make_car_data(_CAR_A))
             rsps.add(responses.GET, f"{OPENF1}/car_data", json=_make_car_data(_CAR_B))
@@ -340,9 +345,13 @@ def test_compare_driver_not_in_session(
     client: TestClient, compare_session: tuple[int, int, int]
 ) -> None:
     sid, drv_a, _ = compare_session
-    r = client.get(
-        f"/api/v1/sessions/{sid}/compare?driver_a={drv_a}&driver_b=999999&channel=Speed"
-    )
+    # The stale-key guard resolves (and validates) the session key before driver
+    # resolution, so /sessions must be mocked even on this 404 path.
+    with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
+        rsps.add(responses.GET, f"{OPENF1}/sessions", json=_SESSIONS_PAYLOAD)
+        r = client.get(
+            f"/api/v1/sessions/{sid}/compare?driver_a={drv_a}&driver_b=999999&channel=Speed"
+        )
     assert r.status_code == 404
 
 
@@ -454,6 +463,7 @@ def _mocked_compare(
     laps_payload = _make_laps_payload(_CAR_A) + _make_laps_payload(_CAR_B)
     with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
         for _ in range(3):
+            rsps.add(responses.GET, f"{OPENF1}/sessions", json=_SESSIONS_PAYLOAD)
             rsps.add(responses.GET, f"{OPENF1}/laps", json=laps_payload)
             rsps.add(responses.GET, f"{OPENF1}/car_data", json=_make_car_data(_CAR_A))
             rsps.add(responses.GET, f"{OPENF1}/car_data", json=_make_car_data(_CAR_B))
@@ -503,6 +513,7 @@ def test_compare_time_delta(
     with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
         # TimeDelta calls /laps once and /car_data twice per driver (Speed × 2)
         for _ in range(4):
+            rsps.add(responses.GET, f"{OPENF1}/sessions", json=_SESSIONS_PAYLOAD)
             rsps.add(responses.GET, f"{OPENF1}/laps", json=laps_payload)
             rsps.add(responses.GET, f"{OPENF1}/car_data", json=_make_car_data(_CAR_A))
             rsps.add(responses.GET, f"{OPENF1}/car_data", json=_make_car_data(_CAR_B))
@@ -551,6 +562,7 @@ def test_compare_sectors_happy(
     # duration_sector_*), so the service fetches /car_data too.
     with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
         for _ in range(3):
+            rsps.add(responses.GET, f"{OPENF1}/sessions", json=_SESSIONS_PAYLOAD)
             rsps.add(responses.GET, f"{OPENF1}/laps", json=laps_payload)
             rsps.add(responses.GET, f"{OPENF1}/car_data", json=_make_car_data(_CAR_A))
             rsps.add(responses.GET, f"{OPENF1}/car_data", json=_make_car_data(_CAR_B))
@@ -585,9 +597,11 @@ def test_compare_sectors_unknown_driver(
     client: TestClient, compare_session: tuple[int, int, int]
 ) -> None:
     sid, drv_a, _ = compare_session
-    r = client.get(
-        f"/api/v1/sessions/{sid}/compare/sectors?driver_a={drv_a}&driver_b=999999"
-    )
+    with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
+        rsps.add(responses.GET, f"{OPENF1}/sessions", json=_SESSIONS_PAYLOAD)
+        r = client.get(
+            f"/api/v1/sessions/{sid}/compare/sectors?driver_a={drv_a}&driver_b=999999"
+        )
     assert r.status_code == 404
 
 
@@ -600,6 +614,7 @@ def test_compare_track_map_happy(
     # traces from /car_data; /location is no longer called.
     with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
         for _ in range(3):
+            rsps.add(responses.GET, f"{OPENF1}/sessions", json=_SESSIONS_PAYLOAD)
             rsps.add(responses.GET, f"{OPENF1}/laps", json=laps_payload)
             rsps.add(responses.GET, f"{OPENF1}/car_data", json=_make_car_data(_CAR_A))
             rsps.add(responses.GET, f"{OPENF1}/car_data", json=_make_car_data(_CAR_B))
