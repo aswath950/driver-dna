@@ -2,17 +2,10 @@
 
 import { useState, useEffect, useCallback } from "react";
 
-export const VISIBLE_CHARTS_STORAGE_KEY = "dna_visible_charts";
 export const AI_MODE_STORAGE_KEY = "dna_ai_mode";
 
-// Internal custom-event names for same-tab broadcast
+// Internal custom-event name for same-tab broadcast
 const AI_MODE_EVENT = "dna_ai_mode_change";
-const CHARTS_EVENT = "dna_charts_change";
-
-// Exported so SessionTypeSync can dispatch the same event.
-export const CHARTS_CHANGE_EVENT = CHARTS_EVENT;
-export const SESSION_TYPE_EVENT = "dna_session_type_change";
-export const SESSION_TYPE_STORAGE_KEY = "dna_session_type";
 
 export const CHART_LABELS = [
   "Rolling pace",
@@ -24,18 +17,10 @@ export const CHART_LABELS = [
 ] as const;
 
 export type ChartLabel = (typeof CHART_LABELS)[number];
-export type VisibleCharts = Record<ChartLabel, boolean>;
 
-const DEFAULT_VISIBLE: VisibleCharts = {
-  "Rolling pace": true,
-  "Gap to leader": true,
-  Undercuts: true,
-  "Tyre degradation": true,
-  "Telemetry compare": true,
-  "Corner performance": true,
-};
-
-// Charts available per session type.  Sessions not listed here default to all charts.
+// Charts applicable per session type.  Sessions not listed here default to all charts.
+// This is a domain-correctness rule (e.g. a Qualifying session has no race-pace data),
+// not an availability switch — operator section visibility lives in lib/features.ts.
 export const CHARTS_FOR_SESSION: Record<string, ChartLabel[]> = {
   R:   [...CHART_LABELS],
   S:   [...CHART_LABELS],
@@ -46,6 +31,19 @@ export const CHARTS_FOR_SESSION: Record<string, ChartLabel[]> = {
   SQ:  ["Telemetry compare", "Corner performance"],
 };
 
+/**
+ * Whether a chart applies to a given session type. Sessions not listed in
+ * CHARTS_FOR_SESSION default to allowing every chart. Pure — safe to call from
+ * server components with the server-known session type.
+ */
+export function chartAllowedForSession(
+  label: ChartLabel,
+  sessionType: string,
+): boolean {
+  const allowed = CHARTS_FOR_SESSION[sessionType];
+  return allowed ? allowed.includes(label) : true;
+}
+
 export type AIMode = "Concise" | "Detailed" | "Critique loop";
 const DEFAULT_AI_MODE: AIMode = "Detailed";
 
@@ -53,13 +51,7 @@ function readLS<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);
     if (!raw) return fallback;
-    const parsed = JSON.parse(raw) as T;
-    // For plain objects, merge so new keys always get their default value
-    // even when an older stored object predates them.
-    if (typeof fallback === "object" && fallback !== null && typeof parsed === "object" && parsed !== null) {
-      return { ...fallback, ...parsed } as T;
-    }
-    return parsed;
+    return JSON.parse(raw) as T;
   } catch {
     return fallback;
   }
@@ -71,53 +63,6 @@ function writeLS(key: string, value: unknown): void {
   } catch {
     // ignore quota / security errors
   }
-}
-
-// ── useVisibleCharts ───────────────────────────────────────────────────────
-
-export function useVisibleCharts() {
-  const [charts, setCharts] = useState<VisibleCharts>(DEFAULT_VISIBLE);
-
-  useEffect(() => {
-    // Hydrate on mount
-    setCharts(readLS(VISIBLE_CHARTS_STORAGE_KEY, DEFAULT_VISIBLE));
-
-    // Same-tab sync: another caller called toggle()
-    const onCustom = (e: Event) => {
-      setCharts((e as CustomEvent<VisibleCharts>).detail);
-    };
-
-    // Cross-tab sync
-    const onStorage = (e: StorageEvent) => {
-      if (e.key === VISIBLE_CHARTS_STORAGE_KEY && e.newValue) {
-        try {
-          setCharts(JSON.parse(e.newValue) as VisibleCharts);
-        } catch {
-          /* malformed */
-        }
-      }
-    };
-
-    window.addEventListener(CHARTS_EVENT, onCustom);
-    window.addEventListener("storage", onStorage);
-    return () => {
-      window.removeEventListener(CHARTS_EVENT, onCustom);
-      window.removeEventListener("storage", onStorage);
-    };
-  }, []);
-
-  const toggle = useCallback((label: ChartLabel) => {
-    setCharts((prev) => {
-      const next = { ...prev, [label]: !prev[label] };
-      writeLS(VISIBLE_CHARTS_STORAGE_KEY, next);
-      window.dispatchEvent(
-        new CustomEvent<VisibleCharts>(CHARTS_EVENT, { detail: next }),
-      );
-      return next;
-    });
-  }, []);
-
-  return { charts, toggle };
 }
 
 // ── useAIMode ──────────────────────────────────────────────────────────────

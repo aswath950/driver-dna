@@ -10,7 +10,6 @@ import {
   type ClassSummary,
   type SingleCorner,
 } from "@/lib/api-client";
-import { useVisibleCharts } from "@/lib/preferences";
 
 interface Props {
   sessionId: number;
@@ -127,7 +126,6 @@ function CornerCard({
 }
 
 export function CornerPerformance({ sessionId, teams }: Props) {
-  const { charts } = useVisibleCharts();
   const [teamAId, setTeamAId] = useState<number>(teams[0]?.id ?? 0);
   const [teamBId, setTeamBId] = useState<number>(teams[1]?.id ?? 0);
   const [view, setView] = useState<View>("summary");
@@ -164,8 +162,6 @@ export function CornerPerformance({ sessionId, teams }: Props) {
     setTeamBId(id);
     void fetchData(teamAId, id);
   }
-
-  if (!charts["Corner performance"]) return null;
 
   if (teams.length < 2) {
     return (

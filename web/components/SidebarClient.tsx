@@ -1,16 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import {
-  useVisibleCharts,
-  useAIMode,
-  CHART_LABELS,
-  CHARTS_FOR_SESSION,
-  SESSION_TYPE_EVENT,
-  SESSION_TYPE_STORAGE_KEY,
-  type AIMode,
-  type ChartLabel,
-} from "@/lib/preferences";
+import { useAIMode, type AIMode } from "@/lib/preferences";
 import { StatPill } from "@/components/ui/StatPill";
 
 const AI_MODES: AIMode[] = ["Concise", "Detailed", "Critique loop"];
@@ -59,54 +50,6 @@ function RadioOption({
   );
 }
 
-// ── Custom checkbox indicator ──────────────────────────────────────────────
-
-function CheckOption({
-  label,
-  checked,
-  onChange,
-}: {
-  label: ChartLabel;
-  checked: boolean;
-  onChange: () => void;
-}) {
-  return (
-    <label className="flex items-center gap-2 cursor-pointer group">
-      <span className="relative inline-flex h-4 w-4 shrink-0">
-        <input
-          type="checkbox"
-          checked={checked}
-          onChange={onChange}
-          className="peer absolute inset-0 h-full w-full cursor-pointer opacity-0"
-        />
-        {/* Box */}
-        <span className="h-4 w-4 border-2 border-white/25 bg-transparent transition-colors peer-checked:border-[var(--f1-red)] peer-checked:bg-[var(--f1-red)]" />
-        {/* Checkmark */}
-        <span className="pointer-events-none absolute inset-0 flex items-center justify-center opacity-0 transition-opacity peer-checked:opacity-100">
-          <svg
-            width="10"
-            height="8"
-            viewBox="0 0 10 8"
-            fill="none"
-            aria-hidden="true"
-          >
-            <path
-              d="M1 4l3 3L9 1"
-              stroke="white"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-        </span>
-      </span>
-      <span className="text-sm text-white/60 transition-colors group-hover:text-white/90">
-        {label}
-      </span>
-    </label>
-  );
-}
-
 // ── SidebarClient ──────────────────────────────────────────────────────────
 
 function fmt(v: number | null, decimals = 1): string {
@@ -114,10 +57,8 @@ function fmt(v: number | null, decimals = 1): string {
 }
 
 export function SidebarClient() {
-  const { charts, toggle } = useVisibleCharts();
   const { mode, setMode } = useAIMode();
   const [raceMode, setRaceMode] = useState<string | null>(null);
-  const [sessionType, setSessionType] = useState<string | null>(null);
   const [apiStatus, setApiStatus] = useState<"loading" | "ok" | "error">(
     "loading",
   );
@@ -137,15 +78,6 @@ export function SidebarClient() {
 
   useEffect(() => {
     setRaceMode(localStorage.getItem(RACE_MODE_KEY));
-    setSessionType(localStorage.getItem(SESSION_TYPE_STORAGE_KEY));
-  }, []);
-
-  useEffect(() => {
-    const handler = (e: Event) => {
-      setSessionType((e as CustomEvent<string | null>).detail);
-    };
-    window.addEventListener(SESSION_TYPE_EVENT, handler);
-    return () => window.removeEventListener(SESSION_TYPE_EVENT, handler);
   }, []);
 
   useEffect(() => {
@@ -184,24 +116,6 @@ export function SidebarClient() {
         telemetry comparison, plus historical race analysis with rolling pace,
         gap charts, undercut detection, and projected finishing order.
       </div>
-
-      {/* Visible Charts */}
-      <hr className="my-4 border-white/10" />
-      <details>
-        <summary className="cursor-pointer select-none py-1 text-xs uppercase tracking-widest text-white/60 hover:text-white/80">
-          Visible Charts
-        </summary>
-        <div className="mt-2 space-y-2">
-          {(sessionType ? (CHARTS_FOR_SESSION[sessionType] ?? CHART_LABELS) : CHART_LABELS).map((label) => (
-            <CheckOption
-              key={label}
-              label={label}
-              checked={charts[label] ?? true}
-              onChange={() => toggle(label)}
-            />
-          ))}
-        </div>
-      </details>
 
       {/* Health Check */}
       <hr className="my-4 border-white/10" />
