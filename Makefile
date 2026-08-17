@@ -8,7 +8,7 @@ PYTEST  := .venv/bin/pytest
         backend-install backend backend-test backend-lint \
         web-install web web-build web-typecheck \
         db migrate seed-circuits seed-corners refresh-stats fetch-telemetry hydrate \
-        dev
+        monitoring monitoring-down dev
 
 help:
 	@echo "DriverDNA runs as one of two apps — pick an option:"
@@ -42,6 +42,9 @@ help:
 	@echo "  refresh-stats    Recompute driver_stats (SEASON=2024 or ALL_SEASONS=1)"
 	@echo "  fetch-telemetry  Download + cache telemetry (SESSION_ID= required)"
 	@echo "  hydrate          ETL one race weekend into Postgres (YEAR= GP= SESSION=)"
+	@echo "  - Metrics:"
+	@echo "  monitoring       Prometheus + postgres_exporter + Grafana (-> :3001)"
+	@echo "  monitoring-down  Stop the metrics stack"
 	@echo "  - Run it all:"
 	@echo "  dev              db + pgAdmin + backend + web in one command"
 
@@ -116,6 +119,15 @@ refresh-stats:
 fetch-telemetry:
 	@echo "Fetching telemetry for session $(SESSION_ID)..."
 	cd backend && .venv/bin/python -m app.etl fetch-telemetry --session-id $(SESSION_ID)
+
+# OPTION 2 — Full-stack · Metrics (Prometheus + postgres_exporter + Grafana)
+monitoring:
+	docker compose --profile monitoring up -d postgres postgres_exporter prometheus grafana
+	@echo "Grafana    -> http://localhost:3001  (admin / admin)"
+	@echo "Prometheus -> http://localhost:9090"
+
+monitoring-down:
+	docker compose --profile monitoring stop postgres_exporter prometheus grafana
 
 # ---------------------------------------------------------------------------
 # OPTION 2 — Full-stack · Web (Next.js)
