@@ -17,10 +17,13 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-# Number of evenly-spaced distance samples per resampled trace.
-# Matches ``src/features.N_POINTS`` and ``src/viz`` so traces are
-# byte-comparable with the Streamlit implementation.
-N_POINTS = 200
+# Number of evenly-spaced distance samples per resampled trace. Raised from the
+# legacy 200 (``src/features.N_POINTS`` / ``src/viz``) to 400 for finer corner
+# detail — braking zones, apex minima and shift edges resolve at ~half the
+# previous spacing. This is applied to the raw cached samples on every read, so
+# the change needs no cache invalidation. ``corner_compute.N_POINTS`` MUST stay
+# equal to this (apex fractions index the same grid); a test enforces it.
+N_POINTS = 400
 
 # Track-map upsample target (microsectors per circuit). Matches src/viz.
 N_DISPLAY = 1000
@@ -210,7 +213,7 @@ def build_channel_figure(
 
     When ``corners`` + ``circuit_length_m`` are supplied the x-axis is
     annotated with the circuit's turn positions (T1, T2, …) instead of the raw
-    0–200 normalised point indices; the chart falls back to the plain
+    ``0–N_POINTS`` normalised point indices; the chart falls back to the plain
     normalised axis when corner data is unavailable.  Speed is labelled in
     km/h since that is the unit of the underlying telemetry.
     """
@@ -272,7 +275,7 @@ def build_channel_figure(
                 layer="below",
             )
     else:
-        xaxis = dict(title="Normalised Distance (0–200 points)")
+        xaxis = dict(title=f"Normalised Distance (0–{N_POINTS} points)")
 
     fig.update_layout(
         title=f"Fastest Lap {channel} — {acronym_a} vs {acronym_b}",

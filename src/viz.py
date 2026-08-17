@@ -284,7 +284,7 @@ def _build_track_map_fig(
 
     # Upsample to 1000 display points for a smoother circuit outline and finer
     # microsector boundaries. XY (from circuits.json, 500 pts) and speed traces
-    # (from OpenF1, N_POINTS=200) may have different source lengths, so each is
+    # (from OpenF1, N_POINTS pts) may have different source lengths, so each is
     # interpolated on its own unit-interval grid before being mapped to t_fine.
     N_DISPLAY = 1000
     t_fine = np.linspace(0.0, 1.0, N_DISPLAY)

@@ -17,7 +17,10 @@ def _hash_df(df: pd.DataFrame) -> str:
     return hashlib.md5(pickle.dumps(df)).hexdigest()
 
 # ── Distance-normalised grid size ────────────────────────────────────────────
-N_POINTS = 200
+# Kept in sync with backend ``telemetry_compute.N_POINTS`` / ``corner_compute``
+# (raised 200 → 400 for finer corner detail). NOTE: ``pipeline.N_POINTS`` is a
+# separate constant for the ML feature dataset and is intentionally NOT changed.
+N_POINTS = 400
 TRACE_COLS = {"Speed": "speed_trace", "Throttle": "throttle_trace", "Brake": "brake_trace"}
 # OpenF1 car_data column names for the same channels
 OPENF1_TRACE_COLS = {"Speed": "speed", "Throttle": "throttle", "Brake": "brake"}

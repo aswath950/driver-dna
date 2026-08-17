@@ -70,6 +70,19 @@ def _synthetic_car_data(
 # ---------------------------------------------------------------------------
 
 
+def test_n_points_is_400() -> None:
+    # The resample grid was raised 200 → 400 for finer corner detail.
+    assert tc.N_POINTS == 400
+
+
+def test_corner_compute_n_points_matches_telemetry() -> None:
+    # corner_compute duplicates the constant; apex fractions index the same grid,
+    # so the two MUST stay equal. This guards against silent drift.
+    from app.services import corner_compute as cc
+
+    assert cc.N_POINTS == tc.N_POINTS
+
+
 def test_process_car_data_returns_n_points_arrays() -> None:
     car = _synthetic_car_data()
     out = tc.process_car_data(car, lap_duration=75.0)
@@ -422,8 +435,9 @@ def test_corner_axis_ticks_maps_to_axis_max() -> None:
     ticks = tc.corner_axis_ticks(_sample_corners(), 4000.0, axis_max=tc.N_POINTS - 1)
     assert ticks is not None
     tickvals, ticktext = ticks
-    # 0% → 0, 25% → 0.25*199, 50% → 0.5*199
-    assert tickvals == [0.0, round(0.25 * 199, 3), round(0.5 * 199, 3)]
+    axis_max = tc.N_POINTS - 1
+    # corners at 0% / 25% / 50% of the lap map to those fractions of axis_max.
+    assert tickvals == [0.0, round(0.25 * axis_max, 3), round(0.5 * axis_max, 3)]
     # Real letters are kept; "nan"/empty letters are dropped.
     assert ticktext == ["T1", "T2A", "T3"]
 
@@ -484,7 +498,7 @@ def test_build_channel_figure_falls_back_without_corners() -> None:
         b, "HAM", "#06B6D4",
         channel="Speed",
     )
-    assert fig.layout.xaxis.title.text == "Normalised Distance (0–200 points)"
+    assert fig.layout.xaxis.title.text == f"Normalised Distance (0–{tc.N_POINTS} points)"
 
 
 def test_build_time_delta_figure_uses_turn_ticks_when_corners_given() -> None:

@@ -24,7 +24,9 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
 
 # Must match telemetry_compute.N_POINTS so apex fractions index the same grid.
-N_POINTS = 200
+# Kept as a literal (not imported) to keep this module free of the plotly-heavy
+# telemetry_compute import; a test asserts the two stay equal.
+N_POINTS = 400
 
 CornerClass = Literal["slow", "medium", "high"]
 
