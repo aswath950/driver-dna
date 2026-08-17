@@ -17,6 +17,7 @@ Data sources differ from Streamlit:
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 import pandas as pd
@@ -30,6 +31,8 @@ from app.db.models import Session as SessionRow
 from app.db.repositories import circuits as circuits_repo
 from app.db.repositories import telemetry as telemetry_repo
 from app.services import telemetry_compute as tc
+
+logger = logging.getLogger(__name__)
 
 Channel = Literal[
     "Speed", "Throttle", "Brake", "RPM", "nGear", "DRS",
@@ -75,6 +78,16 @@ def _differentiate_colors(color_a: str, color_b: str) -> tuple[str, str]:
 
 
 async def _resolve_session_key(db: AsyncSession, session_id: int) -> int:
+    """Return a session's stored ``openf1_session_key`` — no live OpenF1 call.
+
+    Deliberately does NOT validate the key against OpenF1 here. The compare path
+    is cache-first (see :func:`_fetch_fastest_lap_data`): a fully-cached session
+    serves its telemetry from Postgres and never needs the key at all, so an
+    eager liveness check would make every request — even a pure cache hit —
+    hostage to a live upstream call. The stale-key check is deferred to the point
+    of an actual cache miss (:func:`_fetch_laps_or_raise`), where it can also tell
+    a genuinely-stale key apart from a transient OpenF1 failure.
+    """
     s = await db.get(SessionRow, session_id)
     if s is None:
         raise NotFoundError("session", session_id)
@@ -82,16 +95,40 @@ async def _resolve_session_key(db: AsyncSession, session_id: int) -> int:
         raise UpstreamError(
             f"session {session_id} has no openf1_session_key — was it loaded by ETL?"
         )
-    session_key = int(s.openf1_session_key)
-    # Fail fast on a stale key: OpenF1 renumbered its sessions, so a key written
-    # under the old scheme 404s on every downstream call. Without this guard the
-    # live compare path returns confusing empty traces / a downstream 503.
-    if not OpenF1Client(mode="historical").session_exists(session_key):
+    return int(s.openf1_session_key)
+
+
+def _fetch_laps_or_raise(
+    client: OpenF1Client, *, session_key: int, session_id: int
+) -> pd.DataFrame:
+    """Fetch a session's laps on a cache miss, disambiguating an empty result.
+
+    Only reached when the DB cache could not satisfy the request, so this is the
+    first point the live key is genuinely needed. An empty ``/laps`` response is
+    ambiguous — the key may be stale (OpenF1 renumbered its sessions) or the call
+    may have merely failed transiently — so we resolve it with a precise
+    tri-state existence check and raise a *stale-key* error only when OpenF1
+    definitively does not recognize the key. A transient failure yields a plain
+    (retryable) upstream error rather than wrongly blaming the session key, which
+    is exactly the confusion the old eager boolean guard produced.
+    """
+    laps_df = client.get_laps(session_key)
+    if not laps_df.empty:
+        return laps_df
+
+    status = client.session_status(session_key)
+    if status == "not_found":
         raise UpstreamError(
             f"session {session_id} openf1_session_key={session_key} is not "
             "recognized by OpenF1 (stale key) — re-resolve and update it."
         )
-    return session_key
+    if status == "unknown":
+        raise UpstreamError(
+            f"OpenF1 could not be reached to load laps for session_key="
+            f"{session_key} (transient upstream failure) — please retry."
+        )
+    # status == "exists": key is valid but the session genuinely has no laps.
+    raise UpstreamError(f"OpenF1 returned no laps for session_key={session_key}")
 
 
 async def _resolve_driver(
@@ -187,19 +224,6 @@ def _fetch_fastest_lap_from_openf1(
     return result, car, fastest
 
 
-def _samples_dict(car_df: pd.DataFrame) -> dict:
-    """Convert a raw car_data DataFrame to the columnar JSONB format for caching."""
-    return {
-        "dates": [d.isoformat() for d in car_df["date"]],
-        "speed": car_df["speed"].tolist(),
-        "throttle": car_df["throttle"].tolist(),
-        "brake": car_df["brake"].tolist(),
-        "rpm": car_df["rpm"].tolist(),
-        "n_gear": car_df["n_gear"].tolist(),
-        "drs": car_df["drs"].tolist(),
-    }
-
-
 async def _fastest_lap_from_db(
     db: AsyncSession, session_id: int, driver_id: int
 ) -> tuple[int, float] | None:
@@ -288,17 +312,27 @@ async def _fetch_fastest_lap_data(
         and not raw_car.empty
     ):
         try:
-            await telemetry_repo.save_lap(
-                db,
-                session_id=session_id,
-                driver_id=driver_id,
-                lap_number=effective_lap_n,
-                lap_duration=float(fastest["lap_duration"]),
-                samples=_samples_dict(raw_car),
-            )
-            await db.flush()
+            # Isolate the write in a SAVEPOINT: a cache write is best-effort, so a
+            # failure (e.g. an un-serializable sample slipping through) must roll
+            # back only this nested block and leave the request's transaction
+            # usable. Without the savepoint, a failed flush aborts the outer
+            # transaction and the *next* DB call in this request raises
+            # PendingRollbackError — turning a "non-fatal" cache miss into a 500.
+            async with db.begin_nested():
+                await telemetry_repo.save_lap(
+                    db,
+                    session_id=session_id,
+                    driver_id=driver_id,
+                    lap_number=effective_lap_n,
+                    lap_duration=float(fastest["lap_duration"]),
+                    samples=tc.samples_to_jsonb(raw_car),
+                )
         except Exception:
-            pass  # cache write failure is non-fatal
+            logger.warning(
+                "telemetry cache write failed for session=%s driver=%s lap=%s "
+                "(non-fatal, serving live)",
+                session_id, driver_id, effective_lap_n, exc_info=True,
+            )
 
     return result
 
@@ -362,9 +396,9 @@ async def build_compare_payload(
 
     # Phase 2: any cache miss — fetch laps once from OpenF1 and retry.
     if data_a is None or data_b is None:
-        laps_df = client.get_laps(session_key)
-        if laps_df.empty:
-            raise UpstreamError(f"OpenF1 returned no laps for session_key={session_key}")
+        laps_df = _fetch_laps_or_raise(
+            client, session_key=session_key, session_id=session_id
+        )
         if data_a is None:
             data_a = await _fetch_fastest_lap_data(
                 db, session_id=session_id, driver_id=driver_a_id,
@@ -496,9 +530,9 @@ async def build_sector_times_payload(
         driver_number=car_b, laps_df=None,
     )
     if data_a is None or data_b is None:
-        laps_df = client.get_laps(session_key)
-        if laps_df.empty:
-            raise UpstreamError(f"OpenF1 returned no laps for session_key={session_key}")
+        laps_df = _fetch_laps_or_raise(
+            client, session_key=session_key, session_id=session_id
+        )
         if data_a is None:
             data_a = await _fetch_fastest_lap_data(
                 db, session_id=session_id, driver_id=driver_a_id,
@@ -591,9 +625,9 @@ async def build_track_map_payload(
         driver_number=car_b, laps_df=None,
     )
     if data_a is None or data_b is None:
-        laps_df = client.get_laps(session_key)
-        if laps_df.empty:
-            raise UpstreamError(f"OpenF1 returned no laps for session_key={session_key}")
+        laps_df = _fetch_laps_or_raise(
+            client, session_key=session_key, session_id=session_id
+        )
         if data_a is None:
             data_a = await _fetch_fastest_lap_data(
                 db, session_id=session_id, driver_id=driver_a_id,

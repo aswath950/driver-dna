@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.openf1.org/v1"
 
+# Tri-state result of a session-key liveness check (see OpenF1Client.session_status).
+SessionStatus = Literal["exists", "not_found", "unknown"]
+
 # Columns to retain and their expected dtypes for each endpoint.
 # Any extra columns returned by the API are kept but not type-cast.
 _LAP_COLS = [
@@ -209,18 +212,73 @@ class OpenF1Client:
             df["date_end"] = pd.to_datetime(df["date_end"], errors="coerce")
         return df
 
-    def session_exists(self, session_key: int) -> bool:
-        """Return True if OpenF1 still recognizes this ``session_key``.
+    def session_status(
+        self, session_key: int, retries: int = 3, backoff: float = 2.0
+    ) -> SessionStatus:
+        """Tri-state check of whether OpenF1 recognizes this ``session_key``.
 
-        Queries ``/v1/sessions?session_key=X``: a valid key returns one row, a
-        stale/renumbered key returns 404. Because :meth:`_get` swallows every
-        non-401 status (including 404) and any transport failure into an empty
-        DataFrame, a ``False`` here means "could not confirm present" — usually a
-        stale key, but possibly a transient network failure — not hard proof the
-        session was deleted. Callers should phrase diagnostics accordingly.
+        Queries ``/v1/sessions?session_key=X`` directly (not via :meth:`_get`,
+        which collapses every failure into an empty DataFrame and so cannot tell
+        a genuinely-stale key from a call that merely failed). Distinguishes:
+
+        - ``"exists"``    — OpenF1 returned the session; the key is valid.
+        - ``"not_found"`` — OpenF1 answered definitively that no such session
+          exists (HTTP 404, or a 200 with an empty result set). A genuine stale
+          key — safe to tell the caller to re-resolve it.
+        - ``"unknown"``   — the check could not be completed (timeout, connection
+          error, or 429/5xx after retries). NOT proof the key is stale; the
+          caller should treat this as a transient upstream failure, not blame the
+          session key.
+
+        Only transient failures are retried; a definitive 404 short-circuits
+        immediately (no wasted backoff on a key we already know is gone).
         """
-        df = self._get("sessions", {"session_key": session_key})
-        return not df.empty
+        url = f"{BASE_URL}/sessions"
+        params = {"session_key": session_key}
+        for attempt in range(1, retries + 1):
+            try:
+                resp = self._session.get(url, params=params, timeout=self.timeout)
+                if resp.status_code == 401:
+                    raise OpenF1AuthError(
+                        "OpenF1 API returned 401 Unauthorized. "
+                        "The API may now require authentication."
+                    )
+                if resp.status_code == 404:
+                    return "not_found"
+                resp.raise_for_status()
+                data = resp.json()
+                # A successful, empty response is a definitive "no such session".
+                return "exists" if data else "not_found"
+            except OpenF1AuthError:
+                raise
+            except (requests.RequestException, ValueError) as exc:
+                # Non-404/401 HTTP errors (429, 5xx) and transport/parse failures
+                # are transient — retry, then fall through to "unknown".
+                if attempt < retries:
+                    delay = backoff ** attempt
+                    logger.warning(
+                        "OpenF1 session_status attempt %d/%d failed (%s), "
+                        "retrying in %.1fs",
+                        attempt, retries, exc, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.warning(
+                        "OpenF1 session_status failed after %d attempts: %s",
+                        retries, exc,
+                    )
+        return "unknown"
+
+    def session_exists(self, session_key: int) -> bool:
+        """Return True only if OpenF1 definitively still recognizes ``session_key``.
+
+        Thin boolean wrapper over :meth:`session_status`. Both ``"not_found"``
+        (genuine stale key) and ``"unknown"`` (could not confirm) map to
+        ``False``, so callers that need to tell those two apart — e.g. to avoid
+        misreporting a transient failure as a stale key — should call
+        :meth:`session_status` directly.
+        """
+        return self.session_status(session_key) == "exists"
 
     def get_drivers(self, session_key: int) -> pd.DataFrame:
         """
