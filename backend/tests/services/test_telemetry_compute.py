@@ -464,15 +464,37 @@ def test_build_channel_figure_speed_labels_kmh() -> None:
     assert all("km/h" in (t.hovertemplate or "") for t in fig.data)
 
 
-def test_build_channel_figure_non_speed_has_no_kmh() -> None:
+def test_build_channel_figure_non_speed_labels_own_unit() -> None:
     a, b = _two_drivers_data()
     fig = tc.build_channel_figure(
         a, "VER", "#1E40AF",
         b, "HAM", "#06B6D4",
         channel="Throttle",
     )
-    assert fig.layout.yaxis.title.text == "Throttle"
-    assert all(t.hovertemplate is None for t in fig.data)
+    # Non-Speed channels carry their own metric on the axis and in the hover,
+    # never km/h.
+    assert fig.layout.yaxis.title.text == "Throttle (%)"
+    assert all("km/h" not in (t.hovertemplate or "") for t in fig.data)
+    assert all("%" in (t.hovertemplate or "") for t in fig.data)
+
+
+def test_build_channel_figure_axis_titles_carry_units() -> None:
+    a, b = _two_drivers_data()
+    expected = {
+        "Speed": "Speed (km/h)",
+        "Throttle": "Throttle (%)",
+        "Brake": "Brake (%)",
+        "RPM": "Engine Speed (rpm)",
+        "nGear": "Gear",
+        "DRS": "DRS (state)",
+    }
+    for channel, title in expected.items():
+        fig = tc.build_channel_figure(
+            a, "VER", "#1E40AF",
+            b, "HAM", "#06B6D4",
+            channel=channel,
+        )
+        assert fig.layout.yaxis.title.text == title
 
 
 def test_build_channel_figure_uses_turn_ticks_when_corners_given() -> None:

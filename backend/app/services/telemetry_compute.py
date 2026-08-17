@@ -42,6 +42,30 @@ CHANNEL_COLUMN: dict[str, str] = {
     "DRS": "drs",
 }
 
+# Y-axis titles per channel — each carries the unit the channel is measured in
+# so every axis states its metric. nGear/DRS are dimensionless (gear index /
+# activation state) so they name the quantity rather than a physical unit.
+CHANNEL_Y_TITLE: dict[str, str] = {
+    "Speed": "Speed (km/h)",
+    "Throttle": "Throttle (%)",
+    "Brake": "Brake (%)",
+    "RPM": "Engine Speed (rpm)",
+    "nGear": "Gear",
+    "DRS": "DRS (state)",
+}
+
+# Per-channel unit suffix for hover read-outs, so the tooltip value also states
+# its metric. Empty for channels whose value is self-describing.
+CHANNEL_HOVER_UNIT: dict[str, str] = {
+    "Speed": " km/h",
+    "Throttle": " %",
+    "Brake": " %",
+    "RPM": " rpm",
+    "nGear": "",
+    "DRS": "",
+}
+
+
 # Numeric car_data channels stored in the JSONB cache, in column order.
 _SAMPLE_COLUMNS = ("speed", "throttle", "brake", "rpm", "n_gear", "drs")
 
@@ -285,12 +309,15 @@ def build_channel_figure(
         else f"{data_b['lap_time']:.3f}s"
     )
 
-    is_speed = channel == "Speed"
-    y_title = "Speed (km/h)" if is_speed else channel
-    # Speed values get an explicit km/h unit on hover; the driver name stays as
-    # the per-row label (the <extra> slot) so the unified tooltip is unchanged
-    # apart from the unit.
-    hovertemplate = "%{y:.0f} km/h<extra>%{fullData.name}</extra>" if is_speed else None
+    y_title = CHANNEL_Y_TITLE.get(channel, channel)
+    # Each channel's value gets its unit on hover; the driver name stays as the
+    # per-row label (the <extra> slot) so the unified tooltip is unchanged apart
+    # from the unit. Integer-valued channels (gear/DRS state) drop the decimal.
+    hover_unit = CHANNEL_HOVER_UNIT.get(channel, "")
+    y_fmt = ":.0f" if channel in ("Speed", "RPM", "nGear", "DRS") else ":.1f"
+    hovertemplate = (
+        f"%{{y{y_fmt}}}{hover_unit}<extra>%{{fullData.name}}</extra>"
+    )
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
