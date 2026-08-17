@@ -11,7 +11,10 @@ Synthetic-array style mirrors ``test_telemetry_compute.py`` — no DB, no HTTP.
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
+import plotly.graph_objects as go
 import pytest
 from scipy.ndimage import gaussian_filter1d
 
@@ -194,3 +197,166 @@ def test_corner_boundaries_respect_bounds():
     sp_smooth = gaussian_filter1d(speed, sigma=3)
     entry, exit_ = cc._corner_boundaries(sp_smooth, apex_idx=92, lower=86, upper=96)
     assert 86 <= entry <= 92 <= exit_ <= 96
+
+
+# ---------------------------------------------------------------------------
+# Straight detection
+# ---------------------------------------------------------------------------
+
+
+def _stadium_outline(
+    n_straight: int = 80,
+    n_bend: int = 40,
+    half_len: float = 500.0,
+    radius: float = 120.0,
+) -> tuple[list[float], list[float]]:
+    """A 'stadium' circuit: two long straights joined by two 180° bends.
+
+    Returns (x, y) outline lists in travel order. The two bends are the only
+    high-curvature regions, so they are the only corners; everything else is
+    straight.
+    """
+    L, R = half_len, radius
+    top_x = np.linspace(-L, L, n_straight, endpoint=False)
+    top_y = np.full(n_straight, R)
+
+    th_r = np.linspace(np.pi / 2, -np.pi / 2, n_bend, endpoint=False)
+    rb_x, rb_y = L + R * np.cos(th_r), R * np.sin(th_r)
+
+    bot_x = np.linspace(L, -L, n_straight, endpoint=False)
+    bot_y = np.full(n_straight, -R)
+
+    th_l = np.linspace(-np.pi / 2, -3 * np.pi / 2, n_bend, endpoint=False)
+    lb_x, lb_y = -L + R * np.cos(th_l), R * np.sin(th_l)
+
+    x = np.concatenate([top_x, rb_x, bot_x, lb_x])
+    y = np.concatenate([top_y, rb_y, bot_y, lb_y])
+    return x.tolist(), y.tolist()
+
+
+def test_detect_straights_finds_straights_between_bends():
+    x, y = _stadium_outline()
+    corners = cc.detect_corners(tuple(x), tuple(y))
+    assert len(corners) >= 2  # the two bends
+
+    straights = cc.detect_straights(corners, x, y)
+    assert len(straights) == 2  # top + bottom straight
+
+    # Curvature is the discriminator: every straight point sits well below the
+    # peak curvature of the bends (a flat-out high-curvature corner stays out).
+    _, kappa = cc._curvature(x, y)
+    peak = float(kappa.max())
+    for st in straights:
+        assert st["indices"]  # non-empty
+        assert max(kappa[i] for i in st["indices"]) < 0.2 * peak
+        # Monotonic, in-range fractions paired 1-to-1 with indices.
+        assert len(st["fracs"]) == len(st["indices"])
+        assert 0.0 <= st["start_frac"] <= st["end_frac"] <= 1.0
+
+
+def test_detect_straights_excludes_corner_territory():
+    x, y = _stadium_outline()
+    corners = cc.detect_corners(tuple(x), tuple(y))
+    n = len(x)
+
+    corner_idxs: set[int] = set()
+    for c in corners:
+        lo = int(round(min(c["entry_frac"], c["exit_frac"]) * (n - 1)))
+        hi = int(round(max(c["entry_frac"], c["exit_frac"]) * (n - 1)))
+        corner_idxs.update(range(lo, hi + 1))
+
+    straights = cc.detect_straights(corners, x, y)
+    for st in straights:
+        assert not (set(st["indices"]) & corner_idxs)
+
+
+def test_detect_straights_empty_inputs():
+    x, y = _stadium_outline()
+    assert cc.detect_straights([], x, y) == []
+    assert cc.detect_straights([{"entry_frac": 0.1, "exit_frac": 0.2}], [], []) == []
+
+
+# ---------------------------------------------------------------------------
+# Straight metrics + speed aggregation
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_team_speed_single_and_pair():
+    a = [100.0] * N
+    assert cc.aggregate_team_speed([a]) == a
+
+    b = [200.0] * N
+    agg = cc.aggregate_team_speed([a, b])
+    assert agg == [150.0] * N  # element-wise median of two
+
+
+def test_compute_straight_metrics_top_speed_and_location():
+    # Increasing speed → Vmax is at the straight's last point.
+    team_speed = list(np.linspace(100.0, 300.0, N))
+    straight = {
+        "straight_number": 1,
+        "indices": [10, 11, 12, 13, 14],
+        "fracs": [0.0, 0.1, 0.2, 0.3, 0.4],
+    }
+    [m] = cc.compute_straight_metrics([straight], team_speed)
+
+    assert m["straight_number"] == 1
+    assert m["top_speed_index"] == 14
+    assert m["top_speed_frac"] == pytest.approx(0.4)
+    assert m["top_speed"] == pytest.approx(180.0, abs=1.0)  # 100 + 0.4 * 200
+
+
+# ---------------------------------------------------------------------------
+# Figure builders — smoke tests
+# ---------------------------------------------------------------------------
+
+
+def _stadium_corners_and_metrics():
+    x, y = _stadium_outline()
+    corners = cc.classify_corners(cc.detect_corners(tuple(x), tuple(y)), _ref_speed())
+    speed = _ref_speed()
+    throttle = np.where(np.array(speed) > 250, 100.0, 0.0).tolist()
+    brake = np.where(np.array(speed) < 150, 80.0, 0.0).tolist()
+    metrics = cc.compute_corner_metrics(speed, throttle, brake, corners)
+    return x, y, corners, metrics
+
+
+def _ref_speed() -> list[float]:
+    return list(_speed_profile([(0.3, 120, 0.05), (0.8, 90, 0.05)]))
+
+
+def test_build_straight_performance_figure_smoke():
+    x, y = _stadium_outline()
+    corners = cc.detect_corners(tuple(x), tuple(y))
+    straights = cc.detect_straights(corners, x, y)
+    sa = list(np.linspace(120.0, 320.0, N))
+    sb = list(np.linspace(110.0, 300.0, N))
+
+    fig = cc.build_straight_performance_figure(
+        x, y, straights, sa, "Alpha", "#ff0000", sb, "Bravo", "#0000ff"
+    )
+    assert isinstance(fig, go.Figure)
+    assert len(fig.data) >= 2  # outline + at least one microsector trace
+    # Triangle markers for the top-speed points are present.
+    symbols = [
+        tr.marker.symbol for tr in fig.data if getattr(tr, "marker", None) is not None
+    ]
+    assert "triangle-up" in symbols
+    json.loads(fig.to_json())  # serializable
+
+
+def test_build_hybrid_map_figure_smoke():
+    x, y, corners, metrics = _stadium_corners_and_metrics()
+    straights = cc.detect_straights(corners, x, y)
+    sa = list(np.linspace(120.0, 320.0, N))
+    sb = list(np.linspace(110.0, 300.0, N))
+
+    fig = cc.build_hybrid_map_figure(
+        x, y, corners,
+        metrics, "Alpha", "#ff0000",
+        metrics, "Bravo", "#0000ff",
+        straights, sa, sb,
+    )
+    assert isinstance(fig, go.Figure)
+    assert len(fig.data) >= 3  # outline + corners + straight content
+    json.loads(fig.to_json())

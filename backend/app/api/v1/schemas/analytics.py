@@ -142,3 +142,5 @@ class CornerPerformancePayload(ORMModel):
     v_min_figure: str                  # Plotly JSON
     class_summary_figure: str          # Plotly JSON
     track_map_figure: str              # Plotly JSON
+    straight_map_figure: str           # Plotly JSON
+    hybrid_map_figure: str             # Plotly JSON

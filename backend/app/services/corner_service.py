@@ -68,7 +68,7 @@ async def _fetch_driver_data(
     session_key: int,
     laps_df: pd.DataFrame | None,
 ) -> dict | None:
-    """Thin wrapper: cache-first telemetry fetch returning the 200-pt processed dict."""
+    """Thin wrapper: cache-first telemetry fetch returning the N_POINTS-pt processed dict."""
     return await _fetch_fastest_lap_data(
         db,
         session_id=session_id,
@@ -230,6 +230,11 @@ async def build_corner_performance_payload(
     team_a_metrics = cc.aggregate_team_metrics(metrics_a_list)
     team_b_metrics = cc.aggregate_team_metrics(metrics_b_list)
 
+    # ── Straight detection + per-team speed traces ───────────────────────────
+    team_a_speed = cc.aggregate_team_speed([d["speed"] for d in data_a])
+    team_b_speed = cc.aggregate_team_speed([d["speed"] for d in data_b])
+    straights = cc.detect_straights(corners, circuit.x, circuit.y)
+
     # ── Summary + figures ────────────────────────────────────────────────────
     summary = cc.build_class_summary(corners, team_a_metrics, team_b_metrics)
 
@@ -250,6 +255,19 @@ async def build_corner_performance_payload(
         corners,
         team_a_metrics, name_a, color_a,
         team_b_metrics, name_b, color_b,
+    )
+    straight_fig = cc.build_straight_performance_figure(
+        circuit.x, circuit.y,
+        straights,
+        team_a_speed, name_a, color_a,
+        team_b_speed, name_b, color_b,
+    )
+    hybrid_fig = cc.build_hybrid_map_figure(
+        circuit.x, circuit.y,
+        corners,
+        team_a_metrics, name_a, color_a,
+        team_b_metrics, name_b, color_b,
+        straights, team_a_speed, team_b_speed,
     )
 
     # ── Assemble payload ─────────────────────────────────────────────────────
@@ -272,4 +290,6 @@ async def build_corner_performance_payload(
         "v_min_figure":          v_min_fig.to_json(),
         "class_summary_figure":  class_fig.to_json(),
         "track_map_figure":      map_fig.to_json(),
+        "straight_map_figure":   straight_fig.to_json(),
+        "hybrid_map_figure":     hybrid_fig.to_json(),
     }

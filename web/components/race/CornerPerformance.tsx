@@ -16,12 +16,19 @@ interface Props {
   teams: TeamOut[];
 }
 
-type View = "summary" | "per-corner" | "track-map";
+type View =
+  | "summary"
+  | "per-corner"
+  | "track-map"
+  | "straight-performance"
+  | "hybrid-map";
 
 const VIEW_LABELS: { key: View; label: string }[] = [
   { key: "summary", label: "Summary" },
   { key: "per-corner", label: "Per Corner" },
   { key: "track-map", label: "Track Map" },
+  { key: "straight-performance", label: "Straight Performance" },
+  { key: "hybrid-map", label: "Hybrid Map" },
 ];
 
 const CLASS_ORDER = ["slow", "medium", "high"] as const;
@@ -270,6 +277,18 @@ export function CornerPerformance({ sessionId, teams }: Props) {
         ) : payload && view === "track-map" ? (
           <PlotlyChart
             figureJson={payload.track_map_figure}
+            height={520}
+            margin={{ l: 0, r: 0, t: 40, b: 0 }}
+          />
+        ) : payload && view === "straight-performance" ? (
+          <PlotlyChart
+            figureJson={payload.straight_map_figure}
+            height={520}
+            margin={{ l: 0, r: 0, t: 40, b: 0 }}
+          />
+        ) : payload && view === "hybrid-map" ? (
+          <PlotlyChart
+            figureJson={payload.hybrid_map_figure}
             height={520}
             margin={{ l: 0, r: 0, t: 40, b: 0 }}
           />

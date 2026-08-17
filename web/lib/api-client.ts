@@ -90,6 +90,8 @@ export interface CornerPerformancePayload {
   v_min_figure: string;
   class_summary_figure: string;
   track_map_figure: string;
+  straight_map_figure: string;
+  hybrid_map_figure: string;
 }
 
 export interface GpScheduleItem {

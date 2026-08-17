@@ -9,7 +9,7 @@ resulting corner map is cached per-circuit via lru_cache since circuit geometry
 is immutable within a process lifetime.
 
 Corner positions are expressed as 0–1 normalized arc-length fractions that
-directly index into the N_POINTS=200 distance grid produced by
+directly index into the N_POINTS distance grid produced by
 telemetry_compute.process_car_data().
 """
 
@@ -29,6 +29,57 @@ from scipy.signal import find_peaks
 N_POINTS = 400
 
 CornerClass = Literal["slow", "medium", "high"]
+
+# Straight detection (see detect_straights):
+#   - a span counts as "straight" only where curvature is below this percentile
+#     of the lap, which excludes flat-out corners (high curvature, full throttle).
+#   - spans shorter than this fraction of the lap are dropped as noise.
+STRAIGHT_KAPPA_PCT = 25.0
+MIN_STRAIGHT_FRAC = 0.03
+
+
+# ---------------------------------------------------------------------------
+# Curvature — shared by corner and straight detection
+# ---------------------------------------------------------------------------
+
+
+def _curvature(
+    x: tuple[float, ...] | list[float],
+    y: tuple[float, ...] | list[float],
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Compute normalized arc-length and smoothed curvature for an outline.
+
+    Args:
+        x, y: Circuit outline point arrays.
+
+    Returns:
+        (s_norm, kappa_smooth) where s_norm is the 0–1 arc-length fraction at
+        each point and kappa_smooth is the smoothed curvature magnitude.
+        Returns (None, None) for a degenerate (~zero-length) outline.
+    """
+    xa, ya = np.array(x, dtype=float), np.array(y, dtype=float)
+
+    # Arc-length from start
+    ds = np.sqrt(np.diff(xa) ** 2 + np.diff(ya) ** 2)
+    s = np.concatenate([[0.0], np.cumsum(ds)])
+    total = s[-1]
+    if total < 1e-6:
+        return None, None
+    s_norm = s / total  # 0–1 fraction
+
+    # Curvature: κ = |x'y'' - y'x''| / (x'²+y'²)^1.5
+    dx = np.gradient(xa)
+    dy = np.gradient(ya)
+    ddx = np.gradient(dx)
+    ddy = np.gradient(dy)
+    denom = (dx ** 2 + dy ** 2) ** 1.5
+    denom = np.where(denom < 1e-8, 1e-8, denom)
+    kappa = np.abs(dx * ddy - dy * ddx) / denom
+
+    # Smooth to suppress noise; sigma≈1% of array length
+    sigma = max(3, len(kappa) // 80)
+    kappa_smooth = gaussian_filter1d(kappa, sigma=sigma)
+    return s_norm, kappa_smooth
 
 
 # ---------------------------------------------------------------------------
@@ -50,28 +101,9 @@ def detect_corners(
         List of dicts with keys: corner_number, apex_frac, entry_frac, exit_frac.
         All *_frac values are 0–1 arc-length fractions.
     """
-    xa, ya = np.array(x, dtype=float), np.array(y, dtype=float)
-
-    # Arc-length from start
-    ds = np.sqrt(np.diff(xa) ** 2 + np.diff(ya) ** 2)
-    s = np.concatenate([[0.0], np.cumsum(ds)])
-    total = s[-1]
-    if total < 1e-6:
+    s_norm, kappa_smooth = _curvature(x, y)
+    if s_norm is None:
         return []
-    s_norm = s / total  # 0–1 fraction
-
-    # Curvature: κ = |x'y'' - y'x''| / (x'²+y'²)^1.5
-    dx = np.gradient(xa)
-    dy = np.gradient(ya)
-    ddx = np.gradient(dx)
-    ddy = np.gradient(dy)
-    denom = (dx ** 2 + dy ** 2) ** 1.5
-    denom = np.where(denom < 1e-8, 1e-8, denom)
-    kappa = np.abs(dx * ddy - dy * ddx) / denom
-
-    # Smooth to suppress noise; sigma≈1% of array length
-    sigma = max(3, len(kappa) // 80)
-    kappa_smooth = gaussian_filter1d(kappa, sigma=sigma)
 
     # Peak detection: height ≥ 75th-percentile, min distance ≈ 2% of track
     min_height = float(np.percentile(kappa_smooth, 75))
@@ -118,7 +150,7 @@ def _territory_bounds(apex_indices: list[int], n: int) -> list[tuple[int, int]]:
     Args:
         apex_indices: Apex grid indices, ascending. May contain equal/adjacent
                       values on long circuits where corners round to the same
-                      200-pt index.
+                      N_POINTS-pt index.
         n:            Length of the speed grid (N_POINTS).
 
     Returns:
@@ -193,14 +225,14 @@ def corners_from_preloaded(
 
     The ``distance_m`` values are metres from the start/finish line (as stored
     by FastF1) and are divided by ``circuit_length_m`` to produce normalised
-    0–1 arc-length fractions that index into the N_POINTS=200 telemetry grid.
+    0–1 arc-length fractions that index into the N_POINTS telemetry grid.
     Entry and exit boundaries are still derived from the speed profile using
     the same 30%-recovery walk as detect_corners_from_speed.
 
     Args:
         preloaded:        List of corner dicts from ``circuits.corners``.
         circuit_length_m: Total circuit length in metres (``length_km * 1000``).
-        speed:            N_POINTS=200 speed array (km/h) from process_car_data().
+        speed:            N_POINTS speed array (km/h) from process_car_data().
 
     Returns:
         List of dicts: {corner_number, apex_frac, entry_frac, exit_frac}.
@@ -249,7 +281,7 @@ def detect_corners_from_speed(speed: list[float]) -> list[dict]:
     point on the circuit than the lap start/finish line.
 
     Args:
-        speed: N_POINTS=200 speed array (km/h) from process_car_data().
+        speed: N_POINTS speed array (km/h) from process_car_data().
 
     Returns:
         List of dicts: {corner_number, apex_frac, entry_frac, exit_frac}.
@@ -294,7 +326,7 @@ def classify_corners(
 
     Args:
         corners:   Output of detect_corners().
-        ref_speed: N_POINTS=200 speed array (km/h) from process_car_data().
+        ref_speed: N_POINTS speed array (km/h) from process_car_data().
                    Used as reference to determine apex speed.
 
     Returns:
@@ -325,7 +357,7 @@ def compute_corner_metrics(
     """Extract performance metrics for one driver at each corner.
 
     Args:
-        speed, throttle, brake: N_POINTS=200 arrays from process_car_data().
+        speed, throttle, brake: N_POINTS arrays from process_car_data().
         corners: Classified corner list (output of classify_corners()).
 
     Returns:
@@ -458,6 +490,140 @@ def build_class_summary(
             "team_b": {k: round(float(np.median(data[k][1])), 3) for k in keys},
         }
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Straight detection
+# ---------------------------------------------------------------------------
+
+
+def _contiguous_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Return inclusive (start, end) index ranges where ``mask`` is True."""
+    runs: list[tuple[int, int]] = []
+    n = len(mask)
+    i = 0
+    while i < n:
+        if mask[i]:
+            j = i
+            while j + 1 < n and mask[j + 1]:
+                j += 1
+            runs.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+    return runs
+
+
+def detect_straights(
+    corners: list[dict],
+    circuit_x: list[float],
+    circuit_y: list[float],
+) -> list[dict]:
+    """Detect straights as low-curvature spans between corners.
+
+    A straight is a run of outline points that (a) does not fall inside any
+    corner's entry→exit territory and (b) keeps curvature below the
+    STRAIGHT_KAPPA_PCT percentile of the lap.  Curvature — not throttle — is the
+    discriminator, so flat-out corners (Copse, Eau Rouge, 130R) are correctly
+    excluded even though a driver holds full throttle through them.  Runs shorter
+    than MIN_STRAIGHT_FRAC of the lap are dropped.
+
+    The run touching the last outline point is merged with the run touching the
+    first, since the start/finish line usually splits one straight in two.
+
+    Args:
+        corners:   Corner dicts with entry_frac/exit_frac (any order).
+        circuit_x, circuit_y: Circuit outline coordinates.
+
+    Returns:
+        List of dicts: {straight_number, indices, fracs, start_frac, end_frac}.
+        ``indices`` are circuit-outline indices in travel order; ``fracs`` are
+        the matching 0–1 arc-length fractions (for indexing the speed grid).
+    """
+    s_norm, kappa_smooth = _curvature(circuit_x, circuit_y)
+    if s_norm is None or not corners:
+        return []
+    n = len(kappa_smooth)
+    threshold = float(np.percentile(kappa_smooth, STRAIGHT_KAPPA_PCT))
+
+    # Mark each corner's entry→exit territory on the outline grid.
+    is_corner = np.zeros(n, dtype=bool)
+    for c in corners:
+        lo = int(np.clip(round(min(c["entry_frac"], c["exit_frac"]) * (n - 1)), 0, n - 1))
+        hi = int(np.clip(round(max(c["entry_frac"], c["exit_frac"]) * (n - 1)), 0, n - 1))
+        is_corner[lo : hi + 1] = True
+
+    is_straight = (~is_corner) & (kappa_smooth <= threshold)
+    runs = _contiguous_runs(is_straight)
+    if not runs:
+        return []
+
+    index_runs: list[list[int]] = [list(range(a, b + 1)) for a, b in runs]
+    # Merge the start/finish wrap into a single straight.
+    if len(index_runs) >= 2 and runs[0][0] == 0 and runs[-1][1] == n - 1:
+        wrapped = index_runs.pop(-1) + index_runs.pop(0)
+        index_runs.insert(0, wrapped)
+
+    min_len = max(2, int(MIN_STRAIGHT_FRAC * n))
+    straights: list[dict] = []
+    num = 1
+    for idxs in index_runs:
+        if len(idxs) < min_len:
+            continue
+        fracs = [float(s_norm[i]) for i in idxs]
+        straights.append({
+            "straight_number": num,
+            "indices": idxs,
+            "fracs": fracs,
+            "start_frac": fracs[0],
+            "end_frac": fracs[-1],
+        })
+        num += 1
+    return straights
+
+
+def aggregate_team_speed(speed_arrays: list[list[float]]) -> list[float]:
+    """Median-aggregate 1–2 driver speed traces into one team speed trace.
+
+    Mirrors aggregate_team_metrics: a single driver passes through unchanged,
+    two drivers are reduced element-wise by the median.
+    """
+    if len(speed_arrays) == 1:
+        return list(speed_arrays[0])
+    arr = np.array(speed_arrays, dtype=float)
+    return np.median(arr, axis=0).tolist()
+
+
+def compute_straight_metrics(
+    straights: list[dict],
+    team_speed: list[float],
+) -> list[dict]:
+    """Per-straight top speed and its location for one team.
+
+    The team speed trace is the N_POINTS grid; each straight's arc-length
+    ``fracs`` are interpolated onto that grid to read the speed at every outline
+    point, and the maximum is taken.
+
+    Returns:
+        List aligned with ``straights``:
+        {straight_number, top_speed, top_speed_frac, top_speed_index}.
+        ``top_speed_index`` is the circuit-outline index of the Vmax point
+        (for placing a marker on the track map).
+    """
+    sp = np.array(team_speed, dtype=float)
+    grid = np.linspace(0.0, 1.0, len(sp))
+    out: list[dict] = []
+    for st in straights:
+        fr = np.array(st["fracs"], dtype=float)
+        speeds = np.interp(fr, grid, sp)
+        k = int(np.argmax(speeds))
+        out.append({
+            "straight_number": st["straight_number"],
+            "top_speed":       round(float(speeds[k]), 1),
+            "top_speed_frac":  float(fr[k]),
+            "top_speed_index": int(st["indices"][k]),
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -657,38 +823,36 @@ def build_class_summary_figure(
     return fig
 
 
-def build_corner_track_map_figure(
-    circuit_x: list[float],
-    circuit_y: list[float],
-    corners: list[dict],
-    team_a_metrics: list[dict],
-    team_a_name: str,
-    team_a_color: str,
-    team_b_metrics: list[dict],
-    team_b_name: str,
-    team_b_color: str,
-) -> go.Figure:
-    """Circuit outline with apex markers colored by which team has higher v_min."""
-    cx = np.array(circuit_x, dtype=float)
-    cy = np.array(circuit_y, dtype=float)
+# ---------------------------------------------------------------------------
+# Track-map trace helpers — shared by corner, straight, and hybrid maps
+# ---------------------------------------------------------------------------
 
-    # Rotate so the circuit's principal axis fills a landscape canvas.
-    cx, cy = _rotate_circuit_to_fit(cx, cy)
 
-    # Tight axis bounds — 5% padding, matching telemetry track map.
+def _map_axis_ranges(
+    cx: np.ndarray, cy: np.ndarray
+) -> tuple[list[float], list[float]]:
+    """Tight 5%-padded x/y ranges, matching the telemetry track map."""
     pad_x = (cx.max() - cx.min()) * 0.05
     pad_y = (cy.max() - cy.min()) * 0.05
-    x_range = [float(cx.min() - pad_x), float(cx.max() + pad_x)]
-    y_range = [float(cy.min() - pad_y), float(cy.max() + pad_y)]
+    return (
+        [float(cx.min() - pad_x), float(cx.max() + pad_x)],
+        [float(cy.min() - pad_y), float(cy.max() + pad_y)],
+    )
 
-    n_pts = len(cx)
 
-    a_by_n = {m["corner_number"]: m for m in team_a_metrics}
-    b_by_n = {m["corner_number"]: m for m in team_b_metrics}
+def _map_layout(title: str, x_range: list[float], y_range: list[float]) -> dict:
+    """Shared dark layout for the square-scaled track maps."""
+    return _dark_layout(
+        title=title,
+        xaxis={"visible": False, "scaleanchor": "y", "scaleratio": 1, "range": x_range},
+        yaxis={"visible": False, "range": y_range},
+        margin={"l": 0, "r": 0, "t": 40, "b": 0},
+        legend={"orientation": "h", "y": 1.05, "x": 0.5, "xanchor": "center"},
+    )
 
-    fig = go.Figure()
 
-    # Circuit outline
+def _add_circuit_outline(fig: go.Figure, cx: np.ndarray, cy: np.ndarray) -> None:
+    """Add the grey circuit outline trace."""
     fig.add_trace(go.Scatter(
         x=cx.tolist(),
         y=cy.tolist(),
@@ -699,7 +863,43 @@ def build_corner_track_map_figure(
         showlegend=False,
     ))
 
-    # Corner apex markers
+
+def _add_team_legend_proxies(
+    fig: go.Figure,
+    team_a_name: str,
+    team_a_color: str,
+    team_b_name: str,
+    team_b_color: str,
+    *,
+    suffix: str = "faster",
+) -> None:
+    """Add off-canvas markers so the team colors appear in the legend."""
+    for name, color in [(team_a_name, team_a_color), (team_b_name, team_b_color)]:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode="markers",
+            marker={"color": color, "size": 10},
+            name=f"{name} {suffix}",
+        ))
+
+
+def _add_corner_apex_markers(
+    fig: go.Figure,
+    cx: np.ndarray,
+    cy: np.ndarray,
+    corners: list[dict],
+    team_a_metrics: list[dict],
+    team_a_name: str,
+    team_a_color: str,
+    team_b_metrics: list[dict],
+    team_b_name: str,
+    team_b_color: str,
+) -> None:
+    """Add apex markers colored by which team has the higher v_min."""
+    n_pts = len(cx)
+    a_by_n = {m["corner_number"]: m for m in team_a_metrics}
+    b_by_n = {m["corner_number"]: m for m in team_b_metrics}
+
     marker_x, marker_y, marker_colors, marker_sizes, hover_texts = [], [], [], [], []
     for c in corners:
         cn = c["corner_number"]
@@ -757,22 +957,218 @@ def build_corner_track_map_figure(
         showlegend=False,
     ))
 
-    # Legend proxies for team colors
-    for name, color in [(team_a_name, team_a_color), (team_b_name, team_b_color)]:
+
+def _add_straight_microsectors(
+    fig: go.Figure,
+    cx: np.ndarray,
+    cy: np.ndarray,
+    straights: list[dict],
+    team_a_speed: list[float],
+    team_a_color: str,
+    team_b_speed: list[float],
+    team_b_color: str,
+) -> None:
+    """Color each straight's microsectors by the faster team's instantaneous speed.
+
+    Outline segments inside a straight are grouped into three None-separated
+    traces (team A faster / team B faster / tied) so the whole map adds only a
+    few traces regardless of how many microsectors there are.
+    """
+    sa = np.array(team_a_speed, dtype=float)
+    sb = np.array(team_b_speed, dtype=float)
+    grid_a = np.linspace(0.0, 1.0, len(sa))
+    grid_b = np.linspace(0.0, 1.0, len(sb))
+
+    buckets: dict[str, dict[str, list]] = {
+        team_a_color: {"x": [], "y": []},
+        team_b_color: {"x": [], "y": []},
+        "#ffffff":    {"x": [], "y": []},
+    }
+    for st in straights:
+        idxs = st["indices"]
+        fr = np.array(st["fracs"], dtype=float)
+        va = np.interp(fr, grid_a, sa)
+        vb = np.interp(fr, grid_b, sb)
+        for j in range(len(idxs) - 1):
+            d = va[j] - vb[j]
+            color = (
+                team_a_color if d > 0.5
+                else team_b_color if d < -0.5
+                else "#ffffff"
+            )
+            b = buckets[color]
+            b["x"].extend([float(cx[idxs[j]]), float(cx[idxs[j + 1]]), None])
+            b["y"].extend([float(cy[idxs[j]]), float(cy[idxs[j + 1]]), None])
+
+    for color, data in buckets.items():
+        if not data["x"]:
+            continue
         fig.add_trace(go.Scatter(
-            x=[None], y=[None],
-            mode="markers",
-            marker={"color": color, "size": 10},
-            name=f"{name} faster",
+            x=data["x"], y=data["y"],
+            mode="lines",
+            line={"color": color, "width": 7},
+            hoverinfo="skip",
+            showlegend=False,
         ))
 
+
+def _add_top_speed_triangles(
+    fig: go.Figure,
+    cx: np.ndarray,
+    cy: np.ndarray,
+    straight_metrics_a: list[dict],
+    team_a_name: str,
+    team_a_color: str,
+    straight_metrics_b: list[dict],
+    team_b_name: str,
+    team_b_color: str,
+) -> None:
+    """Mark each team's Vmax point on every straight with a team-colored triangle."""
+    for metrics, name, color in (
+        (straight_metrics_a, team_a_name, team_a_color),
+        (straight_metrics_b, team_b_name, team_b_color),
+    ):
+        xs, ys, hover = [], [], []
+        for sm in metrics:
+            i = sm["top_speed_index"]
+            xs.append(float(cx[i]))
+            ys.append(float(cy[i]))
+            hover.append(
+                f"Straight {sm['straight_number']} · {name}: "
+                f"{sm['top_speed']:.1f} km/h"
+            )
+        if not xs:
+            continue
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys,
+            mode="markers",
+            marker={
+                "symbol": "triangle-up",
+                "color": color,
+                "size": 15,
+                "line": {"color": "rgba(255,255,255,0.6)", "width": 1},
+            },
+            hovertext=hover,
+            hoverinfo="text",
+            name=f"{name} top speed",
+            showlegend=False,
+        ))
+
+
+def build_corner_track_map_figure(
+    circuit_x: list[float],
+    circuit_y: list[float],
+    corners: list[dict],
+    team_a_metrics: list[dict],
+    team_a_name: str,
+    team_a_color: str,
+    team_b_metrics: list[dict],
+    team_b_name: str,
+    team_b_color: str,
+) -> go.Figure:
+    """Circuit outline with apex markers colored by which team has higher v_min."""
+    cx = np.array(circuit_x, dtype=float)
+    cy = np.array(circuit_y, dtype=float)
+    cx, cy = _rotate_circuit_to_fit(cx, cy)
+    x_range, y_range = _map_axis_ranges(cx, cy)
+
+    fig = go.Figure()
+    _add_circuit_outline(fig, cx, cy)
+    _add_corner_apex_markers(
+        fig, cx, cy, corners,
+        team_a_metrics, team_a_name, team_a_color,
+        team_b_metrics, team_b_name, team_b_color,
+    )
+    _add_team_legend_proxies(
+        fig, team_a_name, team_a_color, team_b_name, team_b_color, suffix="faster"
+    )
+    fig.update_layout(**_map_layout("Corner Map — Faster Team per Apex", x_range, y_range))
+    return fig
+
+
+def build_straight_performance_figure(
+    circuit_x: list[float],
+    circuit_y: list[float],
+    straights: list[dict],
+    team_a_speed: list[float],
+    team_a_name: str,
+    team_a_color: str,
+    team_b_speed: list[float],
+    team_b_name: str,
+    team_b_color: str,
+) -> go.Figure:
+    """Track map: straights colored by faster team, with per-straight Vmax triangles."""
+    cx = np.array(circuit_x, dtype=float)
+    cy = np.array(circuit_y, dtype=float)
+    cx, cy = _rotate_circuit_to_fit(cx, cy)
+    x_range, y_range = _map_axis_ranges(cx, cy)
+
+    sm_a = compute_straight_metrics(straights, team_a_speed)
+    sm_b = compute_straight_metrics(straights, team_b_speed)
+
+    fig = go.Figure()
+    _add_circuit_outline(fig, cx, cy)
+    _add_straight_microsectors(
+        fig, cx, cy, straights,
+        team_a_speed, team_a_color, team_b_speed, team_b_color,
+    )
+    _add_top_speed_triangles(
+        fig, cx, cy,
+        sm_a, team_a_name, team_a_color,
+        sm_b, team_b_name, team_b_color,
+    )
+    _add_team_legend_proxies(
+        fig, team_a_name, team_a_color, team_b_name, team_b_color, suffix="faster"
+    )
     fig.update_layout(
-        **_dark_layout(
-            title="Corner Map — Faster Team per Apex",
-            xaxis={"visible": False, "scaleanchor": "y", "scaleratio": 1, "range": x_range},
-            yaxis={"visible": False, "range": y_range},
-            margin={"l": 0, "r": 0, "t": 40, "b": 0},
-            legend={"orientation": "h", "y": 1.05, "x": 0.5, "xanchor": "center"},
-        )
+        **_map_layout("Straight Map — Faster Team & Top Speeds", x_range, y_range)
+    )
+    return fig
+
+
+def build_hybrid_map_figure(
+    circuit_x: list[float],
+    circuit_y: list[float],
+    corners: list[dict],
+    team_a_metrics: list[dict],
+    team_a_name: str,
+    team_a_color: str,
+    team_b_metrics: list[dict],
+    team_b_name: str,
+    team_b_color: str,
+    straights: list[dict],
+    team_a_speed: list[float],
+    team_b_speed: list[float],
+) -> go.Figure:
+    """Corner apex markers + straight microsector coloring + Vmax triangles, combined."""
+    cx = np.array(circuit_x, dtype=float)
+    cy = np.array(circuit_y, dtype=float)
+    cx, cy = _rotate_circuit_to_fit(cx, cy)
+    x_range, y_range = _map_axis_ranges(cx, cy)
+
+    sm_a = compute_straight_metrics(straights, team_a_speed)
+    sm_b = compute_straight_metrics(straights, team_b_speed)
+
+    fig = go.Figure()
+    _add_circuit_outline(fig, cx, cy)
+    _add_straight_microsectors(
+        fig, cx, cy, straights,
+        team_a_speed, team_a_color, team_b_speed, team_b_color,
+    )
+    _add_corner_apex_markers(
+        fig, cx, cy, corners,
+        team_a_metrics, team_a_name, team_a_color,
+        team_b_metrics, team_b_name, team_b_color,
+    )
+    _add_top_speed_triangles(
+        fig, cx, cy,
+        sm_a, team_a_name, team_a_color,
+        sm_b, team_b_name, team_b_color,
+    )
+    _add_team_legend_proxies(
+        fig, team_a_name, team_a_color, team_b_name, team_b_color, suffix="faster"
+    )
+    fig.update_layout(
+        **_map_layout("Hybrid Map — Corners & Straights", x_range, y_range)
     )
     return fig
