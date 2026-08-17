@@ -1,0 +1,14 @@
+# Tells Grafana to load any dashboard JSON found in the mounted folder.
+apiVersion: 1
+
+providers:
+  - name: DriverDNA
+    orgId: 1
+    folder: DriverDNA
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

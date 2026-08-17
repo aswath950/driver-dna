@@ -1,0 +1,15 @@
+# Prometheus scrape config for the DriverDNA local monitoring stack.
+# Scrapes postgres_exporter, which translates pg_stat_* views into metrics.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres_exporter:9187"]
+
+  # Prometheus scraping itself — handy for confirming the stack is alive.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

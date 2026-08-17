@@ -34,6 +34,55 @@ services:
       postgres:
         condition: service_healthy
 
+  # --- Metrics stack (optional) --------------------------------------------
+  # Start with:  docker compose --profile monitoring up -d
+  # Grafana -> http://localhost:3001  (admin / admin), Prometheus -> :9090
+  postgres_exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:latest
+    container_name: driver_dna_pg_exporter
+    profiles: ["monitoring"]
+    environment:
+      DATA_SOURCE_NAME: "postgresql://dna:dna@postgres:5432/driver_dna?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: driver_dna_prometheus
+    profiles: ["monitoring"]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - postgres_exporter
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: driver_dna_grafana
+    profiles: ["monitoring"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Let anyone with the URL view dashboards without logging in (local dev only).
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+
   backend:
     build:
       context: .
@@ -55,3 +104,5 @@ services:
 
 volumes:
   pgdata:
+  promdata:
+  grafanadata:

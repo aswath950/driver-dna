@@ -1,0 +1,134 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "title": "DriverDNA · PostgreSQL",
+  "uid": "driverdna-postgres",
+  "tags": ["postgres", "driverdna"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datname",
+        "label": "Database",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(pg_stat_database_numbackends, datname)",
+        "refresh": 2,
+        "includeAll": false,
+        "current": { "text": "driver_dna", "value": "driver_dna" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Postgres Up",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "expr": "pg_up", "refId": "A" } ]
+    },
+    {
+      "id": 2,
+      "title": "Active Connections",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 5, "x": 4, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 50 }, { "color": "red", "value": 90 } ] } } },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "expr": "sum(pg_stat_database_numbackends{datname=\"$datname\"})", "refId": "A" } ]
+    },
+    {
+      "id": 3,
+      "title": "Max Connections",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 5, "x": 9, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "options": { "colorMode": "none", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "expr": "pg_settings_max_connections", "refId": "A" } ]
+    },
+    {
+      "id": 4,
+      "title": "Cache Hit Ratio",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 5, "x": 14, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 0.9 }, { "color": "green", "value": 0.99 } ] } } },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "expr": "sum(pg_stat_database_blks_hit{datname=\"$datname\"}) / (sum(pg_stat_database_blks_hit{datname=\"$datname\"}) + sum(pg_stat_database_blks_read{datname=\"$datname\"}))", "refId": "A" } ]
+    },
+    {
+      "id": 5,
+      "title": "Database Size",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 5, "x": 19, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "options": { "colorMode": "none", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "expr": "pg_database_size_bytes{datname=\"$datname\"}", "refId": "A" } ]
+    },
+    {
+      "id": 6,
+      "title": "Connections",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" } } },
+      "targets": [ { "expr": "pg_stat_database_numbackends{datname=\"$datname\"}", "legendFormat": "{{datname}}", "refId": "A" } ]
+    },
+    {
+      "id": 7,
+      "title": "Transactions / sec",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" } } },
+      "targets": [
+        { "expr": "rate(pg_stat_database_xact_commit{datname=\"$datname\"}[5m])", "legendFormat": "commits", "refId": "A" },
+        { "expr": "rate(pg_stat_database_xact_rollback{datname=\"$datname\"}[5m])", "legendFormat": "rollbacks", "refId": "B" }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Tuple Operations / sec",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" } } },
+      "targets": [
+        { "expr": "rate(pg_stat_database_tup_fetched{datname=\"$datname\"}[5m])", "legendFormat": "fetched", "refId": "A" },
+        { "expr": "rate(pg_stat_database_tup_returned{datname=\"$datname\"}[5m])", "legendFormat": "returned", "refId": "B" },
+        { "expr": "rate(pg_stat_database_tup_inserted{datname=\"$datname\"}[5m])", "legendFormat": "inserted", "refId": "C" },
+        { "expr": "rate(pg_stat_database_tup_updated{datname=\"$datname\"}[5m])", "legendFormat": "updated", "refId": "D" },
+        { "expr": "rate(pg_stat_database_tup_deleted{datname=\"$datname\"}[5m])", "legendFormat": "deleted", "refId": "E" }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Deadlocks & Conflicts / sec",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" } } },
+      "targets": [
+        { "expr": "rate(pg_stat_database_deadlocks{datname=\"$datname\"}[5m])", "legendFormat": "deadlocks", "refId": "A" },
+        { "expr": "rate(pg_stat_database_conflicts{datname=\"$datname\"}[5m])", "legendFormat": "conflicts", "refId": "B" }
+      ]
+    }
+  ]
+}
