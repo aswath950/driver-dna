@@ -117,7 +117,9 @@ class SessionHydrator:
 
     def __init__(self, db: Session, client: OpenF1Client | None = None) -> None:
         self.db = db
-        self.client = client or OpenF1Client(mode="historical")
+        # strict=True: a rate-limited fetch must raise, not look like an empty
+        # weekend and get committed as a successful hydrate of 0 rows.
+        self.client = client or OpenF1Client(mode="historical", strict=True)
         self._circuits_geo: dict[str, dict] = _load_circuits_json()
 
     # ------------------------------------------------------------------

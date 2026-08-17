@@ -74,7 +74,8 @@ class FetchTelemetryResult:
 class TelemetryFetcher:
     def __init__(self, db: Session) -> None:
         self.db = db
-        self.client = OpenF1Client(mode="historical")
+        # strict=True — see SessionHydrator: silent empties corrupt a batch load.
+        self.client = OpenF1Client(mode="historical", strict=True)
 
     def _load_session(self, session_id: int) -> tuple[int, dict[int, int]]:
         """Return (openf1_session_key, {car_number: driver_id})."""

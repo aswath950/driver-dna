@@ -50,6 +50,15 @@ class OpenF1AuthError(Exception):
     """Raised when the OpenF1 API returns 401 Unauthorized."""
 
 
+class OpenF1UnavailableError(Exception):
+    """Raised by a strict client when a request fails after every retry.
+
+    Distinct from an empty result: this means we never got an answer (429, 5xx,
+    timeout), so the caller must NOT read the empty DataFrame as "no such data".
+    Only strict clients raise it — see :class:`OpenF1Client`.
+    """
+
+
 def validate_dataframe(df: pd.DataFrame, required_cols: list[str], context: str = "") -> pd.DataFrame:
     """Check that *df* contains all *required_cols*.
 
@@ -81,17 +90,28 @@ class OpenF1Client:
         seen so that only new data is returned on each poll.
     timeout : int
         HTTP request timeout in seconds (default 10).
+    strict : bool
+        When False (default) a request that fails every retry returns an empty
+        DataFrame, so interactive callers degrade gracefully rather than raising
+        in the middle of a page render.
+
+        When True those exhausted retries raise :class:`OpenF1UnavailableError`
+        instead. Batch/ETL callers want this: an empty DataFrame is
+        indistinguishable from "this race has no data", so a rate-limited run
+        would otherwise write 0 rows and report success.
     """
 
     def __init__(
         self,
         mode: Literal["historical", "live"] = "historical",
         timeout: int = 10,
+        strict: bool = False,
     ) -> None:
         if mode not in ("historical", "live"):
             raise ValueError(f"mode must be 'historical' or 'live', got {mode!r}")
         self.mode = mode
         self.timeout = timeout
+        self.strict = strict
         self._session = requests.Session()
 
         # Live-mode watermarks — track the last-seen timestamps so
@@ -114,10 +134,16 @@ class OpenF1Client:
         """Fire a GET request against the OpenF1 API and return a DataFrame.
 
         Retries up to *retries* times with exponential backoff.
-        Returns an empty DataFrame on final failure — callers never need
-        to catch transport-level exceptions.
+
+        An empty DataFrame means the API answered successfully with no rows —
+        a definitive "no such data". What happens when the request never
+        succeeds depends on the client's ``strict`` flag: a lenient client
+        returns an empty DataFrame too (callers never need to catch
+        transport-level exceptions), while a strict client raises
+        :class:`OpenF1UnavailableError` so the two cases stay distinguishable.
         """
         url = f"{BASE_URL}/{endpoint}"
+        last_exc: Exception | None = None
         for attempt in range(1, retries + 1):
             try:
                 resp = self._session.get(
@@ -134,6 +160,14 @@ class OpenF1Client:
                         "OpenF1 API returned 401 Unauthorized. "
                         "The API may now require authentication."
                     ) from exc
+                # 404 is a definitive "no such resource" — OpenF1 answers this
+                # way for an unknown meeting_name rather than 200 with an empty
+                # body. Short-circuit: retrying cannot change it, and a strict
+                # caller must see genuine absence, not an outage. Mirrors the
+                # 404 handling in session_status.
+                if exc.response is not None and exc.response.status_code == 404:
+                    return pd.DataFrame()
+                last_exc = exc
                 if attempt < retries:
                     delay = backoff ** attempt
                     logger.warning(
@@ -147,6 +181,7 @@ class OpenF1Client:
                         endpoint, retries, exc,
                     )
             except (requests.RequestException, ValueError) as exc:
+                last_exc = exc
                 if attempt < retries:
                     delay = backoff ** attempt
                     logger.warning(
@@ -159,6 +194,12 @@ class OpenF1Client:
                         "OpenF1 %s failed after %d attempts: %s",
                         endpoint, retries, exc,
                     )
+        # Every attempt failed. A strict caller must not mistake this for
+        # "no data" — see the class docstring.
+        if self.strict:
+            raise OpenF1UnavailableError(
+                f"OpenF1 /{endpoint} failed after {retries} attempts: {last_exc}"
+            ) from last_exc
         return pd.DataFrame()
 
     @staticmethod
