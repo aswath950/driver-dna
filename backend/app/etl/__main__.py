@@ -115,6 +115,17 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
         )
         print(json.dumps(result.as_dict(), indent=2, default=str))
+        # A hydrate that wrote nothing is a failure, not a no-op: the weekend
+        # was found but every row count came back zero. Exit non-zero so batch
+        # callers notice instead of banking a silently-empty seed. A dry run
+        # legitimately writes nothing, so it is exempt.
+        if not args.dry_run and result.counts and not any(result.counts.values()):
+            print(
+                f"error: hydrate wrote 0 rows for {args.gp} {args.year} "
+                f"(session={args.session or 'all'}) — treating as a failure",
+                file=sys.stderr,
+            )
+            return 1
         return 0
 
     if args.command == "refresh-stats":
