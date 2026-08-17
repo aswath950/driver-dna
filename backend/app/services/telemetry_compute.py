@@ -42,6 +42,50 @@ CHANNEL_COLUMN: dict[str, str] = {
     "DRS": "drs",
 }
 
+# Numeric car_data channels stored in the JSONB cache, in column order.
+_SAMPLE_COLUMNS = ("speed", "throttle", "brake", "rpm", "n_gear", "drs")
+
+
+# ---------------------------------------------------------------------------
+# JSONB cache serialization
+# ---------------------------------------------------------------------------
+
+
+def _json_safe_column(values: object) -> list:
+    """Coerce one car_data column to a JSON/JSONB-safe list of numbers/nulls.
+
+    Real OpenF1 responses carry two kinds of value that break a JSONB write:
+    ``pd.NA`` (missing columns are backfilled with it) isn't JSON-serializable
+    at all, and ``NaN``/``±Inf`` (dropped or void samples) serialize to tokens
+    Postgres JSONB rejects. Both are mapped to ``None`` (JSON ``null``), which
+    JSONB accepts and the reconstruction path reads back as ``NaN`` — so the
+    array stays index-aligned with ``dates``. Integral values are stored as
+    ``int`` to keep the JSON compact (gear/DRS/rpm), others as ``float``.
+    """
+    nums = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
+    out: list = []
+    for x in nums:
+        if not np.isfinite(x):
+            out.append(None)
+        elif float(x).is_integer():
+            out.append(int(x))
+        else:
+            out.append(float(x))
+    return out
+
+
+def samples_to_jsonb(car_df: pd.DataFrame) -> dict:
+    """Serialize a raw car_data DataFrame to the columnar JSONB cache format.
+
+    The single writer used by both the ETL bulk fetch and the request-time
+    write-through cache, so every value that reaches ``car_telemetry.samples``
+    is guaranteed JSON/JSONB-safe (see :func:`_json_safe_column`).
+    """
+    return {
+        "dates": [d.isoformat() for d in car_df["date"]],
+        **{col: _json_safe_column(car_df[col]) for col in _SAMPLE_COLUMNS},
+    }
+
 
 # ---------------------------------------------------------------------------
 # Post-fetch processing — port of src/viz._fetch_fastest_lap_all_openf1
@@ -85,7 +129,9 @@ def process_car_data(
             ts_end_clip = ts_end_clip.tz_localize("UTC")
         car = car[car["date"] <= ts_end_clip].reset_index(drop=True)
 
-    speeds = car["speed"].to_numpy(dtype=float)
+    # Coerce so a pd.NA-backfilled speed column (OpenF1 omitted it) becomes NaN
+    # instead of raising in .to_numpy(dtype=float); a no-op for real numeric data.
+    speeds = pd.to_numeric(car["speed"], errors="coerce").to_numpy(dtype=float)
     if len(speeds) < 2:
         return None
 
@@ -106,7 +152,12 @@ def process_car_data(
     def _resample(col: str) -> np.ndarray:
         if col not in car.columns:
             return np.full(N_POINTS, np.nan)
-        return np.interp(dist_grid, dist, car[col].to_numpy(dtype=float))
+        # ``pd.to_numeric(..., coerce)`` first: a column OpenF1 omitted is
+        # backfilled with ``pd.NA`` by the client, and ``.to_numpy(dtype=float)``
+        # raises on ``pd.NA``. Coercing maps NA/non-numeric to NaN, which
+        # np.interp propagates as NaN samples rather than crashing the fetch.
+        fp = pd.to_numeric(car[col], errors="coerce").to_numpy(dtype=float)
+        return np.interp(dist_grid, dist, fp)
 
     # Dedup distance for cumtime interpolation (flat segments break np.interp).
     dist_unique, unique_idx = np.unique(dist, return_index=True)

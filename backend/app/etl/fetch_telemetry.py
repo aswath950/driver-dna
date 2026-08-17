@@ -34,6 +34,7 @@ from app.db.models import CarTelemetry
 from app.db.models import Session as SessionRow
 from app.db.models import SessionDriver, Driver
 from app.etl.upserts import upsert_many
+from app.services.telemetry_compute import samples_to_jsonb
 from src.openf1 import OpenF1Client
 
 logger = logging.getLogger(__name__)
@@ -68,19 +69,6 @@ class FetchTelemetryResult:
             "deleted_existing": self.deleted_existing,
             "errors": self.errors,
         }
-
-
-def _samples_dict(car_df: pd.DataFrame) -> dict:
-    """Convert a car_data DataFrame to the columnar JSONB format."""
-    return {
-        "dates": [d.isoformat() for d in car_df["date"]],
-        "speed": car_df["speed"].tolist(),
-        "throttle": car_df["throttle"].tolist(),
-        "brake": car_df["brake"].tolist(),
-        "rpm": car_df["rpm"].tolist(),
-        "n_gear": car_df["n_gear"].tolist(),
-        "drs": car_df["drs"].tolist(),
-    }
 
 
 class TelemetryFetcher:
@@ -163,7 +151,7 @@ class TelemetryFetcher:
                 "driver_id": driver_id,
                 "lap_number": lap_n,
                 "lap_duration": lap_duration,
-                "samples": _samples_dict(lap_car),
+                "samples": samples_to_jsonb(lap_car),
             })
 
         if not rows:

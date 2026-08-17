@@ -16,6 +16,7 @@ import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
 from app.core.config import settings
+from app.services.telemetry_compute import N_POINTS
 
 OPENF1 = "https://api.openf1.org/v1"
 # Use an int well outside the seed's openf1_session_keys to avoid collisions.
@@ -25,9 +26,10 @@ _DRV_A_ID = 1
 _DRV_B_ID = 5
 _CAR_A = 901
 _CAR_B = 905
-# Row returned by the stale-key guard's session_exists() check
-# (_resolve_session_key → GET /v1/sessions?session_key=...). A non-empty list
-# means "key still valid" so compare requests proceed to laps/car_data.
+# Row returned by the tri-state session-key check (session_status →
+# GET /v1/sessions?session_key=...). Only consulted on a cache miss whose
+# /laps came back empty, to tell a stale key from a transient failure; the
+# happy-path tests below never reach it, but it's registered as headroom.
 _SESSIONS_PAYLOAD = [{"session_key": _FAKE_OPENF1_KEY}]
 
 
@@ -303,14 +305,44 @@ def test_compare_happy(client: TestClient, compare_session: tuple[int, int, int]
     assert body["driver_b"]["car_number"] == _CAR_B
     assert body["driver_a"]["code"] == "TAA"
     assert body["driver_b"]["code"] == "TBB"
-    assert len(body["driver_a"]["trace"]) == 200  # N_POINTS
-    assert len(body["driver_b"]["trace"]) == 200
+    assert len(body["driver_a"]["trace"]) == N_POINTS
+    assert len(body["driver_b"]["trace"]) == N_POINTS
     # Trace values from synthetic data: constant speed 250 or 251.
     assert all(abs(v - body["driver_a"]["trace"][0]) < 1e-6 for v in body["driver_a"]["trace"])
     # figure_json must be valid Plotly JSON
     fig = json.loads(body["figure_json"])
     assert "data" in fig and "layout" in fig
     assert len(fig["data"]) == 2  # one trace per driver
+
+
+def test_compare_caches_null_bearing_car_data(
+    client: TestClient, compare_session: tuple[int, int, int]
+) -> None:
+    """Real OpenF1 car_data carries nulls (missing samples / columns). The
+    write-through cache must serialize those to JSONB safely and the request
+    must still succeed — regression test for the NaN/pd.NA JSONB write that
+    used to poison the request transaction and 500."""
+    def _null_bearing(driver_number: int) -> list[dict]:
+        rows = _make_car_data(driver_number)
+        rows[1]["speed"] = None          # a dropped/void sample → NaN
+        for r in rows:
+            r.pop("drs", None)           # a fully-missing column → pd.NA on _clean
+        return rows
+
+    laps_payload = _make_laps_payload(_CAR_A) + _make_laps_payload(_CAR_B)
+    sid, drv_a, drv_b = compare_session
+    with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
+        for _ in range(3):
+            rsps.add(responses.GET, f"{OPENF1}/sessions", json=_SESSIONS_PAYLOAD)
+            rsps.add(responses.GET, f"{OPENF1}/laps", json=laps_payload)
+            rsps.add(responses.GET, f"{OPENF1}/car_data", json=_null_bearing(_CAR_A))
+            rsps.add(responses.GET, f"{OPENF1}/car_data", json=_null_bearing(_CAR_B))
+        r = client.get(
+            f"/api/v1/sessions/{sid}/compare?driver_a={drv_a}&driver_b={drv_b}&channel=Speed"
+        )
+    # The whole point: no 500 from a poisoned transaction.
+    assert r.status_code == 200, r.text
+    assert len(r.json()["driver_a"]["trace"]) == N_POINTS
 
 
 def test_compare_rejects_same_driver(
@@ -345,8 +377,9 @@ def test_compare_driver_not_in_session(
     client: TestClient, compare_session: tuple[int, int, int]
 ) -> None:
     sid, drv_a, _ = compare_session
-    # The stale-key guard resolves (and validates) the session key before driver
-    # resolution, so /sessions must be mocked even on this 404 path.
+    # Session-key resolution no longer makes a live OpenF1 call, and driver
+    # resolution fails before any cache-miss fetch, so this 404 path touches no
+    # OpenF1 endpoint at all. The mock is registered only as defensive headroom.
     with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
         rsps.add(responses.GET, f"{OPENF1}/sessions", json=_SESSIONS_PAYLOAD)
         r = client.get(
@@ -482,7 +515,7 @@ def test_compare_rpm(
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["channel"] == "RPM"
-    assert len(body["driver_a"]["trace"]) == 200
+    assert len(body["driver_a"]["trace"]) == N_POINTS
     fig = json.loads(body["figure_json"])
     assert len(fig["data"]) == 2
 
@@ -525,7 +558,7 @@ def test_compare_time_delta(
     body = r.json()
     assert body["channel"] == "TimeDelta"
     # TimeDelta payload's trace fields now carry per-driver cumtime arrays.
-    assert len(body["driver_a"]["trace"]) == 200
+    assert len(body["driver_a"]["trace"]) == N_POINTS
     fig = json.loads(body["figure_json"])
     # Streamlit-style figure has many traces: 2 shaded fills + 2 coloured
     # leader lines + optional lead-change / peak markers.
@@ -576,15 +609,18 @@ def test_compare_sectors_happy(
     assert body["driver_b"]["code"] == "TBB"
     # Fastest lap is 78.0 s. Synthetic car_data has constant speed → cumtime
     # is linear over distance. Compare Test Circuit has sector_fractions
-    # [0.35, 0.72]; with N_POINTS=200, i1 = round(0.35*199) = 70 and
-    # i2 = round(0.72*199) = 143. Expected splits:
-    #   s1 = 78 * 70/199        ≈ 27.437 s
-    #   s2 = 78 * (143-70)/199  ≈ 28.613 s
-    #   s3 = 78 * (199-143)/199 ≈ 21.950 s
+    # [0.35, 0.72]; splits are taken at grid indices i1 = round(0.35*(N-1)) and
+    # i2 = round(0.72*(N-1)) over the N_POINTS grid, then scaled by lap time.
+    n_1 = N_POINTS - 1
+    i1 = round(0.35 * n_1)
+    i2 = round(0.72 * n_1)
+    exp_s1 = round(78_000 * i1 / n_1)
+    exp_s2 = round(78_000 * (i2 - i1) / n_1)
+    exp_s3 = round(78_000 * (n_1 - i2) / n_1)
     splits_a = body["driver_a"]
-    assert abs(splits_a["sector1_ms"] - 27_437) <= 1
-    assert abs(splits_a["sector2_ms"] - 28_613) <= 1
-    assert abs(splits_a["sector3_ms"] - 21_950) <= 1
+    assert abs(splits_a["sector1_ms"] - exp_s1) <= 1
+    assert abs(splits_a["sector2_ms"] - exp_s2) <= 1
+    assert abs(splits_a["sector3_ms"] - exp_s3) <= 1
     # Sectors sum to the official lap duration (78.000s → 78_000 ms).
     total = splits_a["sector1_ms"] + splits_a["sector2_ms"] + splits_a["sector3_ms"]
     assert abs(total - 78_000) <= 1

@@ -512,3 +512,46 @@ def test_build_time_delta_figure_uses_turn_ticks_when_corners_given() -> None:
     )
     assert fig.layout.xaxis.title.text == "Track Position (turn)"
     assert list(fig.layout.xaxis.ticktext) == ["T1", "T2A", "T3"]
+
+
+# ---------------------------------------------------------------------------
+# samples_to_jsonb — JSONB-safe cache serialization
+# ---------------------------------------------------------------------------
+
+
+def _car_df_with_gaps() -> pd.DataFrame:
+    """A car_data frame carrying the two poison values real OpenF1 emits:
+    a NaN sample (dropped/void reading) and a fully-missing pd.NA column."""
+    return pd.DataFrame({
+        "date": pd.to_datetime(
+            ["2024-05-26T15:00:00.000Z", "2024-05-26T15:00:00.100Z",
+             "2024-05-26T15:00:00.200Z"], utc=True,
+        ),
+        "speed": [250.0, float("nan"), 251.5],   # NaN → JSONB rejects it
+        "throttle": [100.0, 100.0, 100.0],
+        "brake": [0.0, 0.0, 0.0],
+        "rpm": [12000.0, 12000.0, 12000.0],
+        "n_gear": [7, 7, 7],                       # integral → kept as int
+        "drs": pd.array([pd.NA, pd.NA, pd.NA]),    # missing column → all pd.NA
+    })
+
+
+def test_samples_to_jsonb_maps_nan_and_na_to_null() -> None:
+    samples = tc.samples_to_jsonb(_car_df_with_gaps())
+    # NaN sample and the all-missing column both become JSON null.
+    assert samples["speed"] == [250.0, None, 251.5]
+    assert samples["drs"] == [None, None, None]
+    # Integral channel is stored compactly as int, not 7.0.
+    assert samples["n_gear"] == [7, 7, 7]
+    assert len(samples["dates"]) == 3
+
+
+def test_samples_to_jsonb_output_is_strict_json() -> None:
+    import json
+
+    # json.dumps with allow_nan=False is exactly what a Postgres JSONB write
+    # needs: it raises on NaN/Infinity. The pre-fix .tolist() output would fail;
+    # the sanitized output must serialize cleanly.
+    samples = tc.samples_to_jsonb(_car_df_with_gaps())
+    dumped = json.dumps(samples, allow_nan=False)  # must not raise
+    assert "NaN" not in dumped and "null" in dumped
