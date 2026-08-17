@@ -56,6 +56,215 @@
 
 ---
 
+## Get Started
+
+Two paths: three terminals manually, or `make dev`.
+
+### Prerequisites
+
+| Tool | Version | Why |
+|---|---|---|
+| Python | 3.13 | Backend + legacy `src/` |
+| Node | 20 | Next.js 14 |
+| Docker + docker-compose | latest | Postgres · pgAdmin · metrics stack |
+| `psql` | 16 | Inspect DB / EXPLAIN |
+| `npm` (or `pnpm`) | latest | Web deps |
+
+One-shot verification:
+`python --version && node --version && docker --version && psql --version`.
+
+### Three-terminal local dev
+
+#### Terminal 1 — Postgres + pgAdmin
+
+```bash
+make db
+```
+
+Starts Postgres on `:5432` and pgAdmin on `:5050`. Wait until the command returns to
+the prompt, then run migrations (first time only, or after pulling new changes):
+
+```bash
+make migrate
+```
+
+This runs `alembic upgrade head` and seeds circuit corner data from FastF1.
+
+To inspect the database later: open `http://localhost:5050` (login:
+`admin@example.com` / `admin`), add a server with host `postgres`, port `5432`,
+username `dna`, password `dna`.
+
+#### Terminal 2 — FastAPI Backend
+
+```bash
+cd backend
+
+# First time only: create virtualenv and install deps
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+
+# First time only: copy env file and add your OpenAI key (required for /ai/* endpoints)
+cp .env.example .env
+# Edit .env and set OPENAI_API_KEY=sk-...
+
+# First time only: seed real race data
+bash scripts/hydrate_initial_data.sh
+
+# Start the server (every time)
+.venv/bin/uvicorn app.main:app --reload --reload-include="*.env" --port 8000
+```
+
+Confirm the server is up:
+
+```bash
+curl localhost:8000/healthz   # → {"status":"ok","env":"local","version":"1.0.0"}
+```
+
+Swagger UI is at `http://localhost:8000/docs`.
+
+> **Note** — `hydrate_initial_data.sh` seeds a handful of real race weekends so
+> the Race Dashboard has data to show. Skip it and the GP dropdowns will list all
+> races from the OpenF1 calendar but mark them "hasn't been downloaded yet". Use
+> the Pipeline → Download Dataset page to hydrate individual races later.
+
+#### Terminal 3 — Next.js Web
+
+```bash
+cd web
+
+# First time only: install dependencies and copy env file
+pnpm install
+cp .env.example .env.local
+# .env.local defaults already point to localhost:8000 — no edits needed for local dev
+
+# Start the dev server (every time)
+pnpm dev
+```
+
+The web app is ready at `http://localhost:3000`.
+
+#### Smoke-check after startup
+
+```bash
+curl localhost:8000/healthz                          # backend alive
+curl localhost:8000/api/v1/seasons | jq '.data[0]'   # DB has data
+```
+
+Then in the browser:
+
+- `http://localhost:3000` — landing page shows event cards
+- `http://localhost:3000/race` — Race Dashboard: select a year, pick a GP, pick a
+  session, click Load
+- `http://localhost:3000/pipeline` — Pipeline admin: Download Dataset, Fetch
+  Telemetry, Train
+
+#### (Optional) Terminal 4 — legacy Streamlit
+
+```bash
+streamlit run streamlit_app.py                    # → http://localhost:8501
+```
+
+#### (Optional) Metrics dashboard — Prometheus + Grafana
+
+A time-series monitoring stack for the Postgres container, kept behind a
+docker-compose `monitoring` profile so it stays out of the default `up`:
+
+```bash
+make monitoring                                   # or: docker compose --profile monitoring up -d
+```
+
+Pipeline: `postgres → postgres_exporter (:9187) → Prometheus (:9090) → Grafana (:3001)`.
+Open `http://localhost:3001` (login `admin` / `admin`; anonymous viewing is also
+enabled for local dev) → **Dashboards → DriverDNA · PostgreSQL**. The datasource
+and dashboard are auto-provisioned from [monitoring/](monitoring/) — nothing to
+click. The dashboard tracks connections, transactions/sec (commits vs. rollbacks),
+cache-hit ratio, tuple throughput, deadlocks, and database size. Stop it with
+`make monitoring-down`.
+
+This complements pgAdmin rather than replacing it: Grafana graphs trends over
+time; pgAdmin browses rows and runs ad-hoc SQL.
+
+### One-command alternative — Makefile
+
+The repo root [Makefile](Makefile) wraps the most common commands:
+
+```bash
+make dev             # full stack: postgres + pgAdmin + backend + web in one shot
+
+# Or bring up pieces individually:
+make db              # docker compose up -d postgres pgadmin (:5432 + :5050)
+make backend-install # python -m venv backend/.venv && pip install -e backend[dev]
+make backend         # uvicorn dev server on :8000
+make backend-test    # full pytest suite
+make migrate         # alembic upgrade head + seed circuit corners (YEAR= optional)
+make seed-circuits   # upsert circuit x/y geometry from data/circuits.json
+make seed-corners    # seed FastF1 corner data (YEAR= optional preferred year)
+make refresh-stats SEASON=2024          # recompute driver_stats aggregates
+make fetch-telemetry SESSION_ID=73      # pre-warm telemetry cache for a session
+make hydrate YEAR=2024 GP='Monaco Grand Prix' SESSION=R
+make web-install     # pnpm install in web/
+make web             # next dev on :3000
+make web-typecheck   # tsc --noEmit
+make monitoring      # Prometheus + postgres_exporter + Grafana (:3001)
+make monitoring-down # stop the metrics stack
+```
+
+### Env vars reference
+
+| File | Var | Default | Purpose |
+|---|---|---|---|
+| `backend/.env` | `DATABASE_URL` | `postgresql+asyncpg://dna:dna@localhost:5432/driver_dna` | App (asyncpg) |
+| `backend/.env` | `DATABASE_URL_SYNC` | `postgresql+psycopg://dna:dna@localhost:5432/driver_dna` | Alembic (sync) |
+| `backend/.env` | `OPENAI_API_KEY` | _empty_ | Required for `/api/v1/ai/*` |
+| `backend/.env` | `OPENF1_BASE_URL` | `https://api.openf1.org/v1` | Rarely changed |
+| `backend/.env` | `CORS_ORIGINS` | `http://localhost:3000` | Comma-sep allow-list (include `https://*.vercel.app` in prod) |
+| `backend/.env` | `COOKIE_SECRET` | `dev-secret-change-me` | Future-proof; not currently signing |
+| `backend/.env` | `RATE_LIMIT_PER_MIN` | `60` | Per-session AI rate limit |
+| `backend/.env` | `ENV` | `local` | `local` / `preview` / `prod` (toggles cookie attrs) |
+| `web/.env.local` | `NEXT_PUBLIC_API_BASE` | `http://localhost:8000` | Browser-visible API URL (SSE chat) |
+| `web/.env.local` | `API_BASE_INTERNAL` | `http://localhost:8000` | Server-side RSC fetch URL |
+| `web/.env.local` | `NEXT_PUBLIC_GRAPHQL_URL` | `http://localhost:8000/graphql` | GraphQL endpoint |
+| `web/.env.local` | `FEATURE_RADAR` · `FEATURE_MYSTERY_DRIVER` · `FEATURE_RACE` · `FEATURE_PIPELINE` | _unset_ | One operator switch per top-level section. Set to `FALSE` to hide a section from the nav and block its routes; shown unless `FALSE` (unset/`TRUE` = shown). Server-side, read at runtime (takes effect at deploy/boot — no rebuild). |
+
+### Smoke-check checklist
+
+After bring-up, in order:
+
+```bash
+# 1. Backend up?
+curl -s localhost:8000/healthz                                # {"status":"ok",...}
+
+# 2. v1 endpoint live + envelope working?
+curl -s localhost:8000/api/v1/seasons | jq '.data | length'   # > 0
+
+# 3. GraphQL alive?
+curl -s -X POST localhost:8000/graphql \
+  -d '{"query":"{ seasons(first:3) { year } }"}'              # 3 years back
+
+# 4. Standings populated?
+curl -s 'localhost:8000/api/v1/standings?season=2024' | jq '.[0].driver.code'
+
+# 5. Cookie issued?
+curl -is localhost:8000/api/v1/me | grep -i set-cookie        # dna_sid=...
+
+# 6. Telemetry cache status?
+curl -s 'localhost:8000/api/v1/pipeline/telemetry-status?session_id=73'
+# {"session_id":73,"fetched_at":"2024-05-26T15:00:00Z"} or {"fetched_at":null}
+```
+
+Then in the browser:
+
+- <http://localhost:3000> — landing should list event cards
+- <http://localhost:3000/race/1> — leaderboard renders + chat input visible
+- <http://localhost:3000/pipeline> — Pipeline admin: hydrate, fetch telemetry, train
+- <http://localhost:8000/docs> — Swagger UI for every endpoint
+- <http://localhost:8000/graphql> — GraphiQL (local only)
+- <http://localhost:5050> — pgAdmin (login: `admin@example.com` / `admin`; add server with host `postgres`, port `5432`, user/pass `dna`)
+- <http://localhost:3001> — Grafana metrics dashboard (login `admin` / `admin`; requires `make monitoring`)
+- <http://localhost:9090> — Prometheus (requires `make monitoring`)
+
+---
+
 ## Skills demonstrated
 
 A reading guide for reviewers — where each engineering competency lives
@@ -224,6 +433,11 @@ in the code. Every claim links to the file that proves it.
   log search
 - **Cost dashboard in SQL** — `llm_audit` is queryable for daily
   per-feature spend in one `GROUP BY`
+- **Database metrics dashboard** — an optional Prometheus +
+  postgres_exporter + Grafana stack (docker-compose `monitoring`
+  profile) graphs connections, TPS, cache-hit ratio, tuple throughput,
+  deadlocks, and DB size; datasource and dashboard are auto-provisioned
+  from [monitoring/](monitoring/)
 
 ### Security
 
@@ -352,6 +566,7 @@ they only echo what the server returned. See
 | **AI / ML** | OpenAI (gpt-4o-mini) · XGBoost · SHAP · scikit-learn · pandas · numpy | Reused legacy ML stack; backend wraps a single sync OpenAI helper in [app/llm/openai_client.py](backend/app/llm/openai_client.py) |
 | **External** | OpenF1 REST · FastF1 cache · Google Drive API v3 (OAuth 2.0) | Telemetry sources; legacy artifact persistence |
 | **Ops** | Docker · docker-compose · Railway (backend + Postgres) · Vercel (web) · GitHub Actions · pytest 8 · ruff · mypy | Two free-tier cloud services + GH-hosted CI |
+| **Monitoring** | Prometheus · postgres_exporter · Grafana (docker-compose `monitoring` profile) | Auto-provisioned Postgres metrics dashboard for local dev |
 
 ---
 
@@ -409,8 +624,9 @@ driver-dna/
 │   └── drive_sync.py              Google Drive OAuth/upload (Streamlit only)
 ├── streamlit_app.py               Legacy dashboard entry point
 ├── mcp/server.py                  MCP server — 4 stdio tools over fastest-lap data
-├── docker-compose.yml             Postgres + backend (web runs separately)
-├── Makefile                       make {db,backend,web,migrate,hydrate,dev,...}
+├── monitoring/                    Prometheus scrape config + Grafana provisioning & dashboards
+├── docker-compose.yml             Postgres · pgAdmin · backend + `monitoring` profile (exporter · Prometheus · Grafana)
+├── Makefile                       make {db,backend,web,migrate,hydrate,dev,monitoring,...}
 └── .github/workflows/
     ├── ci.yml                     legacy: src/ + Streamlit (ruff · mypy · pytest · eval · docker)
     ├── backend-ci.yml             backend: Postgres svc · alembic · ruff · pytest · OpenAPI snapshot
@@ -894,191 +1110,6 @@ $ curl -b jar localhost:8000/api/v1/me/saved-analyses
 Cookie is `HttpOnly`, `SameSite=Lax` locally, `SameSite=None; Secure`
 in prod so cross-origin Vercel → Railway requests carry it. Logic lives
 in [backend/app/core/sessions.py](backend/app/core/sessions.py).
-
----
-
-## Get Started
-
-Two paths: three terminals manually, or `make dev`.
-
-### Prerequisites
-
-| Tool | Version | Why |
-|---|---|---|
-| Python | 3.13 | Backend + legacy `src/` |
-| Node | 20 | Next.js 14 |
-| Docker + docker-compose | latest | Postgres |
-| `psql` | 16 | Inspect DB / EXPLAIN |
-| `npm` (or `pnpm`) | latest | Web deps |
-
-One-shot verification:
-`python --version && node --version && docker --version && psql --version`.
-
-### Three-terminal local dev
-
-#### Terminal 1 — Postgres + pgAdmin
-
-```bash
-make db
-```
-
-Starts Postgres on `:5432` and pgAdmin on `:5050`. Wait until the command returns to
-the prompt, then run migrations (first time only, or after pulling new changes):
-
-```bash
-make migrate
-```
-
-This runs `alembic upgrade head` and seeds circuit corner data from FastF1.
-
-To inspect the database later: open `http://localhost:5050` (login:
-`admin@example.com` / `admin`), add a server with host `postgres`, port `5432`,
-username `dna`, password `dna`.
-
-#### Terminal 2 — FastAPI Backend
-
-```bash
-cd backend
-
-# First time only: create virtualenv and install deps
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-
-# First time only: copy env file and add your OpenAI key (required for /ai/* endpoints)
-cp .env.example .env
-# Edit .env and set OPENAI_API_KEY=sk-...
-
-# First time only: seed real race data
-bash scripts/hydrate_initial_data.sh
-
-# Start the server (every time)
-.venv/bin/uvicorn app.main:app --reload --reload-include="*.env" --port 8000
-```
-
-Confirm the server is up:
-
-```bash
-curl localhost:8000/healthz   # → {"status":"ok","env":"local","version":"1.0.0"}
-```
-
-Swagger UI is at `http://localhost:8000/docs`.
-
-> **Note** — `hydrate_initial_data.sh` seeds a handful of real race weekends so
-> the Race Dashboard has data to show. Skip it and the GP dropdowns will list all
-> races from the OpenF1 calendar but mark them "hasn't been downloaded yet". Use
-> the Pipeline → Download Dataset page to hydrate individual races later.
-
-#### Terminal 3 — Next.js Web
-
-```bash
-cd web
-
-# First time only: install dependencies and copy env file
-pnpm install
-cp .env.example .env.local
-# .env.local defaults already point to localhost:8000 — no edits needed for local dev
-
-# Start the dev server (every time)
-pnpm dev
-```
-
-The web app is ready at `http://localhost:3000`.
-
-#### Smoke-check after startup
-
-```bash
-curl localhost:8000/healthz                          # backend alive
-curl localhost:8000/api/v1/seasons | jq '.data[0]'   # DB has data
-```
-
-Then in the browser:
-
-- `http://localhost:3000` — landing page shows event cards
-- `http://localhost:3000/race` — Race Dashboard: select a year, pick a GP, pick a
-  session, click Load
-- `http://localhost:3000/pipeline` — Pipeline admin: Download Dataset, Fetch
-  Telemetry, Train
-
-#### (Optional) Terminal 4 — legacy Streamlit
-
-```bash
-streamlit run streamlit_app.py                    # → http://localhost:8501
-```
-
-### One-command alternative — Makefile
-
-The repo root [Makefile](Makefile) wraps the most common commands:
-
-```bash
-make dev             # full stack: postgres + pgAdmin + backend + web in one shot
-
-# Or bring up pieces individually:
-make db              # docker compose up -d postgres pgadmin (:5432 + :5050)
-make backend-install # python -m venv backend/.venv && pip install -e backend[dev]
-make backend         # uvicorn dev server on :8000
-make backend-test    # full pytest suite
-make migrate         # alembic upgrade head + seed circuit corners (YEAR= optional)
-make seed-circuits   # upsert circuit x/y geometry from data/circuits.json
-make seed-corners    # seed FastF1 corner data (YEAR= optional preferred year)
-make refresh-stats SEASON=2024          # recompute driver_stats aggregates
-make fetch-telemetry SESSION_ID=73      # pre-warm telemetry cache for a session
-make hydrate YEAR=2024 GP='Monaco Grand Prix' SESSION=R
-make web-install     # pnpm install in web/
-make web             # next dev on :3000
-make web-typecheck   # tsc --noEmit
-```
-
-### Env vars reference
-
-| File | Var | Default | Purpose |
-|---|---|---|---|
-| `backend/.env` | `DATABASE_URL` | `postgresql+asyncpg://dna:dna@localhost:5432/driver_dna` | App (asyncpg) |
-| `backend/.env` | `DATABASE_URL_SYNC` | `postgresql+psycopg://dna:dna@localhost:5432/driver_dna` | Alembic (sync) |
-| `backend/.env` | `OPENAI_API_KEY` | _empty_ | Required for `/api/v1/ai/*` |
-| `backend/.env` | `OPENF1_BASE_URL` | `https://api.openf1.org/v1` | Rarely changed |
-| `backend/.env` | `CORS_ORIGINS` | `http://localhost:3000` | Comma-sep allow-list (include `https://*.vercel.app` in prod) |
-| `backend/.env` | `COOKIE_SECRET` | `dev-secret-change-me` | Future-proof; not currently signing |
-| `backend/.env` | `RATE_LIMIT_PER_MIN` | `60` | Per-session AI rate limit |
-| `backend/.env` | `ENV` | `local` | `local` / `preview` / `prod` (toggles cookie attrs) |
-| `web/.env.local` | `NEXT_PUBLIC_API_BASE` | `http://localhost:8000` | Browser-visible API URL (SSE chat) |
-| `web/.env.local` | `API_BASE_INTERNAL` | `http://localhost:8000` | Server-side RSC fetch URL |
-| `web/.env.local` | `NEXT_PUBLIC_GRAPHQL_URL` | `http://localhost:8000/graphql` | GraphQL endpoint |
-| `web/.env.local` | `FEATURE_RADAR` · `FEATURE_MYSTERY_DRIVER` · `FEATURE_RACE` · `FEATURE_PIPELINE` | _unset_ | One operator switch per top-level section. Set to `FALSE` to hide a section from the nav and block its routes; shown unless `FALSE` (unset/`TRUE` = shown). Server-side, read at runtime (takes effect at deploy/boot — no rebuild). |
-
-### Smoke-check checklist
-
-After bring-up, in order:
-
-```bash
-# 1. Backend up?
-curl -s localhost:8000/healthz                                # {"status":"ok",...}
-
-# 2. v1 endpoint live + envelope working?
-curl -s localhost:8000/api/v1/seasons | jq '.data | length'   # > 0
-
-# 3. GraphQL alive?
-curl -s -X POST localhost:8000/graphql \
-  -d '{"query":"{ seasons(first:3) { year } }"}'              # 3 years back
-
-# 4. Standings populated?
-curl -s 'localhost:8000/api/v1/standings?season=2024' | jq '.[0].driver.code'
-
-# 5. Cookie issued?
-curl -is localhost:8000/api/v1/me | grep -i set-cookie        # dna_sid=...
-
-# 6. Telemetry cache status?
-curl -s 'localhost:8000/api/v1/pipeline/telemetry-status?session_id=73'
-# {"session_id":73,"fetched_at":"2024-05-26T15:00:00Z"} or {"fetched_at":null}
-```
-
-Then in the browser:
-
-- <http://localhost:3000> — landing should list event cards
-- <http://localhost:3000/race/1> — leaderboard renders + chat input visible
-- <http://localhost:3000/pipeline> — Pipeline admin: hydrate, fetch telemetry, train
-- <http://localhost:8000/docs> — Swagger UI for every endpoint
-- <http://localhost:8000/graphql> — GraphiQL (local only)
-- <http://localhost:5050> — pgAdmin (login: `admin@example.com` / `admin`; add server with host `postgres`, port `5432`, user/pass `dna`)
 
 ---
 
